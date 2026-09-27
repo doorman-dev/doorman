@@ -302,6 +302,7 @@ def run_generated_checks(repo_root: Path) -> None:
     for command in (
         [sys.executable, "scripts/check_parity_reference.py"],
         [sys.executable, "scripts/generate_test_coverage_ledger.py", "--check"],
+        [sys.executable, "scripts/generate_source_coverage_ledger.py", "--check"],
     ):
         completed = subprocess.run(command, cwd=repo_root, check=False)
         if completed.returncode != 0:

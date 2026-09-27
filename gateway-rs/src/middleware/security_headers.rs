@@ -12,32 +12,31 @@ pub async fn security_headers(
     request: Request,
     next: Next,
 ) -> Response {
-    let docs = matches!(request.uri().path(), "/platform/docs" | "/platform/redoc");
+    let docs = matches!(
+        request.uri().path(),
+        "/docs" | "/redoc" | "/platform/docs" | "/platform/redoc"
+    );
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
     insert_default(headers, "x-content-type-options", "nosniff");
-    insert_default(
-        headers,
-        "x-frame-options",
-        if docs { "SAMEORIGIN" } else { "DENY" },
-    );
+    insert_default(headers, "x-frame-options", "DENY");
     insert_default(headers, "referrer-policy", "no-referrer");
     insert_default(
         headers,
         "permissions-policy",
         "geolocation=(), microphone=(), camera=()",
     );
+    let custom_csp = state.config.content_security_policy.as_deref();
     let default_csp = if docs {
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self'; frame-ancestors 'self'; base-uri 'self';"
+        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self'; frame-ancestors *; base-uri 'self';"
     } else {
         "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; img-src 'self' data:; connect-src 'self';"
     };
-    let csp = state
-        .config
-        .content_security_policy
-        .as_deref()
-        .unwrap_or(default_csp);
+    if docs && custom_csp.is_none() {
+        headers.remove("x-frame-options");
+    }
+    let csp = custom_csp.unwrap_or(default_csp);
     insert_value_default(headers, "content-security-policy", csp);
     if state.config.https_only {
         insert_default(

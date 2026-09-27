@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod configuration;
+pub mod field_encryption;
 pub mod memory;
 pub mod models;
 pub mod mongo;

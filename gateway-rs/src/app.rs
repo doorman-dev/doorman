@@ -4,6 +4,7 @@ use axum::{
     routing::{any, get},
 };
 use http::StatusCode;
+use std::any::Any;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove},
@@ -13,11 +14,12 @@ use tower_http::{
 use crate::{
     middleware::{
         activity::track_active_requests,
-        chaos::chaos_middleware,
+        chaos::{chaos_middleware, latency_injection},
         platform_cors::{force_platform_vary, platform_cors},
         request_id::request_id,
         response_compat::response_compat,
         security_headers::security_headers,
+        websocket_reject::reject_disabled_websockets,
     },
     policy::PolicyErrorBody,
     routes::{
@@ -84,7 +86,7 @@ pub fn build_router(state: AppState) -> Router {
                     .collect::<std::sync::Arc<[_]>>(),
             ),
         )
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::custom(handle_panic));
     let platform = Router::new()
         .route("/", any(platform_dispatch))
         .route("/{*path}", any(platform_dispatch))
@@ -119,7 +121,7 @@ pub fn build_router(state: AppState) -> Router {
                     .collect::<std::sync::Arc<[_]>>(),
             ),
         )
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::custom(handle_panic));
 
     Router::new()
         .nest("/api", api)
@@ -130,9 +132,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/metrics", get(metrics))
         .fallback(not_found)
+        .layer(axum_middleware::from_fn(latency_injection))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             track_active_requests,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            reject_disabled_websockets,
         ))
         .layer(compression)
         .layer(axum_middleware::from_fn(force_platform_vary))
@@ -145,6 +152,17 @@ async fn gateway_route_not_found() -> Response {
         Json(PolicyErrorBody {
             error_code: "GTW003".to_owned(),
             error_message: "Gateway route does not exist".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn handle_panic(_panic: Box<dyn Any + Send + 'static>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(PolicyErrorBody {
+            error_code: "ISE001".to_owned(),
+            error_message: "Internal Server Error".to_owned(),
         }),
     )
         .into_response()
@@ -173,6 +191,22 @@ async fn not_found(request: axum::extract::Request) -> Response {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[tokio::test]
+    async fn panic_handler_matches_python_internal_error_envelope() {
+        use http_body_util::BodyExt;
+
+        let response = handle_panic(Box::new("boom"));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error_code": "ISE001",
+                "error_message": "Internal Server Error"
+            })
+        );
+    }
 
     use axum::{
         body::{Body, to_bytes},

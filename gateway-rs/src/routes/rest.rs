@@ -326,7 +326,7 @@ async fn execute_rest(
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(PolicyErrorBody {
-                error_code: "GTW006".to_owned(),
+                error_code: "GTW999".to_owned(),
                 error_message: "Upstream circuit open".to_owned(),
             }),
         )
@@ -533,6 +533,15 @@ async fn execute_rest(
                 retry_backoff(attempt).await;
             }
             Ok(response) => break response,
+            Err(error) if error.is_timeout() && attempt < attempts => {
+                record_failure(&state.runtime.circuits, &circuit_key);
+                state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .runtime
+                    .upstream_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                retry_backoff(attempt).await;
+            }
             Err(_) if attempt < attempts => {
                 record_failure(&state.runtime.circuits, &circuit_key);
                 state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
@@ -633,7 +642,7 @@ async fn execute_rest(
         return Ok(policy_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "GTW006",
-            "Invalid JSON response from upstream",
+            "Malformed JSON from upstream",
         ));
     }
     let upstream_content_type = upstream_headers
@@ -814,11 +823,15 @@ async fn execute_crud(
         Ok(response) => Ok(response),
         Err(crate::storage::runtime::StorageError::InvalidDocument(error)) => {
             tracing::debug!(error = %error, "CRUD validation failed");
-            Ok(policy_error_response(
+            Ok((
                 StatusCode::BAD_REQUEST,
-                "CRUD400",
-                "Validation failed",
-            ))
+                Json(serde_json::json!({
+                    "error_code": "CRUD400",
+                    "error_message": "Validation failed",
+                    "response": {"errors": error.split("; ").collect::<Vec<_>>()}
+                })),
+            )
+                .into_response())
         }
         Err(error) => {
             tracing::error!(error = %error, "CRUD storage operation failed");
@@ -851,7 +864,8 @@ fn crud_resource_id(path: &str) -> Option<&str> {
 }
 
 fn parse_crud_body(body: &[u8]) -> Result<Value, crate::storage::runtime::StorageError> {
-    let value: Value = serde_json::from_slice(body)?;
+    // Python treats request.json() failures as an empty object for CRUD REST.
+    let value: Value = serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
     if !value.is_object() {
         return Err(crate::storage::runtime::StorageError::InvalidDocument(
             "CRUD request body must be a JSON object".to_owned(),
@@ -911,8 +925,12 @@ fn validate_crud_fields(
         let expected = rules.get("type").and_then(Value::as_str);
         let valid_type = match expected {
             Some("string") => field_value.is_string(),
-            Some("number") => field_value.is_number(),
-            Some("integer") => field_value.as_i64().is_some() || field_value.as_u64().is_some(),
+            Some("number") => field_value.is_number() || field_value.is_boolean(),
+            Some("integer") => {
+                field_value.as_i64().is_some()
+                    || field_value.as_u64().is_some()
+                    || field_value.is_boolean()
+            }
             Some("boolean") => field_value.is_boolean(),
             Some("array") => field_value.is_array(),
             Some("object") => field_value.is_object(),
@@ -931,19 +949,60 @@ fn validate_crud_fields(
                 .and_then(Value::as_u64)
                 .is_some_and(|min| text.chars().count() < min as usize)
             {
-                errors.push(format!("Field '{path}' is shorter than min_length"));
+                errors.push(format!(
+                    "Field '{path}' must be at least {} characters",
+                    rules["min_length"]
+                ));
             }
             if rules
                 .get("max_length")
                 .and_then(Value::as_u64)
                 .is_some_and(|max| text.chars().count() > max as usize)
             {
-                errors.push(format!("Field '{path}' is longer than max_length"));
+                errors.push(format!(
+                    "Field '{path}' must be at most {} characters",
+                    rules["max_length"]
+                ));
+            }
+            if let Some(pattern) = rules.get("pattern").and_then(Value::as_str)
+                && let Ok(pattern) = regex::Regex::new(&format!("^(?:{pattern})"))
+                && !pattern.is_match(text)
+            {
+                errors.push(format!(
+                    "Field '{path}' does not match pattern {}",
+                    rules["pattern"].as_str().unwrap_or_default()
+                ));
+            }
+            if let Some(allowed) = rules.get("enum").and_then(Value::as_array)
+                && !allowed.contains(field_value)
+            {
+                errors.push(format!(
+                    "Field '{path}' must be one of: {}",
+                    allowed
+                        .iter()
+                        .map(|value| value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
         }
-        if let Some(allowed) = rules.get("enum").and_then(Value::as_array) {
-            if !allowed.contains(field_value) {
-                errors.push(format!("Field '{path}' is not an allowed value"));
+        let numeric_value = field_value.as_f64().or_else(|| {
+            field_value
+                .as_bool()
+                .map(|value| if value { 1.0 } else { 0.0 })
+        });
+        if let Some(numeric_value) = numeric_value {
+            if let Some(minimum) = rules.get("min_value").and_then(Value::as_f64)
+                && numeric_value < minimum
+            {
+                errors.push(format!("Field '{path}' must be >= {}", rules["min_value"]));
+            }
+            if let Some(maximum) = rules.get("max_value").and_then(Value::as_f64)
+                && numeric_value > maximum
+            {
+                errors.push(format!("Field '{path}' must be <= {}", rules["max_value"]));
             }
         }
         if let (Some(properties), Some(object)) = (
@@ -1181,9 +1240,18 @@ async fn retry_backoff(attempt: u32) {
         .map(|seconds| (seconds * 1000.0) as u64)
         .unwrap_or(2_000);
     let delay_ms = base_ms
-        .saturating_mul(1_u64 << attempt.saturating_sub(1).min(20))
+        .saturating_mul(1_u64 << attempt.min(20))
         .min(maximum_ms);
-    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    let jitter_ms = if delay_ms == 0 {
+        0
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % (delay_ms + 1)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -1445,7 +1513,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["error_code"], "GTW006");
-        assert_eq!(body["error_message"], "Invalid JSON response from upstream");
+        assert_eq!(body["error_message"], "Malformed JSON from upstream");
         server.abort();
     }
 
@@ -1892,6 +1960,30 @@ mod tests {
 
         let wrong_type = json!({ "name": "Ada", "count": "two" });
         assert!(validate_crud_schema(Some(&schema), &wrong_type, false).is_err());
+
+        let constraints = json!({
+            "code": {"type": "string", "pattern": "[A-Z]{2}", "enum": ["AB", "CD"]},
+            "score": {"type": "number", "min_value": 1, "max_value": 5},
+            "integer": {"type": "integer"}
+        });
+        assert!(
+            validate_crud_schema(
+                Some(&constraints),
+                &json!({"code": "AB", "score": 3, "integer": true}),
+                false
+            )
+            .is_ok()
+        );
+        let error = validate_crud_schema(
+            Some(&constraints),
+            &json!({"code": "zz", "score": 8, "integer": false}),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not match pattern"));
+        assert!(error.contains("must be one of: AB, CD"));
+        assert!(error.contains("must be <= 5"));
         assert_eq!(
             crud_resource_id("/api/rest/demo/v1/items/resource-1"),
             Some("resource-1")

@@ -209,6 +209,19 @@ async fn live_role_permission_matrix_blocks_then_allows_each_management_operatio
     )
     .await;
     assert_eq!(api.status(), StatusCode::CREATED);
+    let endpoint = request(
+        &app,
+        Method::POST,
+        "/platform/endpoint",
+        Some(&admin),
+        Some(json!({
+            "api_name": "legacy-open-management", "api_version": "v1",
+            "endpoint_method": "GET", "endpoint_uri": "/visible",
+            "endpoint_description": "pinned Python authorization boundary"
+        })),
+    )
+    .await;
+    assert_eq!(endpoint.status(), StatusCode::CREATED);
 
     for (index, (permission, expected_code)) in [
         ("manage_apis", "API007"),
@@ -311,6 +324,20 @@ async fn least_privilege_role_cannot_create_apis_or_read_logs() {
     .await;
     assert_eq!(viewer.status(), StatusCode::CREATED);
     let viewer = login(&app, "viewer1@example.com", fixture_password()).await;
+    let api = request(
+        &app,
+        Method::POST,
+        "/platform/api",
+        Some(&admin),
+        Some(json!({
+            "api_name": "legacy-open-management", "api_version": "v1",
+            "api_description": "pinned Python authorization boundary",
+            "api_allowed_roles": ["admin"], "api_allowed_groups": ["ALL"],
+            "api_servers": ["http://127.0.0.1:9"], "api_type": "REST"
+        })),
+    )
+    .await;
+    assert_eq!(api.status(), StatusCode::CREATED);
     let create_api = request(
         &app,
         Method::POST,
@@ -329,6 +356,79 @@ async fn least_privilege_role_cannot_create_apis_or_read_logs() {
     .await;
     assert_eq!(create_api.status(), StatusCode::FORBIDDEN);
     assert_eq!(json_body(create_api).await["error_code"], "API007");
+    for path in [
+        "/platform/api/all?page=1&page_size=100",
+        "/platform/api/legacy-open-management/v1",
+        "/platform/endpoint/legacy-open-management/v1?page=1&page_size=100",
+    ] {
+        let response = request(&app, Method::GET, path, Some(&viewer), None).await;
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let update_endpoint = request(
+        &app,
+        Method::PUT,
+        "/platform/endpoint/GET/legacy-open-management/v1/visible",
+        Some(&viewer),
+        Some(json!({"endpoint_description": "blocked"})),
+    )
+    .await;
+    assert_eq!(update_endpoint.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(update_endpoint).await["error_code"], "END011");
+    let delete_endpoint = request(
+        &app,
+        Method::DELETE,
+        "/platform/endpoint/GET/legacy-open-management/v1/visible",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(delete_endpoint.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(delete_endpoint).await["error_code"], "END012");
+    for (method, path, payload, code) in [
+        (
+            Method::POST,
+            "/platform/endpoint/endpoint/validation",
+            Some(json!({
+                "endpoint_id": "missing", "validation_enabled": true,
+                "validation_schema": {"validation_schema": {}}
+            })),
+            "END013",
+        ),
+        (
+            Method::PUT,
+            "/platform/endpoint/endpoint/validation/missing",
+            Some(json!({
+                "validation_enabled": true,
+                "validation_schema": {"validation_schema": {}}
+            })),
+            "END014",
+        ),
+        (
+            Method::DELETE,
+            "/platform/endpoint/endpoint/validation/missing",
+            None,
+            "END015",
+        ),
+    ] {
+        let response = request(&app, method, path, Some(&viewer), payload).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(json_body(response).await["error_code"], code, "{path}");
+    }
+    let deleted = request(
+        &app,
+        Method::DELETE,
+        "/platform/api/legacy-open-management/v1",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(deleted).await,
+        json!({"message": "API deleted successfully"})
+    );
     for (path, code) in [
         ("/platform/logging/logs", "LOG001"),
         ("/platform/logging/logs/files", "LOG001"),
@@ -441,7 +541,7 @@ async fn non_admin_managers_cannot_discover_or_manage_bootstrap_admin() {
     .await;
     assert_eq!(roles.status(), StatusCode::OK);
     assert!(
-        json_body(roles).await["response"]["roles"]
+        json_body(roles).await["roles"]
             .as_array()
             .unwrap()
             .iter()
@@ -524,14 +624,9 @@ async fn non_admin_managers_cannot_discover_or_manage_bootstrap_admin() {
         (Method::POST, "/platform/authorization/admin/enable/admin"),
     ] {
         let response = request(&app, method, path, Some(&manager), Some(json!({}))).await;
-        assert!(
-            matches!(
-                response.status(),
-                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-            ),
-            "{path}: {}",
-            response.status()
-        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let body = json_body(response).await;
+        assert_eq!(body, json!({"error_message": "User not found"}), "{path}");
     }
 }
 
@@ -891,17 +986,22 @@ async fn routing_crud_requires_manage_routings_and_allows_routing_manager() {
 }
 
 #[tokio::test]
-async fn missing_group_and_role_reads_and_deletes_return_not_found() {
+async fn missing_group_and_role_contracts_match_python_service_codes() {
     let app = app().await;
     let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
     for (method, path, code) in [
         (Method::GET, "/platform/group/not-a-group", "GRP002"),
-        (Method::GET, "/platform/role/not-a-role", "ROL002"),
+        (Method::GET, "/platform/role/not-a-role", "ROLE004"),
         (Method::DELETE, "/platform/group/not-a-group", "GRP002"),
-        (Method::DELETE, "/platform/role/not-a-role", "ROL002"),
+        (Method::DELETE, "/platform/role/not-a-role", "ROLE004"),
     ] {
+        let expected = if method == Method::DELETE && path.contains("/role/") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::NOT_FOUND
+        };
         let response = request(&app, method, path, Some(&admin), None).await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(response.status(), expected, "{path}");
         assert_eq!(json_body(response).await["error_code"], code, "{path}");
     }
 }
@@ -933,5 +1033,95 @@ async fn non_admin_role_manager_cannot_create_admin_role() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json_body(response).await["error_code"], "ROLE009");
+    assert_eq!(json_body(response).await["error_code"], "ROLE013");
+}
+
+#[tokio::test]
+async fn role_route_permissions_visibility_and_admin_codes_match_python() {
+    let app = app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    for (name, manage_roles) in [("role-viewer", false), ("role-manager", true)] {
+        let response = request(
+            &app,
+            Method::POST,
+            "/platform/role",
+            Some(&admin),
+            Some(json!({"role_name": name, "manage_roles": manage_roles})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let viewer = create_user(&app, &admin, "role-viewer-user", "role-viewer").await;
+    let manager = create_user(&app, &admin, "role-manager-2", "role-manager").await;
+
+    let listed = request(
+        &app,
+        Method::GET,
+        "/platform/role?page=1&page_size=10",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = json_body(listed).await;
+    assert!(listed["roles"].is_array());
+    assert_eq!(listed["page"], 1);
+    assert_eq!(listed["page_size"], 10);
+    assert!(
+        listed["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|role| role["role_name"] != "admin")
+    );
+    assert_eq!(
+        request(
+            &app,
+            Method::GET,
+            "/platform/role/role-viewer",
+            Some(&viewer),
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    for (method, path, payload, code) in [
+        (
+            Method::POST,
+            "/platform/role",
+            Some(json!({"role_name": "denied-role"})),
+            "ROLE009",
+        ),
+        (
+            Method::PUT,
+            "/platform/role/role-viewer",
+            Some(json!({"view_logs": true})),
+            "ROLE010",
+        ),
+        (
+            Method::DELETE,
+            "/platform/role/role-viewer",
+            None,
+            "ROLE011",
+        ),
+    ] {
+        let response = request(&app, method, path, Some(&viewer), payload).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(response).await["error_code"], code);
+    }
+
+    for (method, code) in [(Method::PUT, "ROLE014"), (Method::DELETE, "ROLE016")] {
+        let response = request(
+            &app,
+            method,
+            "/platform/role/admin",
+            Some(&manager),
+            Some(json!({"view_logs": true})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(response).await["error_code"], code);
+    }
 }

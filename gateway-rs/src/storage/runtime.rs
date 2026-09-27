@@ -103,11 +103,12 @@ impl SharedStorage {
 
     async fn ensure_indexes(database: &Database) -> Result<(), StorageError> {
         let indexes = [
-            ("users", doc! {"username": 1}),
-            ("users", doc! {"email": 1}),
-            ("roles", doc! {"role_name": 1}),
-            ("groups", doc! {"group_name": 1}),
-            ("apis", doc! {"api_name": 1, "api_version": 1}),
+            ("users", doc! {"username": 1}, true),
+            ("users", doc! {"email": 1}, true),
+            ("roles", doc! {"role_name": 1}, true),
+            ("groups", doc! {"group_name": 1}, true),
+            ("apis", doc! {"api_id": 1}, true),
+            ("apis", doc! {"api_name": 1, "api_version": 1}, false),
             (
                 "endpoints",
                 doc! {
@@ -116,24 +117,33 @@ impl SharedStorage {
                     "endpoint_method": 1,
                     "endpoint_uri": 1
                 },
+                true,
             ),
-            ("subscriptions", doc! {"username": 1}),
-            ("routings", doc! {"client_key": 1}),
-            ("credit_defs", doc! {"api_credit_group": 1}),
-            ("user_credits", doc! {"username": 1}),
-            ("tiers", doc! {"tier_name": 1}),
-            ("user_tier_assignments", doc! {"user_id": 1}),
-            ("vault_entries", doc! {"username": 1, "key_name": 1}),
-            ("config_snapshots", doc! {"snapshot_id": 1}),
-            ("revocations", doc! {"type": 1, "username": 1, "jti": 1}),
+            ("subscriptions", doc! {"username": 1}, true),
+            ("routings", doc! {"client_key": 1}, true),
+            ("credit_defs", doc! {"api_credit_group": 1}, true),
+            ("user_credits", doc! {"username": 1}, true),
+            ("endpoint_validations", doc! {"endpoint_id": 1}, true),
+            ("tiers", doc! {"tier_id": 1}, true),
+            ("tiers", doc! {"name": 1}, false),
+            ("user_tier_assignments", doc! {"user_id": 1}, true),
+            ("user_tier_assignments", doc! {"tier_id": 1}, false),
+            ("vault_entries", doc! {"username": 1, "key_name": 1}, true),
+            ("vault_entries", doc! {"username": 1}, false),
+            ("config_snapshots", doc! {"snapshot_id": 1}, true),
+            (
+                "revocations",
+                doc! {"type": 1, "username": 1, "jti": 1},
+                true,
+            ),
         ];
-        for (collection, keys) in indexes {
+        for (collection, keys, unique) in indexes {
             database
                 .collection::<Document>(collection)
                 .create_index(
                     IndexModel::builder()
                         .keys(keys)
-                        .options(IndexOptions::builder().unique(true).build())
+                        .options(IndexOptions::builder().unique(unique).build())
                         .build(),
                 )
                 .await?;
@@ -1313,17 +1323,75 @@ fn value_matches(item: &Value, filter: &Value) -> bool {
     let Some(filter) = filter.as_object() else {
         return true;
     };
-    filter
-        .iter()
-        .all(|(key, expected)| item.get(key) == Some(expected))
+    filter.iter().all(|(key, expected)| {
+        if key == "$or" {
+            return expected.as_array().is_none_or(|alternatives| {
+                alternatives
+                    .iter()
+                    .any(|alternative| value_matches(item, alternative))
+            });
+        }
+        if let Some(candidates) = expected.get("$in").and_then(Value::as_array) {
+            return item
+                .get(key)
+                .is_some_and(|actual| candidates.contains(actual));
+        }
+        item.get(key) == Some(expected)
+    })
 }
 
 fn merge_object(target: &mut Value, updates: &Value) {
     if let (Some(target), Some(updates)) = (target.as_object_mut(), updates.as_object()) {
         for (key, value) in updates {
-            if key != "_id" && !value.is_null() {
-                target.insert(key.clone(), value.clone());
+            if key == "_id" {
+                continue;
             }
+            let parts = key.split('.').collect::<Vec<_>>();
+            let mut current = &mut *target;
+            for part in &parts[..parts.len().saturating_sub(1)] {
+                let entry = current
+                    .entry((*part).to_owned())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !entry.is_object() {
+                    *entry = Value::Object(serde_json::Map::new());
+                }
+                current = entry.as_object_mut().expect("object inserted above");
+            }
+            let leaf = parts.last().copied().unwrap_or(key.as_str());
+            current.insert(leaf.to_owned(), value.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn memory_filters_match_python_or_and_in_contracts() {
+        let item = json!({"name": "alice", "role": "admin"});
+        assert!(value_matches(
+            &item,
+            &json!({"$or": [{"name": "missing"}, {"role": "admin"}]})
+        ));
+        assert!(value_matches(
+            &item,
+            &json!({"name": {"$in": ["alice", "bob"]}})
+        ));
+        assert!(!value_matches(&item, &json!({"name": {"$in": ["bob"]}})));
+    }
+
+    #[test]
+    fn memory_updates_set_null_and_dotted_fields_like_python() {
+        let mut item = json!({"profile": "old", "keep": true});
+        merge_object(
+            &mut item,
+            &json!({"profile.email": "a@example.com", "keep": null}),
+        );
+        assert_eq!(
+            item,
+            json!({"profile": {"email": "a@example.com"}, "keep": null})
+        );
     }
 }

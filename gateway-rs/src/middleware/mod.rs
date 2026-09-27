@@ -8,3 +8,4 @@ pub mod platform_cors;
 pub mod request_id;
 pub mod response_compat;
 pub mod security_headers;
+pub mod websocket_reject;

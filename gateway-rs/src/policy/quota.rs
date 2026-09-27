@@ -16,13 +16,13 @@ pub struct QuotaPolicy {
 /// Derived usage state used by the quota API and enforcement callers.
 /// Thresholds deliberately match the Python tracker: warning begins at 80%
 /// and critical at 95%, including the exhausted boundary.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct QuotaUsageStatus {
     pub allowed: bool,
     pub current_usage: u64,
     pub limit: u64,
     pub remaining: u64,
-    pub percentage_used: u64,
+    pub percentage_used: f64,
     pub is_warning: bool,
     pub is_critical: bool,
     pub is_exhausted: bool,
@@ -31,9 +31,9 @@ pub struct QuotaUsageStatus {
 pub fn quota_usage_status(current_usage: u64, limit: u64) -> QuotaUsageStatus {
     let remaining = limit.saturating_sub(current_usage);
     let percentage_used = if limit == 0 {
-        0
+        0.0
     } else {
-        current_usage.saturating_mul(100) / limit
+        current_usage as f64 / limit as f64 * 100.0
     };
     let is_exhausted = limit == 0 || current_usage >= limit;
     QuotaUsageStatus {
@@ -42,8 +42,8 @@ pub fn quota_usage_status(current_usage: u64, limit: u64) -> QuotaUsageStatus {
         limit,
         remaining,
         percentage_used,
-        is_warning: percentage_used >= 80,
-        is_critical: percentage_used >= 95,
+        is_warning: percentage_used >= 80.0,
+        is_critical: percentage_used >= 95.0,
         is_exhausted,
     }
 }
@@ -85,10 +85,24 @@ pub fn increment_quota(
     period_seconds: u64,
     now_seconds: u64,
 ) -> u64 {
+    increment_quota_by(counter, user_id, quota_id, 1, period_seconds, now_seconds)
+}
+
+/// Records an arbitrary positive usage amount, matching the Python tracker's
+/// `increment_quota(..., amount=...)` contract.
+pub fn increment_quota_by(
+    counter: &WindowCounter,
+    user_id: &str,
+    quota_id: &str,
+    amount: u64,
+    period_seconds: u64,
+    now_seconds: u64,
+) -> u64 {
     let period = period_seconds.max(1);
     let window_index = now_seconds / period;
-    counter.incr(
+    counter.incr_by(
         &quota_counter_key(user_id, quota_id, window_index),
+        amount,
         period.saturating_mul(2),
         now_seconds,
     )
@@ -138,6 +152,9 @@ mod tests {
         assert!(exhausted.is_exhausted);
         assert!(!exhausted.allowed);
         assert_eq!(exhausted.remaining, 0);
+
+        let fractional = quota_usage_status(1, 3);
+        assert!((fractional.percentage_used - 33.333_333_333_333_33).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -146,5 +163,9 @@ mod tests {
         assert_eq!(increment_quota(&counter, "alice", "requests", 60, 60), 1);
         assert_eq!(increment_quota(&counter, "alice", "requests", 60, 61), 2);
         assert_eq!(increment_quota(&counter, "alice", "requests", 60, 120), 1);
+        assert_eq!(
+            increment_quota_by(&counter, "alice", "requests", 4, 60, 121),
+            5
+        );
     }
 }

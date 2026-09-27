@@ -113,6 +113,10 @@ struct CounterEntry {
 
 impl WindowCounter {
     pub fn incr(&self, key: &str, ttl_seconds: u64, now_seconds: u64) -> u64 {
+        self.incr_by(key, 1, ttl_seconds, now_seconds)
+    }
+
+    pub fn incr_by(&self, key: &str, amount: u64, ttl_seconds: u64, now_seconds: u64) -> u64 {
         let mut inner = self.inner.lock().expect("counter mutex poisoned");
         let entry = inner.entry(key.to_owned()).or_insert(CounterEntry {
             count: 0,
@@ -122,7 +126,7 @@ impl WindowCounter {
             entry.count = 0;
             entry.expires_at = now_seconds + ttl_seconds;
         }
-        entry.count += 1;
+        entry.count = entry.count.saturating_add(amount);
         entry.count
     }
 

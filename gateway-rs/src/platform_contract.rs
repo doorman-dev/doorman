@@ -46,8 +46,9 @@ const BOOL_FIELDS: &[&str] = &[
     "api_graphql_subscriptions",
     "api_grpc_web_enabled",
     "api_is_crud",
-    "enforce_admin_subscription",
 ];
+
+const RUST_EXTENSION_BOOL_FIELDS: &[&str] = &["enforce_admin_subscription"];
 
 const INT_FIELDS: &[&str] = &["api_allowed_retry_count", "api_graphql_max_depth"];
 
@@ -175,6 +176,9 @@ fn normalize_api_fields(payload: &Value, update: bool) -> Result<Value, Vec<Valu
         );
     }
     for field in BOOL_FIELDS {
+        normalize_optional(input, &mut output, &mut errors, field, coerce_bool, "bool");
+    }
+    for field in RUST_EXTENSION_BOOL_FIELDS {
         normalize_optional(input, &mut output, &mut errors, field, coerce_bool, "bool");
     }
     for field in INT_FIELDS {
@@ -386,7 +390,19 @@ mod tests {
         assert_eq!(value["api_allowed_roles"], json!([]));
         assert_eq!(value["api_auth_required"], true);
         assert_eq!(value["api_description"], Value::Null);
+        assert!(value.get("enforce_admin_subscription").is_none());
         assert!(value.get("unknown").is_none());
+    }
+
+    #[test]
+    fn rust_extension_bool_is_coerced_without_becoming_a_python_default() {
+        let value = normalize_create_api(&json!({
+            "api_name": "orders",
+            "api_version": "v1",
+            "enforce_admin_subscription": "yes"
+        }))
+        .unwrap();
+        assert_eq!(value["enforce_admin_subscription"], true);
     }
 
     #[test]

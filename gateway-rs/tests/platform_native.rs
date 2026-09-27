@@ -306,7 +306,11 @@ async fn discovery_document_reads_fetch_once_and_reuse_the_python_cache_contract
                         let calls = openapi_counter.clone();
                         async move {
                             calls.fetch_add(1, Ordering::SeqCst);
-                            Json(json!({"openapi": "3.0.0", "info": {"title": "Test API", "version": "1.0.0"}}))
+                            Json(json!({
+                                "openapi": "3.0.0",
+                                "info": {"title": "Test API", "version": "1.0.0"},
+                                "paths": {"/widgets": {"get": {"summary": "List widgets"}}}
+                            }))
                         }
                     }),
                 )
@@ -379,6 +383,45 @@ async fn discovery_document_reads_fetch_once_and_reuse_the_python_cache_contract
         assert_eq!(response_json(response).await["info"]["title"], "Test API");
     }
     assert_eq!(openapi_calls.load(Ordering::SeqCst), 1);
+
+    let refreshed = platform_request(
+        &app,
+        Method::POST,
+        "/platform/api/cached-openapi/v1/openapi/refresh",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(refreshed).await,
+        json!({
+            "message": "OpenAPI spec refreshed successfully",
+            "endpoints_found": 1
+        })
+    );
+    assert_eq!(openapi_calls.load(Ordering::SeqCst), 2);
+
+    let imported = platform_request(
+        &app,
+        Method::POST,
+        "/platform/api/cached-openapi/v1/openapi/import",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(imported.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(imported).await,
+        json!({
+            "message": "OpenAPI import completed",
+            "endpoints_found": 1,
+            "endpoints_imported": 1,
+            "endpoints_skipped": 0
+        })
+    );
 
     for (expected_cached, _) in [(false, 0), (true, 1)] {
         let response = platform_request(
@@ -1016,6 +1059,45 @@ async fn user_create_requires_python_model_role_before_service_logic() {
 }
 
 #[tokio::test]
+async fn update_password_model_validates_before_auth_and_matches_pydantic_bounds() {
+    let app = build_router(memory_state(false).await);
+    for body in [
+        json!({}),
+        json!({"new_password": []}),
+        json!({"new_password": "short"}),
+        json!({"new_password": "x".repeat(37)}),
+    ] {
+        let response = platform_request(
+            &app,
+            Method::PUT,
+            "/platform/user/someone/update-password",
+            None,
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response_json(response).await["error_code"], "VAL001");
+    }
+
+    for body in [
+        json!({"new_password": "é".repeat(36)}),
+        json!({"new_password": 123456, "unknown": "ignored"}),
+    ] {
+        let response = platform_request(
+            &app,
+            Method::PUT,
+            "/platform/user/someone/update-password",
+            None,
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
 async fn user_create_matches_pydantic_bounds_and_scalar_coercion() {
     let app = build_router(memory_state(false).await);
     let (cookie, _) = login(&app).await;
@@ -1025,6 +1107,8 @@ async fn user_create_matches_pydantic_bounds_and_scalar_coercion() {
         json!({"username": "shortpassword", "email": "shortpassword@example.com", "password": "TooShort1!", "role": "user"}),
         json!({"username": "negative-rate", "email": "negative-rate@example.com", "password": "A_secure_password_123!", "role": "user", "rate_limit_duration": -1}),
         json!({"username": "scalar-groups", "email": "scalar-groups@example.com", "password": "A_secure_password_123!", "role": "user", "groups": "team"}),
+        json!({"username": "null-groups", "email": "null-groups@example.com", "password": "A_secure_password_123!", "role": "user", "groups": null}),
+        json!({"username": "unicode-too-long", "email": "unicode-too-long@example.com", "password": "A_secure_password_123!", "role": "é".repeat(51)}),
     ] {
         let response = platform_request(
             &app,
@@ -1070,7 +1154,26 @@ async fn user_create_matches_pydantic_bounds_and_scalar_coercion() {
     assert_eq!(created["rate_limit_duration"], 7);
     assert_eq!(created["active"], false);
     assert_eq!(created["bandwidth_limit_window"], "day");
+    assert_eq!(created["ui_access"], false);
+    assert!(created["throttle_duration"].is_null());
+    assert!(created["custom_attributes"].is_null());
     assert!(created.get("unexpected").is_none());
+
+    let unicode = platform_request(
+        &app,
+        Method::POST,
+        "/platform/user",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "username": "é".repeat(50),
+            "email": "unicode@example.com",
+            "password": "A_secure_password_123!",
+            "role": "é".repeat(50),
+        })),
+    )
+    .await;
+    assert_eq!(unicode.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -1390,6 +1493,35 @@ async fn role_and_group_models_match_pydantic_defaults_coercion_and_empty_update
         response_json(empty_group_update).await["error_code"],
         "GRP006"
     );
+    for (path, field) in [
+        ("/platform/role", "role_name"),
+        ("/platform/group", "group_name"),
+    ] {
+        let accepted = platform_request(
+            &app,
+            Method::POST,
+            path,
+            Some(&cookie),
+            None,
+            Some(json!({field: "é".repeat(50)})),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::CREATED, "{path}");
+        let rejected = platform_request(
+            &app,
+            Method::POST,
+            path,
+            Some(&cookie),
+            None,
+            Some(json!({field: "é".repeat(51)})),
+        )
+        .await;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1497,6 +1629,26 @@ async fn routing_models_match_pydantic_generation_coercion_and_update_exclusion(
     .await;
     assert_eq!(missing_update.status(), StatusCode::BAD_REQUEST);
     assert_eq!(response_json(missing_update).await["error_code"], "RTG004");
+    let unicode_boundary = platform_request(
+        &app,
+        Method::POST,
+        "/platform/routing",
+        Some(&cookie),
+        None,
+        Some(json!({"routing_name": "é".repeat(50), "routing_servers": ["http://upstream"]})),
+    )
+    .await;
+    assert_eq!(unicode_boundary.status(), StatusCode::CREATED);
+    let unicode_too_long = platform_request(
+        &app,
+        Method::POST,
+        "/platform/routing",
+        Some(&cookie),
+        None,
+        Some(json!({"routing_name": "é".repeat(51), "routing_servers": ["http://upstream"]})),
+    )
+    .await;
+    assert_eq!(unicode_too_long.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -1521,7 +1673,7 @@ async fn endpoint_models_match_pydantic_coercion_bounds_and_null_elision() {
         Some(json!({
             "api_name": "endpoint-model", "api_version": "v1", "endpoint_method": "GET",
             "endpoint_uri": "/items", "endpoint_description": 123, "endpoint_servers": [1, false],
-            "ignored": "field"
+            "api_id": "", "endpoint_id": "", "ignored": "field"
         })),
     )
     .await;
@@ -1538,6 +1690,32 @@ async fn endpoint_models_match_pydantic_coercion_bounds_and_null_elision() {
     assert_eq!(endpoint["client_uri"], Value::Null);
     assert_eq!(endpoint["api_id"], "source-api-id");
     assert!(endpoint.get("ignored").is_none());
+    let unicode_boundary = platform_request(
+        &app,
+        Method::POST,
+        "/platform/endpoint",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "api_name": "endpoint-model", "api_version": "v1", "endpoint_method": "GET",
+            "endpoint_uri": "/unicode", "endpoint_description": "é".repeat(255)
+        })),
+    )
+    .await;
+    assert_eq!(unicode_boundary.status(), StatusCode::CREATED);
+    let unicode_too_long = platform_request(
+        &app,
+        Method::POST,
+        "/platform/endpoint",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "api_name": "endpoint-model", "api_version": "v1", "endpoint_method": "GET",
+            "endpoint_uri": "/unicode-too-long", "endpoint_description": "é".repeat(256)
+        })),
+    )
+    .await;
+    assert_eq!(unicode_too_long.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let duplicate = platform_request(
         &app,
         Method::POST,
@@ -1743,6 +1921,30 @@ async fn subscription_model_coerces_python_scalars_and_ignores_unknown_fields() 
     )
     .await;
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let unicode_boundary = platform_request(
+        &app,
+        Method::POST,
+        "/platform/subscription/subscribe",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "username": "admin", "api_name": "é".repeat(50), "api_version": "v1"
+        })),
+    )
+    .await;
+    assert_eq!(unicode_boundary.status(), StatusCode::NOT_FOUND);
+    let unicode_too_long = platform_request(
+        &app,
+        Method::POST,
+        "/platform/subscription/subscribe",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "username": "admin", "api_name": "é".repeat(51), "api_version": "v1"
+        })),
+    )
+    .await;
+    assert_eq!(unicode_too_long.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -1859,6 +2061,10 @@ async fn authorization_refresh_and_invalidate_match_python() {
     )
     .await;
     assert_eq!(invalidate.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(invalidate).await,
+        json!({"message": "Your token has been invalidated"})
+    );
 
     let rejected = platform_request(
         &app,
@@ -2028,8 +2234,7 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     .await;
     assert_eq!(status.status(), StatusCode::OK);
     let status = response_json(status).await;
-    assert_eq!(status["active"], true);
-    assert_eq!(status["revoked"], false);
+    assert_eq!(status, json!({"active": true, "revoked": false}));
 
     let revoke_path = format!("/platform/authorization/admin/revoke/{username}");
     let revoke = platform_request(
@@ -2042,6 +2247,10 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     )
     .await;
     assert_eq!(revoke.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(revoke).await,
+        json!({"message": format!("All tokens revoked for {username}")})
+    );
     let rejected = platform_request(
         &app,
         Method::GET,
@@ -2064,6 +2273,10 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     )
     .await;
     assert_eq!(disable.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(disable).await,
+        json!({"message": format!("User {username} disabled and tokens revoked")})
+    );
     let status = platform_request(
         &app,
         Method::GET,
@@ -2088,6 +2301,10 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     )
     .await;
     assert_eq!(enable.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(enable).await,
+        json!({"message": format!("User {username} enabled")})
+    );
     let unrevoke_path = format!("/platform/authorization/admin/unrevoke/{username}");
     let unrevoke = platform_request(
         &app,
@@ -2099,6 +2316,10 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     )
     .await;
     assert_eq!(unrevoke.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(unrevoke).await,
+        json!({"message": format!("Token revocation cleared for {username}")})
+    );
     let status = platform_request(
         &app,
         Method::GET,
@@ -2111,6 +2332,49 @@ async fn authorization_admin_lifecycle_and_revoke_match_python() {
     let status = response_json(status).await;
     assert_eq!(status["active"], true);
     assert_eq!(status["revoked"], false);
+
+    for (method, action, expected) in [
+        (
+            Method::POST,
+            "revoke",
+            "All tokens revoked for missing-user",
+        ),
+        (
+            Method::POST,
+            "unrevoke",
+            "Token revocation cleared for missing-user",
+        ),
+        (
+            Method::POST,
+            "disable",
+            "User missing-user disabled and tokens revoked",
+        ),
+        (Method::POST, "enable", "User missing-user enabled"),
+    ] {
+        let response = platform_request(
+            &app,
+            method,
+            &format!("/platform/authorization/admin/{action}/missing-user"),
+            Some(&admin_cookie),
+            None,
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{action}");
+        assert_eq!(response_json(response).await, json!({"message": expected}));
+    }
+
+    let missing_status = platform_request(
+        &app,
+        Method::GET,
+        "/platform/authorization/admin/status/missing-user",
+        Some(&admin_cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(missing_status.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response_json(missing_status).await["error_code"], "GTW999");
 }
 
 #[derive(Clone, Default)]
@@ -3440,7 +3704,7 @@ async fn strict_wildcard_cors_allows_localhost_like_python() {
 }
 
 #[tokio::test]
-async fn proto_upload_rejects_traversal_filename() {
+async fn proto_upload_ignores_the_client_filename_like_python() {
     let app = build_router(memory_state(false).await);
     let (cookie, _) = login(&app).await;
     let boundary = "doorman-proto-boundary";
@@ -3462,8 +3726,11 @@ async fn proto_upload_rejects_traversal_filename() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(response_json(response).await["error_code"], "REQ002");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["message"],
+        "Proto file uploaded and gRPC code generated successfully"
+    );
 }
 
 #[tokio::test]
@@ -3549,6 +3816,10 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
         .await
         .unwrap();
     assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(updated).await,
+        json!({"message": "Proto file updated successfully"})
+    );
     let fetched = app
         .clone()
         .oneshot(
@@ -3561,12 +3832,9 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
         .await
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
-    assert!(
-        response_json(fetched).await["content"]
-            .as_str()
-            .unwrap()
-            .contains("Pong")
-    );
+    let fetched = response_json(fetched).await;
+    assert_eq!(fetched["message"], "Proto file retrieved successfully");
+    assert!(fetched["content"].as_str().unwrap().contains("Pong"));
     let deleted = app
         .clone()
         .oneshot(
@@ -3580,6 +3848,10 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(deleted).await,
+        json!({"message": "Proto file and generated files deleted successfully"})
+    );
     for path in [
         "/platform/proto/sample/v1",
         "/platform/proto/doesnotexist/v9",
@@ -3596,6 +3868,11 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            response_json(missing).await["error_code"],
+            "API002",
+            "{path}"
+        );
     }
 }
 
@@ -3807,7 +4084,11 @@ async fn limited_role_cannot_manage_monitor_credits_caches_or_endpoint_validatio
         "/platform/endpoint/endpoint/validation",
         Some(&cookie),
         None,
-        Some(json!({"endpoint_id": "missing", "validation_enabled": true})),
+        Some(json!({
+            "endpoint_id": "missing",
+            "validation_enabled": true,
+            "validation_schema": {"validation_schema": {}}
+        })),
     )
     .await;
     assert_eq!(validation.status(), StatusCode::FORBIDDEN);
@@ -3938,10 +4219,10 @@ async fn proto_retrieval_requires_manage_apis_permission() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = response_json(response).await;
-    assert_eq!(body["error_code"], "API008");
+    assert_eq!(body["error_code"], "AUTH001");
     assert_eq!(
         body["error_message"],
-        "You do not have permission to manage proto files"
+        "User does not have permission to manage APIs"
     );
 }
 
@@ -3996,6 +4277,30 @@ async fn platform_security_headers_csp_hsts_and_request_ids_match_python() {
     assert!(secure.headers().contains_key("strict-transport-security"));
     assert_eq!(secure.headers()["x-request-id"], "python-request-id");
     assert_eq!(secure.headers()["request_id"], "python-request-id");
+
+    let docs_app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&docs_app).await;
+    let docs = platform_request(
+        &docs_app,
+        Method::GET,
+        "/platform/docs",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert!(
+        !docs.headers().contains_key("x-frame-options"),
+        "{:?}",
+        docs.headers()
+    );
+    assert!(
+        docs.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors *")
+    );
 }
 
 #[tokio::test]
@@ -4407,6 +4712,7 @@ async fn management_permissions_readiness_tools_and_restart_preserve_contract() 
     let admin_readiness: Value =
         serde_json::from_slice(&to_bytes(admin_readiness.into_body(), 4096).await.unwrap())
             .unwrap();
+    assert_eq!(admin_readiness.as_object().unwrap().len(), 7);
     assert!(admin_readiness.get("mongodb").is_some());
     assert!(admin_readiness.get("cache_backend").is_some());
 
@@ -4537,6 +4843,79 @@ async fn management_permissions_readiness_tools_and_restart_preserve_contract() 
 }
 
 #[tokio::test]
+async fn tools_permissions_and_required_models_match_python() {
+    let (gateway_app, gateway_cookie) =
+        config_permission_app(Some("manage_gateway"), "tools-gateway").await;
+    let chaos = platform_request(
+        &gateway_app,
+        Method::POST,
+        "/platform/tools/chaos/toggle",
+        Some(&gateway_cookie),
+        None,
+        Some(json!({"backend": "mongo", "enabled": false})),
+    )
+    .await;
+    assert_eq!(chaos.status(), StatusCode::OK);
+
+    let cors_denied = platform_request(
+        &gateway_app,
+        Method::POST,
+        "/platform/tools/cors/check",
+        Some(&gateway_cookie),
+        None,
+        Some(json!({"origin": "http://localhost:3000", "method": "GET"})),
+    )
+    .await;
+    assert_eq!(cors_denied.status(), StatusCode::FORBIDDEN);
+
+    let missing = platform_request(
+        &gateway_app,
+        Method::POST,
+        "/platform/tools/chaos/toggle",
+        Some(&gateway_cookie),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let missing: Value =
+        serde_json::from_slice(&to_bytes(missing.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(missing["detail"].as_array().unwrap().len(), 2);
+    assert_eq!(missing["detail"][0]["loc"], json!(["body", "backend"]));
+    assert_eq!(missing["detail"][1]["loc"], json!(["body", "enabled"]));
+
+    let (security_app, security_cookie) =
+        config_permission_app(Some("manage_security"), "tools-security").await;
+    let cors = platform_request(
+        &security_app,
+        Method::POST,
+        "/platform/tools/cors/check",
+        Some(&security_cookie),
+        None,
+        Some(json!({"origin": "http://not-allowed.example", "method": "GET"})),
+    )
+    .await;
+    assert_eq!(cors.status(), StatusCode::OK);
+    let cors: Value =
+        serde_json::from_slice(&to_bytes(cors.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        cors["preflight"]["response_headers"]["Access-Control-Allow-Origin"],
+        Value::Null
+    );
+
+    let chaos_denied = platform_request(
+        &security_app,
+        Method::POST,
+        "/platform/tools/chaos/toggle",
+        Some(&security_cookie),
+        None,
+        Some(json!({"backend": "redis", "enabled": true})),
+    )
+    .await;
+    assert_eq!(chaos_denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn readiness_degrades_when_an_active_grpc_api_lacks_a_descriptor() {
     let state = memory_state(false).await;
     let storage = state.storage.clone().unwrap();
@@ -4565,7 +4944,7 @@ async fn readiness_degrades_when_an_active_grpc_api_lacks_a_descriptor() {
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
     let readiness = response_json(response).await;
     assert_eq!(readiness["status"], "degraded");
     assert_eq!(readiness["missing_grpc_descriptors"], 1);
@@ -4576,7 +4955,7 @@ async fn readiness_degrades_when_an_active_grpc_api_lacks_a_descriptor() {
 }
 
 #[tokio::test]
-async fn readiness_degrades_when_a_background_persistence_task_is_unhealthy() {
+async fn readiness_matches_python_and_ignores_v2_background_task_health() {
     let state = memory_state(false).await;
     state
         .runtime
@@ -4594,10 +4973,10 @@ async fn readiness_degrades_when_a_background_persistence_task_is_unhealthy() {
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
     let readiness = response_json(response).await;
-    assert_eq!(readiness["status"], "degraded");
-    assert_eq!(readiness["metrics_persistence_healthy"], false);
+    assert_eq!(readiness["status"], "ready");
+    assert!(readiness.get("metrics_persistence_healthy").is_none());
 }
 
 #[tokio::test]
@@ -4707,6 +5086,37 @@ async fn analytics_routes_preserve_python_v2_response_contracts() {
         serde_json::from_slice(&to_bytes(top.into_body(), 64 * 1024).await.unwrap()).unwrap();
     assert!(top["top_apis"][0]["api"].is_string());
     assert!(top["total_apis"].is_number());
+
+    for (path, field, kind) in [
+        (
+            "/platform/analytics/top-users?limit=0",
+            "limit",
+            "value_error.number.not_ge",
+        ),
+        (
+            "/platform/analytics/overview?start_ts=not-an-int",
+            "start_ts",
+            "type_error.integer",
+        ),
+    ] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid: Value =
+            serde_json::from_slice(&to_bytes(invalid.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(invalid["detail"][0]["loc"], json!(["query", field]));
+        assert_eq!(invalid["detail"][0]["type"], kind);
+    }
 
     let detail = app
         .oneshot(
@@ -5503,10 +5913,24 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
         None,
     )
     .await;
-    assert!(matches!(
-        missing.status(),
-        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
-    ));
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let missing = response_json(missing).await;
+    assert_eq!(missing["error_code"], "END004");
+    assert_eq!(
+        missing["error_message"],
+        "Endpoint does not exist for the requested API name, version and URI"
+    );
+    let empty = platform_request(
+        &app,
+        Method::GET,
+        "/platform/endpoint/na/v1",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(empty).await["error_code"], "END005");
     let api = platform_request(&app, Method::POST, "/platform/api", Some(&cookie), None, Some(json!({"api_name": "valapi", "api_version": "v1", "api_description": "validation api", "api_allowed_roles": ["admin"], "api_allowed_groups": ["ALL"], "api_servers": ["http://127.0.0.1:9"], "api_type": "REST", "active": true}))).await;
     assert!(api.status().is_success());
     let endpoint = platform_request(&app, Method::POST, "/platform/endpoint", Some(&cookie), None, Some(json!({"api_name": "valapi", "api_version": "v1", "endpoint_method": "POST", "endpoint_uri": "/payload", "endpoint_description": "payload"}))).await;
@@ -5525,8 +5949,19 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
         .as_str()
         .unwrap()
         .to_owned();
-    let schema = json!({"validation_schema": {"id": {"required": true, "type": "string"}}});
-    let validation = json!({"endpoint_id": endpoint_id.clone(), "validation_enabled": true, "validation_schema": schema});
+    let schema = json!({"validation_schema": {"id": {
+        "required": 1,
+        "type": "string",
+        "min": "2",
+        "nested_schema": null,
+        "ignored": "field"
+    }}});
+    let validation = json!({
+        "endpoint_id": endpoint_id.clone(),
+        "validation_enabled": "yes",
+        "validation_schema": schema,
+        "ignored": "field"
+    });
     let created = platform_request(
         &app,
         Method::POST,
@@ -5547,6 +5982,15 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     )
     .await;
     assert_eq!(fetched.status(), StatusCode::OK);
+    let fetched = response_json(fetched).await;
+    assert_eq!(fetched["validation_enabled"], true);
+    let id_rules = &fetched["validation_schema"]["validation_schema"]["id"];
+    assert_eq!(id_rules["required"], true);
+    assert_eq!(id_rules["min"], 2);
+    assert_eq!(id_rules["max"], Value::Null);
+    assert_eq!(id_rules["pattern"], Value::Null);
+    assert!(id_rules.get("ignored").is_none());
+    assert!(fetched.get("ignored").is_none());
     let updated = platform_request(
         &app,
         Method::PUT,
@@ -5557,6 +6001,16 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     )
     .await;
     assert_eq!(updated.status(), StatusCode::OK);
+    let invalid = platform_request(
+        &app,
+        Method::PUT,
+        &format!("/platform/endpoint/endpoint/validation/{endpoint_id}"),
+        Some(&cookie),
+        None,
+        Some(json!({"validation_enabled": true})),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let deleted = platform_request(
         &app,
         Method::DELETE,
@@ -5619,6 +6073,13 @@ async fn python_config_export_sections_and_import_variants() {
             .unwrap()
             .iter()
             .any(|endpoint| endpoint["endpoint_uri"] == "/x")
+    );
+    assert!(
+        endpoints["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|endpoint| endpoint["api_name"] == "filterapi" && endpoint["api_version"] == "v1")
     );
     for section in [
         json!({"apis": []}),
@@ -5711,13 +6172,14 @@ async fn python_config_permissions_granular_export_and_gateway_import_contracts(
     .await;
     assert_eq!(import.status(), StatusCode::OK);
     let (limited_app, limited_cookie) = config_permission_app(None, "config-limited").await;
-    for (method, path, payload) in [
-        (Method::GET, "/platform/config/export/apis", None),
-        (Method::GET, "/platform/config/export/all", None),
+    for (method, path, payload, code) in [
+        (Method::GET, "/platform/config/export/apis", None, "CFG002"),
+        (Method::GET, "/platform/config/export/all", None, "CFG001"),
         (
             Method::POST,
             "/platform/config/import",
             Some(json!({"apis": []})),
+            "CFG006",
         ),
     ] {
         let response = platform_request(
@@ -5730,6 +6192,7 @@ async fn python_config_permissions_granular_export_and_gateway_import_contracts(
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(response_json(response).await["error_code"], code, "{path}");
     }
 }
 
@@ -5737,15 +6200,83 @@ async fn python_config_permissions_granular_export_and_gateway_import_contracts(
 async fn config_export_missing_named_resources_return_python_404() {
     let app = build_router(memory_state(false).await);
     let (cookie, _) = login(&app).await;
-    for path in [
-        "/platform/config/export/apis?api_name=nope&api_version=v9",
-        "/platform/config/export/roles?role_name=nope-role",
-        "/platform/config/export/groups?group_name=nope-group",
-        "/platform/config/export/routings?client_key=nope-key",
+    let role = platform_request(
+        &app,
+        Method::GET,
+        "/platform/config/export/roles?role_name=admin",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(role.status(), StatusCode::OK);
+    let role = response_json(role).await;
+    assert_eq!(role["role"]["role_name"], "admin");
+    assert!(role.get("roles").is_none());
+    for (path, code, message) in [
+        (
+            "/platform/config/export/apis?api_name=nope&api_version=v9",
+            "CFG404",
+            "API not found",
+        ),
+        (
+            "/platform/config/export/roles?role_name=nope-role",
+            "CFG405",
+            "Role not found",
+        ),
+        (
+            "/platform/config/export/groups?group_name=nope-group",
+            "CFG406",
+            "Group not found",
+        ),
+        (
+            "/platform/config/export/routings?client_key=nope-key",
+            "CFG407",
+            "Routing not found",
+        ),
     ] {
         let response = platform_request(&app, Method::GET, path, Some(&cookie), None, None).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let response = response_json(response).await;
+        assert_eq!(response["error_code"], code, "{path}");
+        assert_eq!(response["error_message"], message, "{path}");
     }
+}
+
+#[tokio::test]
+async fn config_rollback_preserves_python_permission_and_missing_snapshot_quirks() {
+    let (limited_app, limited_cookie) = config_permission_app(None, "rollback-limited").await;
+    let denied = platform_request(
+        &limited_app,
+        Method::POST,
+        "/platform/config/rollback",
+        Some(&limited_cookie),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_json(denied).await,
+        json!({"detail": "Rollback failed"})
+    );
+
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+    let missing = platform_request(
+        &app,
+        Method::POST,
+        "/platform/config/rollback",
+        Some(&cookie),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(missing).await,
+        json!({"error_code": "CFG404", "error_message": "No snapshot found"})
+    );
 }
 
 #[tokio::test]
@@ -5934,6 +6465,32 @@ async fn python_credit_definition_masks_secret_key_material() {
     assert_eq!(body["api_key_header"], "x-api-key");
     assert_eq!(body["api_key_present"], true);
     assert!(body.get("api_key").is_none());
+    let list = platform_request(
+        &app,
+        Method::GET,
+        "/platform/credit/defs",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = response_json(list).await;
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["page_size"], 50);
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["api_credit_group"], "maskgroup");
+    let missing = platform_request(
+        &app,
+        Method::GET,
+        "/platform/credit/defs/missing",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response_json(missing).await["error_code"], "CRD021");
 }
 
 #[tokio::test]
@@ -5951,10 +6508,16 @@ async fn credit_models_match_pydantic_required_fields_coercion_and_unknown_elisi
         Some(json!({
             "api_credit_group": true, "api_key": false, "api_key_header": 7,
             "api_key_new": 9,
-            "credit_tiers": [{
-                "tier_name": 1, "credits": "8", "input_limit": true, "output_limit": 3.9,
-                "reset_frequency": false, "ignored": "field"
-            }], "ignored": "field"
+            "credit_tiers": [
+                {
+                    "tier_name": 1, "credits": "8", "input_limit": true, "output_limit": 3.9,
+                    "reset_frequency": false, "ignored": "field"
+                },
+                {
+                    "tier_name": "é".repeat(50), "credits": 1, "input_limit": 2,
+                    "output_limit": 3, "reset_frequency": "monthly"
+                }
+            ], "ignored": "field"
         })),
     )
     .await;
@@ -5967,12 +6530,20 @@ async fn credit_models_match_pydantic_required_fields_coercion_and_unknown_elisi
     assert_eq!(credit["api_key"], "False");
     assert_eq!(credit["api_key_header"], "7");
     assert_eq!(credit["api_key_new"], "9");
+    assert!(credit["api_key_rotation_expires"].is_null());
     assert_eq!(
-        credit["credit_tiers"],
-        json!([{
+        credit["credit_tiers"][0],
+        json!({
             "tier_name": "1", "credits": 8, "input_limit": 1, "output_limit": 3,
             "reset_frequency": "False"
-        }])
+        })
+    );
+    assert_eq!(
+        credit["credit_tiers"][1],
+        json!({
+            "tier_name": "é".repeat(50), "credits": 1, "input_limit": 2, "output_limit": 3,
+            "reset_frequency": "monthly"
+        })
     );
     assert!(credit.get("ignored").is_none());
     let duplicate = platform_request(
@@ -6037,8 +6608,11 @@ async fn credit_models_match_pydantic_required_fields_coercion_and_unknown_elisi
         Some(&cookie),
         None,
         Some(json!({
-            "username": true,
-            "users_credits": {"True": {"tier_name": 2, "available_credits": "4", "user_api_key": false, "ignored": "field"}},
+            "username": "admin",
+            "users_credits": {
+                "True": {"tier_name": 2, "available_credits": "4", "user_api_key": false, "ignored": "field"},
+                "unicode": {"tier_name": "é".repeat(50), "available_credits": 1}
+            },
             "ignored": "field"
         })),
     )
@@ -6051,7 +6625,28 @@ async fn credit_models_match_pydantic_required_fields_coercion_and_unknown_elisi
         .unwrap();
     assert_eq!(
         user_credits["users_credits"]["True"],
-        json!({"tier_name": "2", "available_credits": 4, "user_api_key": "False"})
+        json!({"tier_name": "2", "available_credits": 4, "reset_date": null, "user_api_key": "False"})
+    );
+    assert_eq!(
+        user_credits["users_credits"]["unicode"],
+        json!({"tier_name": "é".repeat(50), "available_credits": 1, "reset_date": null, "user_api_key": null})
+    );
+    let mismatched_username = platform_request(
+        &app,
+        Method::POST,
+        "/platform/credit/admin",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "username": true,
+            "users_credits": {"group": {"tier_name": "tier", "available_credits": 1}}
+        })),
+    )
+    .await;
+    assert_eq!(mismatched_username.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(mismatched_username).await["error_code"],
+        "CRD014"
     );
     let invalid_user_credits = platform_request(
         &app,
@@ -6215,6 +6810,21 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
     assert_eq!(specific.status(), StatusCode::OK);
     assert_eq!(response_json(specific).await["current_usage"], 8);
 
+    let invalid = platform_request(
+        &app,
+        Method::GET,
+        "/platform/quota/status/not-a-quota",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(invalid).await,
+        json!({"detail": "Invalid quota type: not-a-quota"})
+    );
+
     let export = platform_request(
         &app,
         Method::POST,
@@ -6279,7 +6889,10 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
         .update_one(
             "user_tier_assignments",
             &json!({"user_id": "admin"}),
-            &json!({"effective_until": 0}),
+            &json!({
+                "effective_until": 0,
+                "override_limits": {"monthly_request_quota": 99}
+            }),
         )
         .await
         .unwrap();
@@ -6296,6 +6909,22 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
     assert_eq!(
         response_json(expired_assignment).await["current_tier"]["tier_id"],
         "quota-free"
+    );
+    let expired_status = platform_request(
+        &app,
+        Method::GET,
+        "/platform/quota/status",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(expired_status.status(), StatusCode::OK);
+    let expired_status = response_json(expired_status).await;
+    assert_eq!(expired_status["tier_info"]["tier_id"], "quota-free");
+    assert_eq!(
+        expired_status["tier_info"]["limits"]["monthly_request_quota"],
+        99
     );
 }
 
@@ -6867,6 +7496,72 @@ async fn tier_crud_returns_normalized_python_tier_contracts() {
 }
 
 #[tokio::test]
+async fn tier_public_and_protected_route_boundaries_match_python() {
+    let app = build_router(memory_state(false).await);
+    let created = platform_request(
+        &app,
+        Method::POST,
+        "/platform/tiers/",
+        None,
+        None,
+        Some(json!({
+            "tier_id": "public-tier", "name": "custom", "display_name": "Public Tier",
+            "limits": {"requests_per_minute": 12}
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let fetched = platform_request(
+        &app,
+        Method::GET,
+        "/platform/tiers/public-tier",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+
+    let updated = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/tiers/public-tier",
+        None,
+        None,
+        Some(json!({"display_name": "Public Tier Updated"})),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let assigned = platform_request(
+        &app,
+        Method::POST,
+        "/platform/tiers/assignments",
+        None,
+        None,
+        Some(json!({"user_id": "public-user", "tier_id": "public-tier"})),
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::CREATED);
+    let assignment = platform_request(
+        &app,
+        Method::GET,
+        "/platform/tiers/assignments/public-user",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(assignment.status(), StatusCode::OK);
+
+    for path in ["/platform/tiers/", "/platform/tiers/statistics/all"] {
+        let protected = platform_request(&app, Method::GET, path, None, None, None).await;
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn rate_limit_statistics_and_shadowed_status_match_python_contracts() {
     let state = memory_state(false).await;
     let storage = state.storage.clone().unwrap();
@@ -6902,6 +7597,9 @@ async fn rate_limit_statistics_and_shadowed_status_match_python_contracts() {
             "rule_id": "disabled-ip", "rule_type": "per_ip", "time_window": "day", "limit": 1,
             "enabled": false
         }),
+        json!({
+            "rule_id": "legacy-no-enabled", "rule_type": "global", "time_window": "day", "limit": 1
+        }),
     ] {
         storage.insert_one("rate_limit_rules", rule).await.unwrap();
     }
@@ -6933,10 +7631,10 @@ async fn rate_limit_statistics_and_shadowed_status_match_python_contracts() {
     .await;
     assert_eq!(statistics.status(), StatusCode::OK);
     let statistics = response_json(statistics).await;
-    assert_eq!(statistics["total_rules"], 4);
+    assert_eq!(statistics["total_rules"], 5);
     assert_eq!(statistics["enabled_rules"], 3);
-    assert_eq!(statistics["disabled_rules"], 1);
-    assert_eq!(statistics["rules_by_type"]["global"], 1);
+    assert_eq!(statistics["disabled_rules"], 2);
+    assert_eq!(statistics["rules_by_type"]["global"], 2);
     assert_eq!(statistics["rules_by_type"]["per_user"], 2);
     assert_eq!(statistics["rules_by_type"]["per_ip"], 1);
     assert_eq!(statistics["rules_by_type"]["per_api"], 0);
@@ -7057,6 +7755,18 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
     let listed = response_json(listed).await;
     assert!(listed.is_array());
     assert_eq!(listed[0]["rule_id"], "crud-rule");
+
+    let invalid_enabled = platform_request(
+        &app,
+        Method::GET,
+        "/platform/rate-limits/?enabled_only=not-a-bool",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(invalid_enabled.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response_json(invalid_enabled).await["error_code"], "VAL001");
 
     let updated = platform_request(
         &app,
@@ -7194,6 +7904,33 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
     assert_eq!(copied["rule_id"], "crud-rule-copy");
     assert_eq!(copied["description"], "Copy of crud-rule");
     assert_eq!(copied["limit"], 20);
+
+    let numeric_copy = platform_request(
+        &app,
+        Method::POST,
+        "/platform/rate-limits/crud-rule/duplicate",
+        None,
+        None,
+        Some(json!({"new_rule_id": 456})),
+    )
+    .await;
+    assert_eq!(numeric_copy.status(), StatusCode::CREATED);
+    assert_eq!(response_json(numeric_copy).await["rule_id"], "456");
+
+    let missing_copy = platform_request(
+        &app,
+        Method::POST,
+        "/platform/rate-limits/missing-source/duplicate",
+        None,
+        None,
+        Some(json!({"new_rule_id": "unused"})),
+    )
+    .await;
+    assert_eq!(missing_copy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(missing_copy).await["detail"],
+        "Source rule missing-source not found"
+    );
 
     let disabled = platform_request(
         &app,

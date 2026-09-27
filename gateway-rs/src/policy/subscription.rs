@@ -55,7 +55,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn admin_requires_subscription_by_default() {
+    fn admin_bypasses_subscription_unless_enforced() {
         let user = json!({ "username": "admin", "role": "admin" });
         assert!(enforce_subscription("demo/v1", &user, &[], &[], true).is_err());
         assert!(enforce_subscription("demo/v1", &user, &[], &[], false).is_ok());

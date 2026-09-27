@@ -1,4 +1,8 @@
-use std::fmt;
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{LazyLock, Mutex},
+};
 
 use tracing::{
     Event, Subscriber,
@@ -14,6 +18,26 @@ use tracing_subscriber::{
 };
 
 use crate::observability::audit::redact_record;
+
+const MEMORY_LOG_CAPACITY: usize = 50_000;
+static MEMORY_LOGS: LazyLock<Mutex<VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(MEMORY_LOG_CAPACITY)));
+
+pub fn memory_log_snapshot() -> Vec<String> {
+    MEMORY_LOGS
+        .lock()
+        .map(|logs| logs.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn remember_log(entry: &str) {
+    if let Ok(mut logs) = MEMORY_LOGS.lock() {
+        if logs.len() == MEMORY_LOG_CAPACITY {
+            logs.pop_front();
+        }
+        logs.push_back(entry.to_owned());
+    }
+}
 
 /// Formats complete tracing events as JSON only after recursively removing secrets.
 ///
@@ -46,6 +70,18 @@ where
         });
         redact_record(&mut record);
         let encoded = serde_json::to_string(&record).map_err(|_| fmt::Error)?;
+        let memory_time = record
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|timestamp| timestamp.get(..19))
+            .unwrap_or_default();
+        let memory_record = serde_json::json!({
+            "time": memory_time,
+            "name": event.metadata().target(),
+            "level": event.metadata().level().to_string(),
+            "message": record.pointer("/fields/message").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        });
+        remember_log(&serde_json::to_string(&memory_record).map_err(|_| fmt::Error)?);
         writer.write_str(&encoded)?;
         writer.write_char('\n')
     }
@@ -108,7 +144,7 @@ mod tests {
 
     use tracing_subscriber::fmt::MakeWriter;
 
-    use super::RedactingJsonEvent;
+    use super::{RedactingJsonEvent, memory_log_snapshot};
 
     #[derive(Clone, Default)]
     struct CapturedLog(Arc<Mutex<Vec<u8>>>);
@@ -158,5 +194,9 @@ mod tests {
             event["fields"]["message"],
             "Authorization: [REDACTED]; Cookie: [REDACTED]; Set-Cookie: [REDACTED]; X-API-Key: [REDACTED]; X-CSRF-Token: [REDACTED]; access_token=[REDACTED]; refresh_token=[REDACTED]; Basic [REDACTED]"
         );
+        assert!(memory_log_snapshot().iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|entry| entry["message"] == event["fields"]["message"])
+        }));
     }
 }

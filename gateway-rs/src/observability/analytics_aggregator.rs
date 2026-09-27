@@ -97,7 +97,7 @@ pub struct AnalyticsAggregator {
 impl AnalyticsAggregator {
     pub fn new() -> Self {
         Self {
-            points: RwLock::new(VecDeque::with_capacity(1440)),
+            points: RwLock::new(VecDeque::with_capacity(43_200)),
             api_counters: RwLock::new(HashMap::new()),
             api_error_counters: RwLock::new(HashMap::new()),
             user_counters: RwLock::new(HashMap::new()),
@@ -155,7 +155,7 @@ impl AnalyticsAggregator {
                     ((last.latency_ms * previous as f64) + duration_ms) / last.requests as f64;
                 return;
             }
-            if points.len() >= 1440 {
+            if points.len() >= 43_200 {
                 points.pop_front();
             }
             points.push_back(AggregatedPoint {
@@ -177,10 +177,18 @@ impl AnalyticsAggregator {
     }
 
     pub fn get_timeseries_range(&self, start_ts: u64, end_ts: u64) -> Vec<AggregatedPoint> {
-        self.get_timeseries()
-            .into_iter()
-            .filter(|point| point.timestamp >= start_ts && point.timestamp <= end_ts)
-            .collect()
+        let interval = match end_ts.saturating_sub(start_ts) {
+            seconds if seconds <= 86_400 => 300,
+            seconds if seconds <= 604_800 => 3_600,
+            _ => 86_400,
+        };
+        aggregate_points(
+            self.get_timeseries()
+                .into_iter()
+                .filter(|point| point.timestamp >= start_ts && point.timestamp <= end_ts)
+                .collect(),
+            interval,
+        )
     }
 
     pub fn get_status_distribution(&self) -> HashMap<String, u64> {
@@ -305,7 +313,7 @@ impl AnalyticsAggregator {
                 bytes_out: bucket.bytes_out,
             })
             .collect::<VecDeque<_>>();
-        while points.len() > 1440 {
+        while points.len() > 43_200 {
             points.pop_front();
         }
 
@@ -327,6 +335,28 @@ impl AnalyticsAggregator {
         );
         Ok(())
     }
+}
+
+fn aggregate_points(points: Vec<AggregatedPoint>, interval: u64) -> Vec<AggregatedPoint> {
+    let mut buckets = std::collections::BTreeMap::<u64, AggregatedPoint>::new();
+    for point in points {
+        let timestamp = (point.timestamp / interval) * interval;
+        let bucket = buckets.entry(timestamp).or_insert_with(|| AggregatedPoint {
+            timestamp,
+            ..AggregatedPoint::default()
+        });
+        let previous_requests = bucket.requests;
+        bucket.requests = bucket.requests.saturating_add(point.requests);
+        bucket.errors = bucket.errors.saturating_add(point.errors);
+        bucket.bytes_in = bucket.bytes_in.saturating_add(point.bytes_in);
+        bucket.bytes_out = bucket.bytes_out.saturating_add(point.bytes_out);
+        if bucket.requests > 0 {
+            bucket.latency_ms = ((bucket.latency_ms * previous_requests as f64)
+                + (point.latency_ms * point.requests as f64))
+                / bucket.requests as f64;
+        }
+    }
+    buckets.into_values().collect()
 }
 
 impl Default for AnalyticsAggregator {
@@ -448,5 +478,44 @@ mod tests {
         assert_eq!(original.get_top_endpoints(10), before_endpoints);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn range_queries_use_python_aggregation_levels() {
+        let points = vec![
+            AggregatedPoint {
+                timestamp: 301,
+                requests: 2,
+                errors: 1,
+                latency_ms: 10.0,
+                bytes_in: 3,
+                bytes_out: 4,
+            },
+            AggregatedPoint {
+                timestamp: 599,
+                requests: 1,
+                errors: 0,
+                latency_ms: 40.0,
+                bytes_in: 5,
+                bytes_out: 6,
+            },
+            AggregatedPoint {
+                timestamp: 601,
+                requests: 1,
+                errors: 1,
+                latency_ms: 20.0,
+                bytes_in: 7,
+                bytes_out: 8,
+            },
+        ];
+        let five_minute = aggregate_points(points.clone(), 300);
+        assert_eq!(five_minute.len(), 2);
+        assert_eq!(five_minute[0].timestamp, 300);
+        assert_eq!(five_minute[0].requests, 3);
+        assert_eq!(five_minute[0].errors, 1);
+        assert_eq!(five_minute[0].latency_ms, 20.0);
+        assert_eq!(five_minute[0].bytes_in, 8);
+        assert_eq!(aggregate_points(points.clone(), 3_600).len(), 1);
+        assert_eq!(aggregate_points(points, 86_400).len(), 1);
     }
 }

@@ -36,6 +36,8 @@ jobs:
           python3 scripts/check_parity_reference.py
       - name: Verify Python-to-Rust test coverage ledger
         run: python3 scripts/generate_test_coverage_ledger.py --check
+      - name: Verify Python-to-Rust source coverage ledger
+        run: python3 scripts/generate_source_coverage_ledger.py --check
       - name: Test release tooling
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Run Clippy

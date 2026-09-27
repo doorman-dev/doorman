@@ -3221,7 +3221,7 @@ async fn live_test_90_security_tools_and_config_export_import_parity() {
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"origin": "http://localhost:3000"}).to_string(),
+                    json!({"origin": "http://localhost:3000", "method": "GET"}).to_string(),
                 ))
                 .unwrap(),
         )

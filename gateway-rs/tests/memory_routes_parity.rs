@@ -175,6 +175,17 @@ async fn python_memory_route_contracts_in_isolated_processes() {
         Method::POST,
         "/platform/memory/dump",
         Some(&manager),
+        json!({"path": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["detail"][0]["loc"], json!(["body", "path"]));
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/platform/memory/dump",
+        Some(&manager),
         json!({}),
     )
     .await;

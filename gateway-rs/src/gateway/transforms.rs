@@ -38,7 +38,11 @@ pub fn transform_response(
     let status = direction
         .get("status_map")
         .and_then(|mapping| mapping.get(status.as_u16().to_string()))
-        .and_then(Value::as_u64)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
         .and_then(|value| u16::try_from(value).ok())
         .and_then(|value| StatusCode::from_u16(value).ok())
         .unwrap_or(status);
@@ -71,7 +75,7 @@ fn transform_headers(mut headers: HeaderMap, config: Option<&Value>) -> HeaderMa
         for (name, value) in add {
             let (Ok(name), Ok(value)) = (
                 HeaderName::try_from(name),
-                HeaderValue::from_str(value.as_str().unwrap_or(&value.to_string())),
+                HeaderValue::from_str(&python_string(value)),
             ) else {
                 continue;
             };
@@ -134,13 +138,20 @@ fn transform_query(query: Option<&str>, config: Option<&Value>) -> String {
     if let Some(add) = config.get("add").and_then(Value::as_object) {
         for (name, value) in add {
             pairs.retain(|(existing, _)| existing != name);
-            pairs.push((
-                name.clone(),
-                value.as_str().unwrap_or(&value.to_string()).to_owned(),
-            ));
+            pairs.push((name.clone(), python_string(value)));
         }
     }
     encode_query(&pairs)
+}
+
+fn python_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Null => "None".to_owned(),
+        value => value.to_string(),
+    }
 }
 
 fn encode_query(pairs: &[(String, String)]) -> String {
@@ -289,6 +300,25 @@ mod tests {
         assert_eq!(query, "new=1");
 
         let config = serde_json::json!({"response": {"status_map": {"500": 502}}});
+        let (_, _, status) = transform_response(
+            HeaderMap::new(),
+            Vec::new(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(&config),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let config = serde_json::json!({"request": {
+            "headers": {"add": {"x-enabled": true, "x-empty": null}},
+            "query": {"add": {"enabled": false}}
+        }});
+        let (headers, _, query) =
+            transform_request(HeaderMap::new(), Vec::new(), None, Some(&config));
+        assert_eq!(headers["x-enabled"], "True");
+        assert_eq!(headers["x-empty"], "None");
+        assert_eq!(query, "enabled=False");
+
+        let config = serde_json::json!({"response": {"status_map": {"500": "502"}}});
         let (_, _, status) = transform_response(
             HeaderMap::new(),
             Vec::new(),

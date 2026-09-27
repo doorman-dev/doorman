@@ -1,5 +1,15 @@
 //! GraphQL validation port: depth, complexity field cost, and introspection control.
 
+use std::sync::LazyLock;
+
+static DOUBLE_QUOTED: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#""[^"]*""#).expect("string expression is valid"));
+static SINGLE_QUOTED: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"'[^']*'").expect("string expression is valid"));
+static GRAPHQL_WORD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b").expect("field expression is valid")
+});
+
 #[derive(Debug, Clone)]
 pub struct GraphqlValidationConfig {
     pub max_depth: usize,
@@ -42,29 +52,16 @@ pub fn validate_graphql_query(query: &str, config: &GraphqlValidationConfig) -> 
 }
 
 pub fn calculate_graphql_depth(query: &str) -> usize {
+    let without_comments = query
+        .lines()
+        .map(|line| line.split_once('#').map_or(line, |(prefix, _)| prefix))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let without_strings = DOUBLE_QUOTED.replace_all(&without_comments, "\"\"");
+    let without_strings = SINGLE_QUOTED.replace_all(&without_strings, "''");
     let mut depth = 0usize;
     let mut max_depth = 0usize;
-    let mut in_string = false;
-    let mut in_comment = false;
-
-    for ch in query.chars() {
-        if in_comment {
-            if ch == '\n' {
-                in_comment = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if ch == '#' {
-            in_comment = true;
-            continue;
-        }
+    for ch in without_strings.chars() {
         if ch == '{' {
             depth += 1;
             if depth > max_depth {
@@ -79,21 +76,19 @@ pub fn calculate_graphql_depth(query: &str) -> usize {
 }
 
 pub fn calculate_graphql_cost(query: &str) -> usize {
-    let mut cost = 0usize;
-
-    for word in query.split_whitespace() {
-        let clean_word = word
-            .trim_matches(|c| c == '{' || c == '}' || c == '(' || c == ')' || c == ':' || c == ',');
-        if clean_word.starts_with('#') {
-            continue;
-        }
-        if !clean_word.is_empty() && !clean_word.starts_with('"') && !is_graphql_keyword(clean_word)
-        {
-            cost += 1;
-        }
+    if query.is_empty() {
+        return 0;
     }
-
-    cost.max(1)
+    let without_comments = query
+        .lines()
+        .map(|line| line.split_once('#').map_or(line, |(prefix, _)| prefix))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let without_strings = DOUBLE_QUOTED.replace_all(&without_comments, "");
+    GRAPHQL_WORD
+        .find_iter(&without_strings)
+        .filter(|word| !is_graphql_keyword(&word.as_str().to_ascii_lowercase()))
+        .count()
 }
 
 fn is_graphql_keyword(word: &str) -> bool {
@@ -119,5 +114,9 @@ mod tests {
 
         let introspection = "query { __schema { types { name } } }";
         assert!(validate_graphql_query(introspection, &config).is_err());
+
+        assert_eq!(calculate_graphql_depth("{ field(arg: '{') { child } }"), 2);
+        assert_eq!(calculate_graphql_cost("query { user { id name } }"), 3);
+        assert_eq!(calculate_graphql_cost(""), 0);
     }
 }

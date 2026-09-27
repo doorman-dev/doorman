@@ -106,6 +106,18 @@ pub fn evaluate_rest_policy(
     } else {
         request.method.as_str()
     };
+    if !documents
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint_belongs_to_api(endpoint, &api))
+    {
+        return Err(PolicyFailure::new(
+            PolicyStage::Resolution,
+            StatusCode::NOT_FOUND,
+            "GTW002",
+            "No endpoints found for the requested API",
+        ));
+    }
     if !endpoint_exists(&documents.endpoints, &api, method, &route.endpoint_uri) {
         return Err(PolicyFailure::new(
             PolicyStage::Resolution,
@@ -226,11 +238,11 @@ pub fn evaluate_rest_policy(
         }
 
         let enforce_admin_sub = std::env::var("ENFORCE_ADMIN_SUBSCRIPTION")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| {
                 api.get("enforce_admin_subscription")
                     .and_then(Value::as_bool)
-                    .unwrap_or(true)
+                    .unwrap_or(false)
             });
 
         enforce_subscription(
@@ -404,14 +416,14 @@ pub async fn evaluate_shared_effects(
                 let now_seconds = request.now_millis / 1000;
                 let bucket = (now_seconds / window) * window;
                 let key = bandwidth_key(username, window, bucket);
-                let total = storage
+                let used = storage
                     .current_counter(&key)
                     .await
-                    .map_err(storage_failure)?
-                    .saturating_add(request.content_length);
+                    .map_err(storage_failure)?;
+                let total = used.saturating_add(request.content_length);
                 decision.bandwidth_key = Some(key);
                 decision.bandwidth_ttl_seconds = Some(window);
-                if total > limit {
+                if used >= limit || total > limit {
                     return Err(PolicyFailure::new(
                         PolicyStage::Bandwidth,
                         StatusCode::TOO_MANY_REQUESTS,
@@ -503,8 +515,7 @@ fn storage_failure(error: crate::storage::runtime::StorageError) -> PolicyFailur
 
 fn endpoint_exists(endpoints: &[Value], api: &Value, method: &str, endpoint_uri: &str) -> bool {
     endpoints.iter().any(|endpoint| {
-        let same_api = string_field(endpoint, "api_name") == string_field(api, "api_name")
-            && string_field(endpoint, "api_version") == string_field(api, "api_version");
+        let same_api = endpoint_belongs_to_api(endpoint, api);
         let same_method = string_field(endpoint, "endpoint_method")
             .is_some_and(|actual| actual.eq_ignore_ascii_case(method));
         let uri =
@@ -513,6 +524,19 @@ fn endpoint_exists(endpoints: &[Value], api: &Value, method: &str, endpoint_uri:
             && same_method
             && uri.is_some_and(|pattern| endpoint_pattern_matches(pattern, endpoint_uri))
     })
+}
+
+fn endpoint_belongs_to_api(endpoint: &Value, api: &Value) -> bool {
+    match (
+        string_field(endpoint, "api_id"),
+        string_field(api, "api_id"),
+    ) {
+        (Some(endpoint_id), Some(api_id)) => endpoint_id == api_id,
+        _ => {
+            string_field(endpoint, "api_name") == string_field(api, "api_name")
+                && string_field(endpoint, "api_version") == string_field(api, "api_version")
+        }
+    }
 }
 
 fn optional_string_list(value: &Value, field: &str) -> Option<Vec<String>> {
@@ -526,6 +550,10 @@ fn optional_string_list(value: &Value, field: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn is_revoked(revocations: &[Value], username: &str, jti: Option<&str>) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     revocations
         .iter()
         .any(|revocation| match string_field(revocation, "type") {
@@ -536,6 +564,10 @@ pub(crate) fn is_revoked(revocations: &[Value], username: &str, jti: Option<&str
             Some("jti") => {
                 string_field(revocation, "username") == Some(username)
                     && jti.is_some_and(|jti| string_field(revocation, "jti") == Some(jti))
+                    && revocation
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|expires_at| expires_at > now)
             }
             _ => false,
         })
@@ -546,6 +578,29 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn expired_or_malformed_jti_revocations_do_not_block_requests() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"old", "expires_at": now})],
+            "alice",
+            Some("old")
+        ));
+        assert!(!is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"missing"})],
+            "alice",
+            Some("missing")
+        ));
+        assert!(is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"live", "expires_at": now + 60})],
+            "alice",
+            Some("live")
+        ));
+    }
 
     #[test]
     fn mixed_settings_records_cannot_override_api_proxy_policy() {
@@ -632,6 +687,39 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.error_code, "GTW003");
+    }
+
+    #[test]
+    fn returns_no_endpoints_for_api_without_registered_endpoints() {
+        let mut documents = PolicyDocuments {
+            apis: vec![json!({
+                "api_id": "api-1",
+                "api_name": "demo",
+                "api_version": "v1",
+                "api_public": true,
+            })],
+            ..Default::default()
+        };
+        let request = PolicyRequest {
+            method: Method::GET,
+            path: "/api/rest/demo/v1/missing".to_owned(),
+            headers: HeaderMap::new(),
+            direct_ip: None,
+            now_millis: 0,
+            content_length: 0,
+        };
+        let failure = evaluate_rest_policy(
+            &mut documents,
+            &request,
+            &SharedStorageConfig::default(),
+            &PolicyRuntime::default(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error_code, "GTW002");
+        assert_eq!(
+            failure.error_message,
+            "No endpoints found for the requested API"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub struct Config {
     pub compression_level: i32,
     pub compression_minimum_size: u16,
     pub strict_response_envelope: bool,
+    pub websockets_enabled: bool,
     pub logs_dir: Option<PathBuf>,
     pub security_settings_file: Option<PathBuf>,
     pub shared_storage: SharedStorageConfig,
@@ -211,6 +212,7 @@ impl Config {
             compression_level,
             compression_minimum_size,
             strict_response_envelope: env_bool("STRICT_RESPONSE_ENVELOPE", false),
+            websockets_enabled: env_bool("WEBSOCKETS_ENABLED", false),
             logs_dir: env_non_empty("LOGS_DIR").map(PathBuf::from).or_else(|| {
                 let path = PathBuf::from("/app/logs");
                 path.exists().then_some(path)
@@ -245,6 +247,7 @@ impl Config {
             compression_level: 6,
             compression_minimum_size: 500,
             strict_response_envelope: false,
+            websockets_enabled: false,
             logs_dir: None,
             // Tests opt into an isolated path when exercising file persistence.
             security_settings_file: None,

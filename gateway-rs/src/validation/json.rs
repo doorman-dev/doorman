@@ -50,6 +50,7 @@ pub fn validate_json_with_registry(
         .unwrap_or(schema)
         .as_object()
         .ok_or_else(|| "Invalid endpoint validation schema".to_owned())?;
+    validate_schema_paths(mapping, "")?;
     for (path, rules) in mapping {
         let found = nested_value(value, path);
         validate_value(found, rules, path, registry)?;
@@ -69,7 +70,7 @@ fn validate_value(
         .unwrap_or(false);
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return if required {
-            Err(format!("Required field {path} is missing"))
+            Err("Field is required".to_owned())
         } else {
             Ok(())
         };
@@ -80,34 +81,42 @@ fn validate_value(
         .unwrap_or_default();
     let valid_type = match expected {
         "string" => value.is_string(),
-        "number" => value.is_number(),
+        // bool is a subclass of int in Python, so the pinned number validator
+        // accepts JSON booleans and applies numeric bounds to 0/1.
+        "number" => value.is_number() || value.is_boolean(),
         "boolean" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
         _ => true,
     };
     if !valid_type {
-        return Err(format!("Expected {expected} at {path}"));
+        return Err(format!(
+            "Expected {expected}, got {}",
+            python_type_name(value)
+        ));
     }
     if let Some(text) = value.as_str() {
         let length = text.chars().count() as f64;
-        enforce_range(length, rules, path, "String length")?;
+        enforce_range(length, rules, "String length", "", "")?;
         if let Some(pattern) = rules.get("pattern").and_then(Value::as_str) {
             let regex = Regex::new(pattern)
                 .map_err(|_| format!("Invalid validation pattern for {path}"))?;
-            if !regex.is_match(text) {
-                return Err(format!("String does not match pattern {pattern} at {path}"));
+            if regex.find(text).is_none_or(|found| found.start() != 0) {
+                return Err(format!("String does not match pattern {pattern}"));
             }
         }
         if let Some(format) = rules.get("format").and_then(Value::as_str) {
             validate_format(text, format, path)?;
         }
     }
-    if let Some(number) = value.as_f64() {
-        enforce_range(number, rules, path, "Value")?;
+    if let Some(number) = value
+        .as_f64()
+        .or_else(|| value.as_bool().map(|value| if value { 1.0 } else { 0.0 }))
+    {
+        enforce_range(number, rules, "Value", "", "")?;
     }
     if let Some(items) = value.as_array() {
-        enforce_range(items.len() as f64, rules, path, "Array length")?;
+        enforce_range(items.len() as f64, rules, "Array", " items", " items")?;
         if let Some(item_rules) = rules.get("array_items") {
             for (index, item) in items.iter().enumerate() {
                 validate_value(
@@ -124,6 +133,14 @@ fn validate_value(
         rules.get("nested_schema").and_then(Value::as_object),
     ) {
         for (field, nested_rules) in nested {
+            if nested_rules
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && object.get(field).is_none_or(Value::is_null)
+            {
+                return Err(format!("Required field {field} is missing"));
+            }
             validate_value(
                 object.get(field),
                 nested_rules,
@@ -134,69 +151,169 @@ fn validate_value(
     }
     if let Some(allowed) = rules.get("enum").and_then(Value::as_array) {
         if !allowed.contains(value) {
-            return Err(format!("Value at {path} must be one of {allowed:?}"));
+            return Err(format!(
+                "Value must be one of {}",
+                python_list_repr(allowed)
+            ));
         }
     }
     if let Some(name) = rules.get("custom_validator").and_then(Value::as_str) {
         registry
             .validate(name, value, rules)
-            .map_err(|message| format!("{message} at {path}"))?;
+            .map_err(|message| message.to_owned())?;
     }
     Ok(())
 }
 
-fn enforce_range(value: f64, rules: &Value, path: &str, description: &str) -> Result<(), String> {
-    if rules
-        .get("min")
-        .and_then(Value::as_f64)
-        .is_some_and(|minimum| value < minimum)
+fn enforce_range(
+    value: f64,
+    rules: &Value,
+    description: &str,
+    minimum_suffix: &str,
+    maximum_suffix: &str,
+) -> Result<(), String> {
+    if let Some(minimum) = rules.get("min").and_then(Value::as_f64)
+        && value < minimum
     {
-        return Err(format!("{description} is below minimum at {path}"));
+        return Err(format!(
+            "{description} must be at least {}{minimum_suffix}",
+            python_number(minimum)
+        ));
     }
-    if rules
-        .get("max")
-        .and_then(Value::as_f64)
-        .is_some_and(|maximum| value > maximum)
+    if let Some(maximum) = rules.get("max").and_then(Value::as_f64)
+        && value > maximum
     {
-        return Err(format!("{description} exceeds maximum at {path}"));
+        return Err(format!(
+            "{description} must be at most {}{maximum_suffix}",
+            python_number(maximum)
+        ));
     }
     Ok(())
 }
 
 fn validate_format(value: &str, format: &str, path: &str) -> Result<(), String> {
     let valid = match format {
-        "email" => value
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.')),
-        "url" => {
-            (value.starts_with("http://") || value.starts_with("https://"))
-                && value
-                    .split_once("://")
-                    .is_some_and(|(_, host)| host.contains('.'))
-        }
+        "email" => Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+            .is_ok_and(|regex| regex.is_match(value)),
+        "url" => Regex::new(
+            r"^https?://(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*$",
+        )
+        .is_ok_and(|regex| regex.is_match(value)),
         "date" => valid_date(value),
-        "datetime" => value.contains('T') && value.len() >= 16,
+        "datetime" => valid_datetime(value),
         "uuid" => uuid::Uuid::parse_str(value).is_ok(),
         _ => true,
     };
     if valid {
         Ok(())
     } else {
-        Err(format!("Invalid {format} format at {path}"))
+        let message = match format {
+            "date" => "Invalid date format (YYYY-MM-DD)",
+            "datetime" => "Invalid datetime format (ISO 8601)",
+            "uuid" => "Invalid UUID format",
+            "email" => "Invalid email format",
+            "url" => "Invalid URL format",
+            _ => return Ok(()),
+        };
+        let _ = path;
+        Err(message.to_owned())
     }
 }
 
 fn valid_date(value: &str) -> bool {
-    let mut parts = value.split('-');
-    matches!(
-        (
-            parts.next().and_then(|part| part.parse::<u16>().ok()),
-            parts.next().and_then(|part| part.parse::<u8>().ok()),
-            parts.next().and_then(|part| part.parse::<u8>().ok()),
-            parts.next(),
-        ),
-        (Some(year), Some(1..=12), Some(1..=31), None) if year > 0
+    time::Date::parse(
+        value,
+        &time::format_description::well_known::Iso8601::DEFAULT,
     )
+    .is_ok()
+}
+
+fn valid_datetime(value: &str) -> bool {
+    valid_date(value)
+        || time::OffsetDateTime::parse(
+            value,
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        )
+        .is_ok()
+        || time::PrimitiveDateTime::parse(
+            value,
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        )
+        .is_ok()
+        || value.find(' ').is_some_and(|index| {
+            let mut normalized = value.to_owned();
+            normalized.replace_range(index..=index, "T");
+            time::PrimitiveDateTime::parse(
+                &normalized,
+                &time::format_description::well_known::Iso8601::DEFAULT,
+            )
+            .is_ok()
+        })
+}
+
+fn python_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "int",
+        Value::Number(_) => "float",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+fn python_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        value.to_string()
+    }
+}
+
+fn python_list_repr(values: &[Value]) -> String {
+    let values = values
+        .iter()
+        .map(|value| match value {
+            Value::String(value) => format!("'{value}'"),
+            Value::Bool(true) => "True".to_owned(),
+            Value::Bool(false) => "False".to_owned(),
+            Value::Null => "None".to_owned(),
+            value => value.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{values}]")
+}
+
+fn validate_schema_paths(
+    schema: &serde_json::Map<String, Value>,
+    parent: &str,
+) -> Result<(), String> {
+    for (path, rules) in schema {
+        let full_path = if parent.is_empty() {
+            path.clone()
+        } else {
+            format!("{parent}.{path}")
+        };
+        if full_path.split('.').any(|part| {
+            part.is_empty()
+                || part.split_once('[').is_some_and(|(field, index)| {
+                    field.is_empty()
+                        && !index
+                            .strip_suffix(']')
+                            .unwrap_or(index)
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit())
+                })
+        }) {
+            return Err(format!("Invalid field path: {full_path}"));
+        }
+        if let Some(nested) = rules.get("nested_schema").and_then(Value::as_object) {
+            validate_schema_paths(nested, &full_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
@@ -267,7 +384,7 @@ mod tests {
         assert!(validate_json_with_registry(&json!({"code": "ABC"}), &schema, &registry).is_ok());
         assert_eq!(
             validate_json_with_registry(&json!({"code": "Abc"}), &schema, &registry).unwrap_err(),
-            "Not upper at code"
+            "Not upper"
         );
 
         let unknown = json!({"code": {"custom_validator": "not_compiled"}});
@@ -361,5 +478,52 @@ mod tests {
             "type": "string"
         }}});
         assert!(validate_json(&json!({"user": {"name": "ok"}}), &invalid_path).is_err());
+    }
+
+    #[test]
+    fn preserves_python_validation_messages_and_coercion_edges() {
+        assert_eq!(
+            validate_json(
+                &json!({}),
+                &json!({"name": {"required": true, "type": "string"}})
+            )
+            .unwrap_err(),
+            "Field is required"
+        );
+        assert_eq!(
+            validate_json(&json!({"name": 1}), &json!({"name": {"type": "string"}})).unwrap_err(),
+            "Expected string, got int"
+        );
+        assert!(
+            validate_json(
+                &json!({"enabled": true}),
+                &json!({"enabled": {"type": "number", "min": 1}})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_json(
+                &json!({"code": "xxABC"}),
+                &json!({"code": {"type": "string", "pattern": "ABC"}})
+            )
+            .unwrap_err(),
+            "String does not match pattern ABC"
+        );
+        assert_eq!(
+            validate_json(
+                &json!({"when": "2025-02-30"}),
+                &json!({"when": {"type": "string", "format": "date"}})
+            )
+            .unwrap_err(),
+            "Invalid date format (YYYY-MM-DD)"
+        );
+        assert_eq!(
+            validate_json(
+                &json!({"status": "CLOSED"}),
+                &json!({"status": {"enum": ["NEW", "OPEN"]}})
+            )
+            .unwrap_err(),
+            "Value must be one of ['NEW', 'OPEN']"
+        );
     }
 }

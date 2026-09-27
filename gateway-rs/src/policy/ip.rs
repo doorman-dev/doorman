@@ -133,7 +133,18 @@ pub fn effective_client_ip(
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
-    ip.is_loopback()
+    if ip.is_loopback() {
+        return true;
+    }
+    std::env::var("DOORMAN_IN_DOCKER")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        && matches!(ip, IpAddr::V4(ip) if ip == Ipv4Addr::new(192, 168, 65, 1) || ip == Ipv4Addr::new(172, 17, 0, 1))
 }
 
 fn ip_in_list(ip: IpAddr, patterns: &[String]) -> bool {

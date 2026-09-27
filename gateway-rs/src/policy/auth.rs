@@ -44,8 +44,8 @@ struct JwtKeyConfig {
     secret: Option<String>,
     key: Option<String>,
     public_key: Option<String>,
+    public_key_path: Option<String>,
     verification_key: Option<String>,
-    active: Option<bool>,
 }
 
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
@@ -107,6 +107,7 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 #[derive(Clone, Debug)]
 struct VerificationKey {
+    kid: Option<String>,
     algorithm: String,
     secret: String,
     rsa: bool,
@@ -137,6 +138,7 @@ fn select_key(config: &SharedStorageConfig, kid: Option<&str>) -> Option<Verific
         }
     }
     config.jwt_secret.as_ref().map(|secret| VerificationKey {
+        kid: Some("legacy-key".to_owned()),
         algorithm: "HS256".to_owned(),
         secret: secret.clone(),
         rsa: false,
@@ -154,28 +156,36 @@ fn select_configured_key(raw: &str, kid: Option<&str>) -> Option<VerificationKey
         _ => return None,
     };
 
-    configs
+    let keys = configs
         .into_iter()
         .filter_map(|value| serde_json::from_value::<JwtKeyConfig>(value).ok())
-        .filter(|config| config.active.unwrap_or(true))
-        .find_map(|config| {
-            if let Some(expected) = kid {
-                if config.kid.as_deref() != Some(expected) {
-                    return None;
-                }
-            }
+        .filter_map(|config| {
             let algorithm = config.algorithm.unwrap_or_else(|| "HS256".to_owned());
             let secret = if algorithm.eq_ignore_ascii_case("RS256") {
-                config.public_key.or(config.verification_key)
+                config
+                    .public_key_path
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .or(config.public_key)
+                    .or(config.verification_key)
             } else {
                 config.secret.or(config.key).or(config.verification_key)
             }?;
             Some(VerificationKey {
+                kid: config.kid,
                 rsa: algorithm.eq_ignore_ascii_case("RS256"),
                 algorithm,
                 secret,
             })
         })
+        .collect::<Vec<_>>();
+    if let Some(kid) = kid {
+        return keys.into_iter().find(|key| key.kid.as_deref() == Some(kid));
+    }
+    if keys.len() == 1 {
+        return keys.into_iter().next();
+    }
+    keys.into_iter()
+        .find(|key| key.kid.as_deref() == Some("legacy-key"))
 }
 
 pub fn unauthorized(message: &str) -> PolicyFailure {
@@ -223,5 +233,27 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("raw-token"));
         assert_eq!(extract_token(&headers), Some("raw-token".to_owned()));
+    }
+
+    #[test]
+    fn configured_verification_key_selection_matches_legacy_kid_rules() {
+        let keys = r#"[
+            {"kid":"one","algorithm":"HS256","secret":"first","active":false},
+            {"kid":"two","algorithm":"HS256","secret":"second"}
+        ]"#;
+        assert!(select_configured_key(keys, None).is_none());
+        assert_eq!(
+            select_configured_key(keys, Some("one")).unwrap().secret,
+            "first"
+        );
+
+        let legacy = r#"[
+            {"kid":"one","algorithm":"HS256","secret":"first"},
+            {"kid":"legacy-key","algorithm":"HS256","secret":"legacy"}
+        ]"#;
+        assert_eq!(
+            select_configured_key(legacy, None).unwrap().secret,
+            "legacy"
+        );
     }
 }
