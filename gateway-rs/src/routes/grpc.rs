@@ -16,17 +16,12 @@ pub async fn grpc_policy_then_execute(
     State(state): State<AppState>,
     mut request: Request,
 ) -> Result<Response, GatewayError> {
-    let proto_discovery = request.method() == http::Method::GET
-        && request.uri().query().is_some_and(|query| {
-            query
-                .split('&')
-                .any(|part| part.eq_ignore_ascii_case("proto"))
-        });
+    // Python's gRPC gateway route accepts both POST and GET (the latter used
+    // for proto discovery as well as plain GET calls), plus OPTIONS for CORS.
     if !matches!(
         request.method(),
-        &http::Method::POST | &http::Method::OPTIONS
-    ) && !proto_discovery
-    {
+        &http::Method::POST | &http::Method::GET | &http::Method::OPTIONS
+    ) {
         return Ok(http::StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
     let path = request.uri().path();

@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import { useRouter } from 'next/navigation'
 import Pagination from '@/components/Pagination'
 import { getCookie } from '@/utils/http'
 import { SERVER_URL } from '@/utils/config'
@@ -102,7 +103,8 @@ const logsFromResponse = (data: any): Log[] => {
 type OverrideKey = string
 
 export default function LogsPage() {
-  const { permissions } = useAuth()
+  const { permissions, authResolved, logsEnabled } = useAuth()
+  const router = useRouter()
   const canExport = !!permissions?.export_logs
   const [logs, setLogs] = useState<Log[]>([])
   const [groupedLogs, setGroupedLogs] = useState<GroupedLogs[]>([])
@@ -123,6 +125,10 @@ export default function LogsPage() {
   const [hidePlatformLogs, setHidePlatformLogs] = useState(false)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState<number | null>(null)
   const [securityAuditActive, setSecurityAuditActive] = useState(false)
+
+  useEffect(() => {
+    if (authResolved && !logsEnabled) router.replace('/dashboard')
+  }, [authResolved, logsEnabled, router])
   const [filters, setFilters] = useState<FilterState>(() => {
     const now = new Date()
     const today = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0')
@@ -545,6 +551,8 @@ export default function LogsPage() {
       default: return 'bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200'
     }
   }
+
+  if (authResolved && !logsEnabled) return null
 
   return (
     <ProtectedRoute requiredPermission="view_logs">

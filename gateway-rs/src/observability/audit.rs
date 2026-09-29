@@ -123,6 +123,34 @@ pub fn management_mutation(actor: &str, action: &str, target: &str, status: &str
     );
 }
 
+/// Mirrors Python's `SecurityAuditMiddleware`: a generic audit event for
+/// every modification request and every `/platform/*` request (including
+/// reads), independent of the specific named `management_mutation` events
+/// application code already emits for successful mutations -- Python's own
+/// middleware runs unconditionally alongside those, so this is intentionally
+/// additional coverage, not a replacement.
+pub fn platform_request(
+    actor: &str,
+    method: &str,
+    path: &str,
+    status_code: u16,
+    duration_ms: f64,
+    user_agent: Option<&str>,
+) {
+    tracing::info!(
+        actor = %redacted_value("actor", actor),
+        action = %format!("{method} {path}"),
+        target = "platform",
+        status = if status_code < 400 { "success" } else { "failure" },
+        method,
+        path,
+        status_code,
+        duration_ms,
+        user_agent,
+        "platform audit event"
+    );
+}
+
 pub fn global_ip_deny(target: &str, reason: &str, source_ip: Option<&str>) {
     tracing::info!(
         action = "ip.global_deny",
@@ -229,5 +257,71 @@ mod tests {
         assert_eq!(record["api_authorization_field_swap"], "x-auth");
         assert_eq!(record["nested"][0], REDACTED);
         assert_eq!(record["nested"][1], "safe");
+    }
+
+    #[test]
+    fn platform_request_emits_pythons_middleware_shaped_audit_event() {
+        use std::{
+            io,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for CapturedLog {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'writer> MakeWriter<'writer> for CapturedLog {
+            type Writer = Self;
+            fn make_writer(&'writer self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::platform_request(
+                "alice",
+                "GET",
+                "/platform/user",
+                200,
+                12.5,
+                Some("test-agent"),
+            );
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(event["fields"]["actor"], "alice");
+        assert_eq!(event["fields"]["action"], "GET /platform/user");
+        assert_eq!(event["fields"]["target"], "platform");
+        assert_eq!(event["fields"]["status"], "success");
+        assert_eq!(event["fields"]["status_code"], 200);
+
+        // A failing status (>= 400) maps to Python's status='failure'.
+        let capture = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::platform_request("bob", "DELETE", "/platform/user/bob", 403, 1.0, None);
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(event["fields"]["status"], "failure");
     }
 }

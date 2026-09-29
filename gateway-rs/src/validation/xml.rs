@@ -26,7 +26,7 @@ pub fn soap_body_object(xml: &str) -> Result<Value, String> {
 
 fn parse(xml: &str) -> Result<Node, String> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut stack = Vec::<Node>::new();
     let mut root = None;
     loop {
@@ -52,11 +52,39 @@ fn parse(xml: &str) -> Result<Node, String> {
                 if let Some(node) = stack.last_mut() {
                     let text = event
                         .decode()
+                        .map_err(|_| "Invalid SOAP envelope".to_owned())?;
+                    node.text.get_or_insert_with(String::new).push_str(&text);
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let Some(node) = stack.last_mut() {
+                    let text = event
+                        .decode()
+                        .map_err(|_| "Invalid SOAP envelope".to_owned())?;
+                    node.text.get_or_insert_with(String::new).push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(event)) => {
+                if let Some(node) = stack.last_mut() {
+                    let resolved = match event
+                        .resolve_char_ref()
                         .map_err(|_| "Invalid SOAP envelope".to_owned())?
-                        .into_owned();
-                    if !text.is_empty() {
-                        node.text = Some(text);
-                    }
+                    {
+                        Some(character) => character,
+                        None => match event
+                            .decode()
+                            .map_err(|_| "Invalid SOAP envelope".to_owned())?
+                            .as_ref()
+                        {
+                            "lt" => '<',
+                            "gt" => '>',
+                            "amp" => '&',
+                            "apos" => '\'',
+                            "quot" => '"',
+                            _ => return Err("Invalid SOAP envelope".to_owned()),
+                        },
+                    };
+                    node.text.get_or_insert_with(String::new).push(resolved);
                 }
             }
             Ok(Event::End(_)) => {
@@ -122,6 +150,15 @@ mod tests {
         assert_eq!(
             soap_body_object(xml).unwrap(),
             serde_json::json!({"user": {"name": "Ada"}})
+        );
+    }
+
+    #[test]
+    fn preserves_leaf_text_exactly_like_element_tree() {
+        let xml = r#"<E xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><Op><a> x &amp; y &#65;<![CDATA[<z>]]> </a><b> </b><c></c><d/><e>1</e><e>2</e></Op></s:Body></E>"#;
+        assert_eq!(
+            soap_body_object(xml).unwrap(),
+            serde_json::json!({"a": " x & y A<z> ", "b": " ", "c": null, "d": null, "e": "2"})
         );
     }
 

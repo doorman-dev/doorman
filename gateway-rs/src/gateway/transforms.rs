@@ -167,29 +167,32 @@ struct PathPart {
 }
 
 fn path_parts(path: &str) -> Option<Vec<PathPart>> {
-    let path = path.trim().strip_prefix("$.")?;
+    // Python: only "$." prefixed paths; each segment is either `word[digits]` or a plain key.
+    let path = path.strip_prefix("$.")?;
     let mut parts = Vec::new();
     for raw in path.split('.') {
         if raw.is_empty() {
             continue;
         }
-        let (field, index) = if let Some((field, raw_index)) = raw.split_once('[') {
-            let index = raw_index.strip_suffix(']')?.parse().ok()?;
-            (field, Some(index))
-        } else {
-            (raw, None)
-        };
-        if field.is_empty()
-            || !field
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            return None;
-        }
-        parts.push(PathPart {
-            field: field.to_owned(),
-            index,
+        let indexed = raw.strip_suffix(']').and_then(|head| {
+            let (field, digits) = head.split_once('[')?;
+            let word = !field.is_empty()
+                && field
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_');
+            let numeric = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+            (word && numeric).then_some((field, digits))
         });
+        match indexed {
+            Some((field, digits)) => parts.push(PathPart {
+                field: field.to_owned(),
+                index: Some(digits.parse().ok()?),
+            }),
+            None => parts.push(PathPart {
+                field: raw.to_owned(),
+                index: None,
+            }),
+        }
     }
     (!parts.is_empty()).then_some(parts)
 }
@@ -346,5 +349,26 @@ mod tests {
         assert_eq!(value["items"][1]["renamed"], "value");
         assert_eq!(value["items"][2]["created"], true);
         assert_eq!(value["tags"], serde_json::json!(["old", "new"]));
+    }
+
+    #[test]
+    fn jsonpath_segments_accept_any_plain_key_like_python() {
+        let config = serde_json::json!({"request": {"body": {
+            "remove": ["$.a-b"],
+            "set": {"$.first-name": "x", "$.p q.r": 1},
+            "rename": {"$.old key": "$.new-key"}
+        }}});
+        let (_, body, _) = transform_request(
+            HeaderMap::new(),
+            br#"{"a-b":1,"old key":"v"}"#.to_vec(),
+            None,
+            Some(&config),
+        );
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("a-b").is_none());
+        assert_eq!(value["first-name"], "x");
+        assert_eq!(value["p q"]["r"], 1);
+        assert_eq!(value["new-key"], "v");
+        assert!(value.get("old key").is_none());
     }
 }

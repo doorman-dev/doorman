@@ -27,7 +27,7 @@ use crate::{
         grpc::grpc_policy_then_execute,
         grpc_web::grpc_web_policy_then_execute,
         metrics::metrics,
-        operations::{caches, health, status},
+        operations::{caches, features, health, status},
         platform::platform_dispatch,
         rest::rest_policy_then_proxy,
         soap::soap_policy_then_execute,
@@ -52,6 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/soap/{*path}", any(soap_policy_then_execute))
         .route("/grpc/{*path}", any(grpc_policy_then_execute))
         .route("/health", any(health))
+        .route("/features", get(features))
         .route("/status", any(status))
         .route("/caches", any(caches))
         .fallback(gateway_route_not_found)

@@ -94,6 +94,15 @@ pub fn render(runtime: &GatewayRuntime) -> String {
         "doorman_active_requests {}",
         runtime.active_requests.load(Ordering::Relaxed)
     );
+    output.push_str("# HELP doorman_tls_reload_total TLS configuration reload outcomes\n# TYPE doorman_tls_reload_total counter\n");
+    let _ = writeln!(output, "doorman_tls_reload_total{{result=\"success\"}} {}", runtime.tls_reload_success_total.load(Ordering::Relaxed));
+    let _ = writeln!(output, "doorman_tls_reload_total{{result=\"failure\"}} {}", runtime.tls_reload_failure_total.load(Ordering::Relaxed));
+    output.push_str("# HELP doorman_tls_certificate_expiry_timestamp_seconds Certificate expiry as Unix time\n# TYPE doorman_tls_certificate_expiry_timestamp_seconds gauge\n");
+    if let Ok(expiries) = runtime.tls_certificate_expiries.lock() {
+        for (profile, expiry) in expiries.iter() {
+            let _ = writeln!(output, "doorman_tls_certificate_expiry_timestamp_seconds{{profile=\"{profile}\"}} {expiry}");
+        }
+    }
     output
 }
 

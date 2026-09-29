@@ -453,7 +453,16 @@ fn seed_protos(
 }
 
 fn seed_metrics(users: &[String], apis: &[(String, String)], rng: &mut StdRng) {
-    for _ in 0..400 {
+    // Mirrors Python's seed_metrics(minutes=400): backfill 400 historical
+    // one-minute buckets (oldest first) instead of recording everything into
+    // the current minute, so a freshly seeded instance shows a real
+    // multi-hour timeseries.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for minutes_ago in (1..=400).rev() {
+        let timestamp = now.saturating_sub(minutes_ago * 60);
         for _ in 0..rng.random_range(0..=50) {
             let status = *choose(&[200_u16, 200, 200, 201, 204, 400, 401, 403, 404, 500], rng);
             let api = apis
@@ -462,7 +471,8 @@ fn seed_metrics(users: &[String], apis: &[(String, String)], rng: &mut StdRng) {
             let user = users
                 .get(rng.random_range(0..users.len().max(1)))
                 .map(String::as_str);
-            global_analytics().record_request(
+            global_analytics().record_request_at(
+                timestamp,
                 api.as_deref(),
                 user,
                 None,
@@ -556,6 +566,45 @@ mod tests {
                 logs: 2_000,
                 seed: None
             }
+        );
+    }
+
+    #[test]
+    fn seed_metrics_backfills_historical_minute_buckets_like_python() {
+        let aggregator = crate::observability::analytics_aggregator::AnalyticsAggregator::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Mirror seed_metrics' own backfill loop against an isolated aggregator
+        // (not the process-global one) so the test is hermetic.
+        for minutes_ago in (1..=400).rev() {
+            let timestamp = now.saturating_sub(minutes_ago * 60);
+            aggregator.record_request_at(
+                timestamp,
+                Some("rest:demo"),
+                Some("admin"),
+                None,
+                200,
+                42.0,
+                0,
+                0,
+            );
+        }
+        let series = aggregator.get_timeseries();
+        assert_eq!(series.len(), 400, "one bucket per historical minute");
+        let mut timestamps: Vec<u64> = series.iter().map(|point| point.timestamp).collect();
+        let deduped_len = {
+            timestamps.dedup();
+            timestamps.len()
+        };
+        assert_eq!(
+            deduped_len, 400,
+            "each bucket has a distinct minute timestamp"
+        );
+        assert!(
+            timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+            "strictly increasing"
         );
     }
 

@@ -215,7 +215,7 @@ async fn live_role_permission_matrix_blocks_then_allows_each_management_operatio
         "/platform/endpoint",
         Some(&admin),
         Some(json!({
-            "api_name": "legacy-open-management", "api_version": "v1",
+            "api_name": "permission-matrix-api", "api_version": "v1",
             "endpoint_method": "GET", "endpoint_uri": "/visible",
             "endpoint_description": "pinned Python authorization boundary"
         })),
@@ -338,6 +338,19 @@ async fn least_privilege_role_cannot_create_apis_or_read_logs() {
     )
     .await;
     assert_eq!(api.status(), StatusCode::CREATED);
+    let endpoint = request(
+        &app,
+        Method::POST,
+        "/platform/endpoint",
+        Some(&admin),
+        Some(json!({
+            "api_name": "legacy-open-management", "api_version": "v1",
+            "endpoint_method": "GET", "endpoint_uri": "/visible",
+            "endpoint_description": "pinned Python authorization boundary"
+        })),
+    )
+    .await;
+    assert_eq!(endpoint.status(), StatusCode::CREATED);
     let create_api = request(
         &app,
         Method::POST,

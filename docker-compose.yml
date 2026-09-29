@@ -34,6 +34,7 @@ services:
       MEM_AUTO_SAVE_FREQ: ${MEM_AUTO_SAVE_FREQ:-300}
       PYTHONINTMAXSTRDIGITS: ${PYTHONINTMAXSTRDIGITS:-4300}
       MEM_ENCRYPTION_KEY: ${MEM_ENCRYPTION_KEY:-}
+      LOGS_ENABLED: ${LOGS_ENABLED:-true}
       LOGS_DIR: /app/logs
     volumes:
       - doorman-generated:/app/data

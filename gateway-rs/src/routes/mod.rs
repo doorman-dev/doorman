@@ -7,3 +7,4 @@ pub mod operations;
 pub mod platform;
 pub mod rest;
 pub mod soap;
+pub mod tls_admin;

@@ -11,6 +11,7 @@ pub mod groups;
 pub mod ip;
 pub mod quota;
 pub mod rate_limit;
+pub mod rate_limit_models;
 pub mod roles;
 pub mod simulator;
 pub mod subscription;
@@ -78,6 +79,7 @@ pub struct PolicyDecision {
     pub tier_rate_limit_enabled: bool,
     pub tier_limit_status: Option<tier::TierLimitStatus>,
     pub upstream: Option<String>,
+    pub upstream_tls_profile_id: Option<String>,
     pub upstream_path: Option<String>,
     pub allowed_headers: Vec<String>,
     pub throttle_delay_ms: Option<u64>,

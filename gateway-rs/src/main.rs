@@ -15,12 +15,16 @@ use doorman_gateway::{
     routes::platform::backfill_grpc_descriptors,
     state::{GatewayRuntime, MemoryAutosaveConfig},
     storage::{runtime::SharedStorage, security_settings, snapshot},
+    tls::{TlsConnectionInfo, TlsListener},
 };
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reqwest, Tonic, and the native listener enable different Rustls feature sets.
+    // Select one provider before any of them construct TLS configuration.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     doorman_gateway::observability::init();
 
     match env::args().nth(1).as_deref() {
@@ -108,16 +112,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     spawn_sighup_reload(state.hot_reload.clone());
-    let app = build_router(state);
+    let tls_config = state.reload_tls_from_storage().await?;
+    let app = build_router(state.clone());
     let listener = TcpListener::bind(&bind_addr).await?;
 
+    let reload_state = state.clone();
+    let reload_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = reload_state.reload_tls_from_storage().await {
+                warn!(%error, "TLS reload rejected; retaining active configuration");
+            }
+        }
+    });
+
     info!(address = %bind_addr, "Doorman Rust gateway listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if let Some(tls_config) = tls_config {
+        let listener = TlsListener::new(listener, tls_config);
+        state.set_tls_listener_handle(listener.reload_handle());
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<TlsConnectionInfo>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    }
+    reload_task.abort();
 
     // Axum has now drained active requests. Stop writers before the final dump
     // so an older autosave cannot replace the state committed during draining.

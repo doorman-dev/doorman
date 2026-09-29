@@ -1,12 +1,25 @@
 use http::StatusCode;
 use serde_json::Value;
 
-use super::{PolicyFailure, PolicyStage, rate_limit::duration_to_seconds};
+use super::{PolicyFailure, PolicyStage};
 use crate::storage::{
     cache::WindowCounter,
     models::{bool_field, string_field, u64_field},
     redis::bandwidth_key,
 };
+
+/// Python `_window_to_seconds`: strips every trailing `s`; unknown or empty windows are one day.
+pub fn window_seconds(window: &str) -> u64 {
+    match window.to_ascii_lowercase().trim_end_matches('s') {
+        "second" => 1,
+        "minute" => 60,
+        "hour" => 3600,
+        "day" => 86400,
+        "week" => 604800,
+        "month" => 2592000,
+        _ => 86400,
+    }
+}
 
 pub fn enforce_pre_request_limit(
     username: &str,
@@ -25,7 +38,7 @@ pub fn enforce_pre_request_limit(
         return Ok(());
     }
     let window = string_field(user, "bandwidth_limit_window").unwrap_or("day");
-    let seconds = duration_to_seconds(window);
+    let seconds = window_seconds(window);
     let bucket = (now_seconds / seconds) * seconds;
     let used = counter.get(&bandwidth_key(username, seconds, bucket), now_seconds);
     if used >= limit || used + content_length > limit {
@@ -44,6 +57,22 @@ pub fn enforce_pre_request_limit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn window_mapping_matches_python_defaults() {
+        for (window, seconds) in [
+            ("second", 1),
+            ("Minutes", 60),
+            ("hourss", 3600),
+            ("week", 604800),
+            ("month", 2592000),
+            ("year", 86400),
+            ("fortnight", 86400),
+            ("", 86400),
+        ] {
+            assert_eq!(window_seconds(window), seconds, "{window}");
+        }
+    }
 
     #[test]
     fn rejects_over_limit_request_body() {

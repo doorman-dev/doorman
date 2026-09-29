@@ -30,6 +30,7 @@ use crate::{
         redis::{bandwidth_key, rate_limit_key, throttle_key},
         runtime::SharedStorage,
     },
+    tls::{policy::{ClientTlsFailure, ClientTlsPolicy}, profiles::{TlsProfiles, select_upstream_profile}},
 };
 
 #[derive(Clone, Debug)]
@@ -40,14 +41,18 @@ pub struct PolicyRequest {
     pub direct_ip: Option<IpAddr>,
     pub now_millis: u64,
     pub content_length: u64,
+    pub peer_certificates: Vec<Vec<u8>>,
+    pub native_tls: bool,
+    pub is_preflight: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PolicyRuntime {
     pub rate_counter: WindowCounter,
     pub rate_bucket_counter: TokenBucketCounter,
     pub throttle_counter: WindowCounter,
     pub bandwidth_counter: WindowCounter,
+    pub tls_profiles: std::sync::Arc<TlsProfiles>,
 }
 
 pub fn evaluate_rest_policy(
@@ -127,6 +132,12 @@ pub fn evaluate_rest_policy(
         ));
     }
     let endpoint = find_endpoint(&documents.endpoints, &api, method, &route.endpoint_uri).cloned();
+    if !request.is_preflight {
+        let policy = ClientTlsPolicy::from_documents(&api, endpoint.as_ref())
+            .map_err(client_tls_failure)?;
+        policy.enforce(&request.peer_certificates, &runtime.tls_profiles, request.native_tls)
+            .map_err(client_tls_failure)?;
+    }
 
     let api_public = bool_field(&api, "api_public").unwrap_or(false);
     let api_auth_required = bool_field(&api, "api_auth_required").unwrap_or(true);
@@ -308,6 +319,16 @@ pub fn evaluate_rest_policy(
         &route.endpoint_uri,
         client_key,
     ) {
+        let profile = select_upstream_profile(&api, endpoint.as_ref(), &upstream.url)
+            .map_err(|_| PolicyFailure::new(PolicyStage::Resolution, StatusCode::SERVICE_UNAVAILABLE, "TLS004", "Upstream TLS binding is invalid"))?;
+        if let Some(id) = profile.as_deref() {
+            if !matches!(url::Url::parse(&upstream.url).ok().map(|url| url.scheme().to_owned()).as_deref(), Some("https" | "grpcs"))
+                || !runtime.tls_profiles.upstreams.contains_key(id)
+            {
+                return Err(PolicyFailure::new(PolicyStage::Resolution, StatusCode::SERVICE_UNAVAILABLE, "TLS004", "Upstream TLS profile is unavailable"));
+            }
+        }
+        decision.upstream_tls_profile_id = profile;
         decision.upstream = Some(upstream.url);
         decision.routing_key = Some(upstream.key);
         decision.routing_servers = upstream.servers;
@@ -315,6 +336,15 @@ pub fn evaluate_rest_policy(
     }
 
     Ok(Some(decision))
+}
+
+fn client_tls_failure(failure: ClientTlsFailure) -> PolicyFailure {
+    let (status, code, message) = match failure {
+        ClientTlsFailure::Missing => (StatusCode::UNAUTHORIZED, "TLS001", "Client certificate required"),
+        ClientTlsFailure::Invalid => (StatusCode::FORBIDDEN, "TLS002", "Client certificate is not authorized"),
+        ClientTlsFailure::Configuration => (StatusCode::SERVICE_UNAVAILABLE, "TLS003", "Client TLS policy is unavailable"),
+    };
+    PolicyFailure::new(PolicyStage::Authentication, status, code, message)
 }
 
 fn default_http_read_timeout_ms() -> u64 {
@@ -361,9 +391,9 @@ pub async fn evaluate_shared_effects(
             })?;
 
         let rate_enabled = bool_field_default(user, "rate_limit_enabled", false)
-            || user.get("rate_limit_duration").is_some();
+            || super::rate_limit::truthy_count(user, "rate_limit_duration").is_some();
         if rate_enabled {
-            let limit = u64_field(user, "rate_limit_duration").unwrap_or(60);
+            let limit = super::rate_limit::truthy_count(user, "rate_limit_duration").unwrap_or(60);
             let window = super::rate_limit::duration_to_seconds(
                 string_field(user, "rate_limit_duration_type").unwrap_or("minute"),
             )
@@ -381,17 +411,18 @@ pub async fn evaluate_shared_effects(
         }
 
         let throttle_enabled = bool_field_default(user, "throttle_enabled", false)
-            || user.get("throttle_duration").is_some()
-            || user.get("throttle_queue_limit").is_some();
+            || super::rate_limit::truthy_count(user, "throttle_duration").is_some()
+            || super::rate_limit::truthy_count(user, "throttle_queue_limit").is_some();
         if throttle_enabled {
-            let limit = u64_field(user, "throttle_duration").unwrap_or(10);
+            let limit = super::rate_limit::truthy_count(user, "throttle_duration").unwrap_or(10);
             let window = super::rate_limit::duration_to_seconds(
                 string_field(user, "throttle_duration_type").unwrap_or("second"),
             )
             .max(1);
             let key = throttle_key(username, request.now_millis / (window * 1000));
             let count = shared_counter(storage, &key, window, mutate).await?;
-            let queue_limit = u64_field(user, "throttle_queue_limit").unwrap_or(10);
+            let queue_limit =
+                super::rate_limit::truthy_count(user, "throttle_queue_limit").unwrap_or(10);
             let excess = count.saturating_sub(limit);
             if queue_limit > 0 && (count > queue_limit || excess > queue_limit) {
                 return Err(PolicyFailure::new(
@@ -409,10 +440,9 @@ pub async fn evaluate_shared_effects(
         if bool_field(user, "bandwidth_limit_enabled") != Some(false) {
             if let Some(limit) = u64_field(user, "bandwidth_limit_bytes").filter(|limit| *limit > 0)
             {
-                let window = super::rate_limit::duration_to_seconds(
+                let window = super::bandwidth::window_seconds(
                     string_field(user, "bandwidth_limit_window").unwrap_or("day"),
-                )
-                .max(1);
+                );
                 let now_seconds = request.now_millis / 1000;
                 let bucket = (now_seconds / window) * window;
                 let key = bandwidth_key(username, window, bucket);
@@ -628,6 +658,9 @@ mod tests {
             direct_ip: Some("10.0.0.2".parse().unwrap()),
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -678,6 +711,9 @@ mod tests {
             direct_ip: None,
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -707,6 +743,9 @@ mod tests {
             direct_ip: None,
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -753,6 +792,9 @@ mod tests {
             direct_ip: None,
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
         };
         let decision = evaluate_rest_policy(
             &mut documents,

@@ -15,6 +15,7 @@ mod python_scalar;
 pub mod routes;
 pub mod state;
 pub mod storage;
+pub mod tls;
 pub mod validation;
 
 pub use app::build_router;

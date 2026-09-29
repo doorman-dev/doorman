@@ -9,15 +9,26 @@ pub struct Config {
     pub port: u16,
     pub connect_timeout: Duration,
     pub https_only: bool,
+    pub downstream_tls_mode: DownstreamTlsMode,
+    pub downstream_tls_cert_file: Option<PathBuf>,
+    pub downstream_tls_key_file: Option<PathBuf>,
+    pub tls_profiles_file: Option<PathBuf>,
     pub content_security_policy: Option<String>,
     pub compression_enabled: bool,
     pub compression_level: i32,
     pub compression_minimum_size: u16,
     pub strict_response_envelope: bool,
     pub websockets_enabled: bool,
+    pub logs_enabled: bool,
     pub logs_dir: Option<PathBuf>,
     pub security_settings_file: Option<PathBuf>,
     pub shared_storage: SharedStorageConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownstreamTlsMode {
+    Proxy,
+    Native,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +208,28 @@ impl Config {
         };
         let compression_minimum_size =
             env_parse::<u64>("COMPRESSION_MINIMUM_SIZE", 500)?.min(u64::from(u16::MAX)) as u16;
+        let logs_enabled = env_bool("LOGS_ENABLED", true);
+        let downstream_tls_mode = match env::var("DOWNSTREAM_TLS_MODE")
+            .unwrap_or_else(|_| "proxy".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "proxy" => DownstreamTlsMode::Proxy,
+            "native" => DownstreamTlsMode::Native,
+            _ => return Err(ConfigError::InvalidConfiguration(
+                "DOWNSTREAM_TLS_MODE must be proxy or native".to_owned(),
+            )),
+        };
+        let downstream_tls_cert_file = env_non_empty("DOWNSTREAM_TLS_CERT_FILE").map(PathBuf::from);
+        let downstream_tls_key_file = env_non_empty("DOWNSTREAM_TLS_KEY_FILE").map(PathBuf::from);
+        let tls_profiles_file = env_non_empty("TLS_PROFILES_FILE").map(PathBuf::from);
+        if downstream_tls_mode == DownstreamTlsMode::Native
+            && (downstream_tls_cert_file.is_none() || downstream_tls_key_file.is_none())
+        {
+            return Err(ConfigError::InvalidConfiguration(
+                "native TLS requires DOWNSTREAM_TLS_CERT_FILE and DOWNSTREAM_TLS_KEY_FILE".to_owned(),
+            ));
+        }
 
         Ok(Self {
             host: env::var("HOST")
@@ -205,6 +238,10 @@ impl Config {
             port: env_parse("PORT", 3001)?,
             connect_timeout: python_http_connect_timeout()?,
             https_only: env_bool("HTTPS_ONLY", false),
+            downstream_tls_mode,
+            downstream_tls_cert_file,
+            downstream_tls_key_file,
+            tls_profiles_file,
             content_security_policy: env::var("CONTENT_SECURITY_POLICY")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -213,10 +250,15 @@ impl Config {
             compression_minimum_size,
             strict_response_envelope: env_bool("STRICT_RESPONSE_ENVELOPE", false),
             websockets_enabled: env_bool("WEBSOCKETS_ENABLED", false),
-            logs_dir: env_non_empty("LOGS_DIR").map(PathBuf::from).or_else(|| {
-                let path = PathBuf::from("/app/logs");
-                path.exists().then_some(path)
-            }),
+            logs_enabled,
+            logs_dir: logs_enabled
+                .then(|| {
+                    env_non_empty("LOGS_DIR").map(PathBuf::from).or_else(|| {
+                        let path = PathBuf::from("/app/logs");
+                        path.exists().then_some(path)
+                    })
+                })
+                .flatten(),
             shared_storage,
             security_settings_file: Some(
                 env::var("SECURITY_SETTINGS_FILE")
@@ -242,12 +284,17 @@ impl Config {
             port: 0,
             connect_timeout: Duration::from_secs(1),
             https_only: false,
+            downstream_tls_mode: DownstreamTlsMode::Proxy,
+            downstream_tls_cert_file: None,
+            downstream_tls_key_file: None,
+            tls_profiles_file: None,
             content_security_policy: None,
             compression_enabled: true,
             compression_level: 6,
             compression_minimum_size: 500,
             strict_response_envelope: false,
             websockets_enabled: false,
+            logs_enabled: true,
             logs_dir: None,
             // Tests opt into an isolated path when exercising file persistence.
             security_settings_file: None,
@@ -539,6 +586,46 @@ mod tests {
         assert!(config.compression_enabled);
         assert_eq!(config.compression_level, 6);
         assert_eq!(config.compression_minimum_size, 500);
+    }
+
+    #[test]
+    fn logs_can_be_disabled_at_environment_level() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _environment = EnvRestore::set(&[
+            ("ENV", "development"),
+            ("MEM_OR_EXTERNAL", "MEM"),
+            ("THREADS", "1"),
+            ("DOORMAN_ADMIN_PASSWORD", "DisabledLogsPassword123!"),
+            (
+                "JWT_SECRET_KEY",
+                "disabled-logs-signing-key-at-least-32-characters",
+            ),
+            ("LOGS_ENABLED", "false"),
+            ("LOGS_DIR", "/tmp/doorman-disabled-logs-config-test"),
+        ]);
+
+        let config = Config::from_env().unwrap();
+        assert!(!config.logs_enabled);
+        assert!(config.logs_dir.is_none());
+    }
+
+    #[test]
+    fn native_tls_requires_both_pem_paths() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _environment = EnvRestore::set(&[
+            ("ENV", "development"),
+            ("MEM_OR_EXTERNAL", "MEM"),
+            ("THREADS", "1"),
+            ("DOORMAN_ADMIN_PASSWORD", "NativeTlsPassword123!"),
+            ("JWT_SECRET_KEY", "native-tls-signing-key-at-least-32-characters"),
+            ("DOWNSTREAM_TLS_MODE", "native"),
+            ("DOWNSTREAM_TLS_CERT_FILE", ""),
+            ("DOWNSTREAM_TLS_KEY_FILE", ""),
+        ]);
+        assert!(matches!(
+            Config::from_env(),
+            Err(ConfigError::InvalidConfiguration(message)) if message.contains("DOWNSTREAM_TLS_CERT_FILE")
+        ));
     }
 
     #[test]

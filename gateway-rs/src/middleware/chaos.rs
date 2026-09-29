@@ -46,7 +46,15 @@ pub async fn latency_injection(req: Request, next: Next) -> Response {
         enabled,
         req.headers()
             .get("x-doorman-latency")
-            .and_then(|value| value.to_str().ok()),
+            // Starlette decodes header bytes as latin-1.
+            .map(|value| {
+                value
+                    .as_bytes()
+                    .iter()
+                    .map(|b| char::from(*b))
+                    .collect::<String>()
+            })
+            .as_deref(),
     ) {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
@@ -57,8 +65,25 @@ fn injected_latency_ms(enabled: bool, value: Option<&str>) -> Option<u64> {
     if !enabled {
         return None;
     }
-    let delay = value?.trim().parse::<i64>().ok()?.clamp(0, 5_000);
+    let text = crate::python_scalar::strip(value?);
+    let delay = match crate::python_scalar::parse_integer(text) {
+        Some(parsed) => parsed.clamp(0, 5_000),
+        // Python ints are unbounded; only magnitude beyond i128 needs the sign.
+        None if is_oversized_integer(text) => {
+            if text.starts_with('-') {
+                0
+            } else {
+                5_000
+            }
+        }
+        None => return None,
+    };
     (delay > 0).then_some(delay as u64)
+}
+
+fn is_oversized_integer(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    digits.len() > 38 && digits.chars().all(|c| c.is_ascii_digit()) && digits.len() <= 4_300
 }
 
 #[cfg(test)]
@@ -74,5 +99,16 @@ mod tests {
         assert_eq!(injected_latency_ms(true, Some("0")), None);
         assert_eq!(injected_latency_ms(true, Some(" 125 ")), Some(125));
         assert_eq!(injected_latency_ms(true, Some("9000")), Some(5_000));
+        assert_eq!(injected_latency_ms(true, Some("+1_0")), Some(10));
+        assert_eq!(injected_latency_ms(true, Some("１２")), Some(12));
+        assert_eq!(injected_latency_ms(true, Some("1__0")), None);
+        assert_eq!(
+            injected_latency_ms(true, Some(&"9".repeat(60))),
+            Some(5_000)
+        );
+        assert_eq!(
+            injected_latency_ms(true, Some(&format!("-{}", "9".repeat(60)))),
+            None
+        );
     }
 }

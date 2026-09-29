@@ -8,6 +8,7 @@ use doorman_gateway::storage::models::PolicyDocuments;
 use doorman_gateway::{AppState, Config, build_router};
 use http::{Request, StatusCode, header};
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -31,6 +32,47 @@ async fn rust_health_matches_public_contract() {
         to_bytes(response.into_body(), 1024).await.unwrap(),
         r#"{"status":"online"}"#
     );
+}
+
+#[tokio::test]
+async fn disabled_logs_leave_request_metrics_running_without_creating_log_files() {
+    let logs_dir =
+        std::env::temp_dir().join(format!("doorman-disabled-logs-{}", uuid::Uuid::new_v4()));
+    let mut config = Config::for_test("http://127.0.0.1:9".to_owned());
+    config.logs_enabled = false;
+    config.logs_dir = Some(logs_dir.clone());
+    let state = AppState::new(config).unwrap();
+    let runtime = state.runtime.clone();
+    let app = build_router(state);
+
+    let features = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/features")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(features.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(features.into_body(), 1024).await.unwrap(),
+        r#"{"logs_enabled":false}"#
+    );
+
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(runtime.request_total.load(Ordering::Relaxed) >= 2);
+    assert!(!logs_dir.exists(), "disabled logging created {logs_dir:?}");
 }
 
 #[tokio::test]

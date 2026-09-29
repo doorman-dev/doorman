@@ -33,6 +33,11 @@ struct StatusResponse {
     uptime: String,
 }
 
+#[derive(Serialize)]
+pub struct FeaturesResponse {
+    logs_enabled: bool,
+}
+
 #[derive(Clone, Copy)]
 enum GatewayOperation {
     Status,
@@ -47,6 +52,12 @@ pub async fn health(
         return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
     Ok(Json(HealthResponse { status: "online" }).into_response())
+}
+
+pub async fn features(State(state): State<AppState>) -> Json<FeaturesResponse> {
+    Json(FeaturesResponse {
+        logs_enabled: state.config.logs_enabled,
+    })
 }
 
 pub async fn status(

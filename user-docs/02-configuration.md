@@ -63,6 +63,11 @@ localStorage.setItem('API_URL', 'https://api.doorman.example.com')
 | `AUTH_REFRESH_EXPIRE_FREQ` | `days` | `seconds`, `minutes`, `hours`, `days` |
 | `TOKEN_ENCRYPTION_KEY` | - | Encrypt API keys at rest (recommended) |
 | `HTTPS_ONLY` | `false` | **Required in production.** Enforces HTTPS, secure cookies, CSRF |
+| `DOWNSTREAM_TLS_MODE` | `proxy` | `proxy` keeps external TLS termination; `native` terminates TLS in the Rust listener. |
+| `DOWNSTREAM_TLS_CERT_FILE` | unset | PEM certificate chain for native TLS. Required when mode is `native`. |
+| `DOWNSTREAM_TLS_KEY_FILE` | unset | PEM private key for native TLS. Required when mode is `native`. |
+| `TLS_PROFILES_FILE` | unset | YAML file defining file-managed client-CA and upstream TLS profiles. |
+| `TLS_SECRET_ENCRYPTION_KEY` | unset | Base64 of exactly 32 random bytes, shared across nodes. Required for admin-managed TLS material; without it uploads are rejected. |
 
 ## IP Access Control
 
@@ -96,6 +101,7 @@ Policy matching trims surrounding whitespace. IPv4 networks accept prefix length
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LOGS_ENABLED` | `true` | Set to `false` to disable stored request/audit logs, logging APIs, and the Logs page. Metrics and analytics remain enabled. |
 | `LOG_FORMAT` | `plain` | `plain` or `json` (use json in production) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 

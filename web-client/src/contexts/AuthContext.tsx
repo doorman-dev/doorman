@@ -24,6 +24,7 @@ interface AuthContextType {
   hasUIAccess: boolean
   user: { username: string; role: string } | null
   permissions: any
+  logsEnabled: boolean
   canAccessPage: (permission: string) => boolean
   logout: () => void
   checkAuth: () => Promise<void>
@@ -38,7 +39,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     authResolved: false,
     hasUIAccess: false,
     user: null as { username: string; role: string } | null,
-    permissions: null as any
+    permissions: null as any,
+    logsEnabled: false
   })
   const isAuthenticatedRef = useRef(false)
   const router = useRouter()
@@ -47,6 +49,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (DEBUG) console.log('=== AUTH CONTEXT DEBUG ===')
     try {
       await fetchJson(`${SERVER_URL}/platform/authorization/status`)
+      const features: any = await fetchJson(`${SERVER_URL}/api/features`).catch(() => ({ logs_enabled: true }))
+      const logsEnabled = (features?.response?.logs_enabled ?? features?.logs_enabled) !== false
 
       let user = null as any
       let permissions: any = null
@@ -65,7 +69,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         authResolved: true,
         hasUIAccess: !!(user && user.ui_access === true),
         user,
-        permissions
+        permissions,
+        logsEnabled
       })
     } catch (error) {
       if (DEBUG) console.warn('AuthContext - Not authenticated or status check failed:', error)
@@ -74,7 +79,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         authResolved: true,
         hasUIAccess: false,
         user: null,
-        permissions: null
+        permissions: null,
+        logsEnabled: false
       })
     }
   }
@@ -107,7 +113,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authResolved: true,
       hasUIAccess: false,
       user: null,
-      permissions: null
+      permissions: null,
+      logsEnabled: false
     })
     router.push('/login')
   }
@@ -156,6 +163,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     hasUIAccess: authState.hasUIAccess,
     user: authState.user,
     permissions: authState.permissions,
+    logsEnabled: authState.logsEnabled,
     canAccessPage: canAccessPagePermission,
     logout,
     checkAuth,

@@ -95,7 +95,7 @@ fn validate_value(
             python_type_name(value)
         ));
     }
-    if let Some(text) = value.as_str() {
+    if let Some(text) = value.as_str().filter(|_| expected == "string") {
         let length = text.chars().count() as f64;
         enforce_range(length, rules, "String length", "", "")?;
         if let Some(pattern) = rules.get("pattern").and_then(Value::as_str) {
@@ -112,10 +112,11 @@ fn validate_value(
     if let Some(number) = value
         .as_f64()
         .or_else(|| value.as_bool().map(|value| if value { 1.0 } else { 0.0 }))
+        .filter(|_| expected == "number")
     {
         enforce_range(number, rules, "Value", "", "")?;
     }
-    if let Some(items) = value.as_array() {
+    if let Some(items) = value.as_array().filter(|_| expected == "array") {
         enforce_range(items.len() as f64, rules, "Array", " items", " items")?;
         if let Some(item_rules) = rules.get("array_items") {
             for (index, item) in items.iter().enumerate() {
@@ -129,7 +130,7 @@ fn validate_value(
         }
     }
     if let (Some(object), Some(nested)) = (
-        value.as_object(),
+        value.as_object().filter(|_| expected == "object"),
         rules.get("nested_schema").and_then(Value::as_object),
     ) {
         for (field, nested_rules) in nested {
@@ -137,7 +138,7 @@ fn validate_value(
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                && object.get(field).is_none_or(Value::is_null)
+                && !object.contains_key(field)
             {
                 return Err(format!("Required field {field} is missing"));
             }
@@ -149,8 +150,12 @@ fn validate_value(
             )?;
         }
     }
-    if let Some(allowed) = rules.get("enum").and_then(Value::as_array) {
-        if !allowed.contains(value) {
+    if let Some(allowed) = rules
+        .get("enum")
+        .and_then(Value::as_array)
+        .filter(|allowed| !allowed.is_empty())
+    {
+        if !allowed.iter().any(|candidate| python_eq(candidate, value)) {
             return Err(format!(
                 "Value must be one of {}",
                 python_list_repr(allowed)
@@ -192,16 +197,18 @@ fn enforce_range(
 }
 
 fn validate_format(value: &str, format: &str, path: &str) -> Result<(), String> {
+    // Python's `$` also matches before one trailing newline.
+    let pattern_value = value.strip_suffix('\n').unwrap_or(value);
     let valid = match format {
         "email" => Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-            .is_ok_and(|regex| regex.is_match(value)),
+            .is_ok_and(|regex| regex.is_match(pattern_value)),
         "url" => Regex::new(
             r"^https?://(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*$",
         )
-        .is_ok_and(|regex| regex.is_match(value)),
+        .is_ok_and(|regex| regex.is_match(pattern_value)),
         "date" => valid_date(value),
         "datetime" => valid_datetime(value),
-        "uuid" => uuid::Uuid::parse_str(value).is_ok(),
+        "uuid" => valid_uuid(value),
         _ => true,
     };
     if valid {
@@ -220,35 +227,119 @@ fn validate_format(value: &str, format: &str, path: &str) -> Result<(), String> 
     }
 }
 
+/// `datetime.strptime(value, '%Y-%m-%d')`: unpadded month/day are accepted.
 fn valid_date(value: &str) -> bool {
-    time::Date::parse(
-        value,
-        &time::format_description::well_known::Iso8601::DEFAULT,
-    )
-    .is_ok()
+    static DATE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^([0-9]{4})-(1[0-2]|0[1-9]|[1-9])-(3[0-1]|[1-2][0-9]|0[1-9]|[1-9]| [1-9])$")
+            .expect("date expression is valid")
+    });
+    let Some(parts) = DATE.captures(value) else {
+        return false;
+    };
+    let year: i32 = parts[1].parse().unwrap_or(0);
+    let month: u8 = parts[2].parse().unwrap_or(0);
+    let day: u8 = parts[3].trim().parse().unwrap_or(0);
+    year >= 1
+        && time::Month::try_from(month)
+            .ok()
+            .and_then(|month| time::Date::from_calendar_date(year, month, day).ok())
+            .is_some()
 }
 
+/// `uuid.UUID(value)`: strips `urn:`/`uuid:`, braces and hyphens, then needs 32 hex digits.
+fn valid_uuid(value: &str) -> bool {
+    let hex = value
+        .replace("urn:", "")
+        .replace("uuid:", "")
+        .trim_matches(|c| c == '{' || c == '}')
+        .replace('-', "");
+    hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `datetime.fromisoformat(value.replace('Z', '+00:00'))` (Python 3.11+ grammar):
+/// extended or basic dates, ISO week dates, any single-character separator, optional
+/// `HH[:MM[:SS[.f]]]` time, and an optional `±HH[:MM[:SS[.f]]]` offset.
 fn valid_datetime(value: &str) -> bool {
-    valid_date(value)
-        || time::OffsetDateTime::parse(
-            value,
-            &time::format_description::well_known::Iso8601::DEFAULT,
+    static DATE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})|(\d{4})-W(\d{2})(?:-(\d))?|(\d{4})W(\d{2})(\d)?)",
         )
-        .is_ok()
-        || time::PrimitiveDateTime::parse(
-            value,
-            &time::format_description::well_known::Iso8601::DEFAULT,
+        .expect("static date pattern")
+    });
+    static TIME: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^(\d{2})(?:(?::(\d{2})(?::(\d{2})(?:[.,]\d+)?)?)|(?:(\d{2})(?:(\d{2})(?:[.,]\d+)?)?))?(?:[+-](\d{2})(?::?(\d{2})(?::?(\d{2})(?:[.,]\d+)?)?)?)?$",
         )
-        .is_ok()
-        || value.find(' ').is_some_and(|index| {
-            let mut normalized = value.to_owned();
-            normalized.replace_range(index..=index, "T");
-            time::PrimitiveDateTime::parse(
-                &normalized,
-                &time::format_description::well_known::Iso8601::DEFAULT,
-            )
-            .is_ok()
-        })
+        .expect("static time pattern")
+    });
+    let value = value.replace('Z', "+00:00");
+    let Some(captures) = DATE.captures(&value) else {
+        return false;
+    };
+    let number = |index: usize| {
+        captures
+            .get(index)
+            .map(|m| m.as_str().parse::<i32>().unwrap())
+    };
+    let calendar = if number(1).is_some() {
+        (number(1), number(2), number(3))
+    } else {
+        (number(4), number(5), number(6))
+    };
+    let date_ok = if let (Some(y), Some(m), Some(d)) = calendar {
+        u8::try_from(m)
+            .ok()
+            .and_then(|m| time::Month::try_from(m).ok())
+            .zip(u8::try_from(d).ok())
+            .is_some_and(|(m, d)| time::Date::from_calendar_date(y, m, d).is_ok())
+    } else {
+        let (year, week, day) = if number(7).is_some() {
+            (number(7), number(8), number(9))
+        } else {
+            (number(10), number(11), number(12))
+        };
+        match (year, week, u8::try_from(day.unwrap_or(1)).ok()) {
+            (Some(y), Some(w), Some(d)) => {
+                let weekday = match d {
+                    1 => Some(time::Weekday::Monday),
+                    2 => Some(time::Weekday::Tuesday),
+                    3 => Some(time::Weekday::Wednesday),
+                    4 => Some(time::Weekday::Thursday),
+                    5 => Some(time::Weekday::Friday),
+                    6 => Some(time::Weekday::Saturday),
+                    7 => Some(time::Weekday::Sunday),
+                    _ => None,
+                };
+                u8::try_from(w)
+                    .ok()
+                    .zip(weekday)
+                    .is_some_and(|(w, wd)| time::Date::from_iso_week_date(y, w, wd).is_ok())
+            }
+            _ => false,
+        }
+    };
+    if !date_ok {
+        return false;
+    }
+    let rest = &value[captures.get(0).unwrap().end()..];
+    let mut chars = rest.chars();
+    if chars.next().is_none() {
+        return true;
+    }
+    let time_part = chars.as_str();
+    let Some(time) = TIME.captures(time_part) else {
+        return false;
+    };
+    let field = |index: usize| time.get(index).map(|m| m.as_str().parse::<u32>().unwrap());
+    let hour = field(1).unwrap();
+    let minute = field(2).or(field(4)).unwrap_or(0);
+    let second = field(3).or(field(5)).unwrap_or(0);
+    hour < 24
+        && minute < 60
+        && second < 60
+        && field(6).is_none_or(|h| h < 24)
+        && field(7).is_none_or(|m| m < 60)
+        && field(8).is_none_or(|s| s < 60)
 }
 
 fn python_type_name(value: &Value) -> &'static str {
@@ -274,16 +365,77 @@ fn python_number(value: f64) -> String {
 fn python_list_repr(values: &[Value]) -> String {
     let values = values
         .iter()
-        .map(|value| match value {
-            Value::String(value) => format!("'{value}'"),
-            Value::Bool(true) => "True".to_owned(),
-            Value::Bool(false) => "False".to_owned(),
-            Value::Null => "None".to_owned(),
-            value => value.to_string(),
-        })
+        .map(python_repr)
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{values}]")
+}
+
+fn python_repr(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let quote = if text.contains('\'') && !text.contains('"') {
+                '"'
+            } else {
+                '\''
+            };
+            let mut out = String::from(quote);
+            for character in text.chars() {
+                match character {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c == quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(quote);
+            out
+        }
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Null => "None".to_owned(),
+        Value::Array(items) => python_list_repr(items),
+        Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(key, value)| format!(
+                    "{}: {}",
+                    python_repr(&Value::String(key.clone())),
+                    python_repr(value)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        number => number.to_string(),
+    }
+}
+
+/// Python `==` semantics for JSON-shaped values: `1 == 1.0 == True`.
+fn python_eq(left: &Value, right: &Value) -> bool {
+    let numeric = |value: &Value| match value {
+        Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
+        Value::Number(number) => number.as_f64(),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (numeric(left), numeric(right)) {
+        return a == b;
+    }
+    match (left, right) {
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| python_eq(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.get(key).is_some_and(|other| python_eq(value, other)))
+        }
+        _ => left == right,
+    }
 }
 
 fn validate_schema_paths(
@@ -299,12 +451,7 @@ fn validate_schema_paths(
         if full_path.split('.').any(|part| {
             part.is_empty()
                 || part.split_once('[').is_some_and(|(field, index)| {
-                    field.is_empty()
-                        && !index
-                            .strip_suffix(']')
-                            .unwrap_or(index)
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit())
+                    field.is_empty() && !is_ascii_digits(index.trim_end_matches(']'))
                 })
         }) {
             return Err(format!("Invalid field path: {full_path}"));
@@ -316,6 +463,10 @@ fn validate_schema_paths(
     Ok(())
 }
 
+fn is_ascii_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = root;
     for segment in path.split('.') {
@@ -324,15 +475,22 @@ fn nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
             current = current.get(field)?;
         }
         if let Some(index) = index {
-            current = current.as_array()?.get(index)?;
+            let items = current.as_array()?;
+            // Python indexes from the end for negative values.
+            let index = if index < 0 {
+                items.len().checked_sub(index.unsigned_abs() as usize)?
+            } else {
+                index as usize
+            };
+            current = items.get(index)?;
         }
     }
     Some(current)
 }
 
-fn parse_segment(segment: &str) -> Option<(&str, Option<usize>)> {
+fn parse_segment(segment: &str) -> Option<(&str, Option<i64>)> {
     if let Some((field, raw_index)) = segment.split_once('[') {
-        let index = raw_index.strip_suffix(']')?.parse().ok()?;
+        let index = raw_index.trim_end_matches(']').parse().ok()?;
         Some((field, Some(index)))
     } else if segment.is_empty() {
         None
@@ -525,5 +683,120 @@ mod tests {
             .unwrap_err(),
             "Value must be one of ['NEW', 'OPEN']"
         );
+    }
+
+    #[test]
+    fn python_edge_cases_for_paths_types_enums_and_formats() {
+        let ok = |doc: Value, schema: Value| validate_json(&doc, &schema);
+        // Invalid schema paths: empty index, multiple closing brackets are fine.
+        for (path, valid) in [
+            ("[", false),
+            ("[]", false),
+            ("[0]", true),
+            ("[0]]", true),
+            ("a[x]", true),
+            ("a..b", false),
+        ] {
+            let schema = json!({ path: {"type": "string"} });
+            assert_eq!(
+                validate_schema_paths(schema.as_object().unwrap(), "").is_ok(),
+                valid,
+                "{path}"
+            );
+        }
+        // Present-but-null nested field: "Field is required", not "is missing".
+        let nested = json!({"o": {"type": "object", "nested_schema": {"k": {"type": "string", "required": true}}}});
+        assert_eq!(
+            ok(json!({"o": {"k": null}}), nested.clone()).unwrap_err(),
+            "Field is required"
+        );
+        assert_eq!(
+            ok(json!({"o": {}}), nested).unwrap_err(),
+            "Required field k is missing"
+        );
+        // Negative indexes read from the end.
+        let idx = json!({"a[-1]": {"type": "number", "min": 5}});
+        assert!(ok(json!({"a": [1, 9]}), idx.clone()).is_ok());
+        assert_eq!(
+            ok(json!({"a": [9, 1]}), idx).unwrap_err(),
+            "Value must be at least 5"
+        );
+        // Empty enum is ignored; 1 == 1.0 == True; repr of nested values.
+        assert!(
+            ok(
+                json!({"x": "q"}),
+                json!({"x": {"type": "string", "enum": []}})
+            )
+            .is_ok()
+        );
+        assert!(
+            ok(
+                json!({"x": 1.0}),
+                json!({"x": {"type": "number", "enum": [1]}})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            ok(
+                json!({"x": "z"}),
+                json!({"x": {"type": "string", "enum": ["a", "it's", 2, true, null]}})
+            )
+            .unwrap_err(),
+            "Value must be one of ['a', \"it's\", 2, True, None]"
+        );
+        // Constraints only apply for the declared type.
+        assert!(
+            ok(
+                json!({"x": "ab"}),
+                json!({"x": {"type": "other", "min": 5}})
+            )
+            .is_ok()
+        );
+        // strptime-style dates, permissive UUID normalisation, trailing newline in `$` formats.
+        for (format, value, valid) in [
+            ("date", "2024-1-5", true),
+            ("date", "2024-02-30", false),
+            ("date", "2024-02-29", true),
+            ("date", "2023-02-29", false),
+            ("date", "2024-01-05T00:00", false),
+            ("date", "0000-01-01", false),
+            ("uuid", "12345678123456781234567812345678", true),
+            ("uuid", "{12345678-1234-5678-1234-567812345678}", true),
+            (
+                "uuid",
+                "urn:uuid:12345678-1234-5678-1234-567812345678",
+                true,
+            ),
+            ("uuid", "1234-5678", false),
+            ("uuid", "1234567-8123-4567-8123-4567812345678", true),
+            ("datetime", "2024-1-5", false),
+            ("datetime", "2024-01-05", true),
+            ("datetime", "2024-01-05T10", true),
+            ("datetime", "2024-01-05 10:30:15.123456789", true),
+            ("datetime", "20240105T103015", true),
+            ("datetime", "2024-W01-1T10:00", true),
+            ("datetime", "2024W011", true),
+            ("datetime", "2024-01-05T10:00:00Z", true),
+            ("datetime", "2024-01-05T10:00:00+0530", true),
+            ("datetime", "2024-01-05T10:00:00,5", true),
+            ("datetime", "2024-01-05*10:00", true),
+            ("datetime", "2024-13-01", false),
+            ("datetime", "2024-02-30", false),
+            ("datetime", "2024-01-05T24:00", false),
+            ("datetime", "2024-01-05T10:60", false),
+            ("datetime", "2024-01-05T", false),
+            ("datetime", "2024-01-05T10:00+24:00", false),
+            ("datetime", "2024-01-05T10:0000", false),
+            ("datetime", "10:00", false),
+            ("email", "a@b.com\n", true),
+            ("email", "a@b.com\n\n", false),
+        ] {
+            let schema = json!({"v": {"type": "string", "format": format}});
+            assert_eq!(
+                ok(json!({"v": value}), schema).is_ok(),
+                valid,
+                "{format} {value:?}"
+            );
+        }
     }
 }

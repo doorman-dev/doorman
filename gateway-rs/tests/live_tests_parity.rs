@@ -28,6 +28,27 @@ async fn test_app_state() -> AppState {
     test_app_state_with(|_| {}).await
 }
 
+/// Re-runs `name` in a child process with ENFORCE_ADMIN_SUBSCRIPTION=true (as the Python
+/// live tests do) so the process-global variable cannot leak into concurrent tests.
+fn reexec_with_enforced_admin_subscription(name: &str) -> bool {
+    if std::env::var_os("DOORMAN_ENFORCE_ADMIN_SUB_CHILD").is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("DOORMAN_ENFORCE_ADMIN_SUB_CHILD", "1")
+        .env("ENFORCE_ADMIN_SUBSCRIPTION", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test]
 async fn hot_reload_changes_retry_and_timeout_on_real_http_requests() {
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -1388,11 +1409,18 @@ async fn monitor_metrics_increment_status_series_and_top_apis_parity() {
     assert!(metrics["total_requests"].as_u64().unwrap_or(0) >= 3);
     assert!(metrics["status_counts"]["200"].as_u64().unwrap_or(0) >= 3);
     assert!(metrics["series"].is_array());
+    // Python's MetricsStore.snapshot serializes top_apis as a list of
+    // [name, count] tuples (sorted(dict.items())), not objects.
     assert!(metrics["top_apis"].as_array().unwrap().iter().any(|entry| {
-        entry["name"]
-            .as_str()
+        entry
+            .as_array()
+            .and_then(|pair| pair.first())
+            .and_then(|name| name.as_str())
             .is_some_and(|name| name.starts_with("rest:"))
     }));
+    // Python's unique_users is len(agg_user_counts) reconstructed from the
+    // selected range's buckets, not a process-global all-time distinct count.
+    assert!(metrics["unique_users"].as_u64().unwrap_or(0) >= 1);
     upstream.abort();
 }
 
@@ -2225,6 +2253,10 @@ async fn request_id_is_forwarded_to_authenticated_rest_upstream_and_response() {
 
 #[tokio::test]
 async fn live_test_21_subscription_list_unsubscribe_parity() {
+    if reexec_with_enforced_admin_subscription("live_test_21_subscription_list_unsubscribe_parity")
+    {
+        return;
+    }
     let app = build_router(test_app_state().await);
     let token = login_admin(&app).await;
     let api_name = "subs-test-21";
@@ -3157,10 +3189,12 @@ async fn live_test_41_soap_and_85_endpoint_validation_parity() {
                         "endpoint_id": endpoint_id,
                         "validation_enabled": true,
                         "validation_schema": {
-                            "intA": {
-                                "required": true,
-                                "type": "string",
-                                "min": 2
+                            "validation_schema": {
+                                "intA": {
+                                    "required": true,
+                                    "type": "string",
+                                    "min": 2
+                                }
                             }
                         }
                     })
@@ -4168,6 +4202,9 @@ message HelloReply { string message = 1; }
 
 #[tokio::test]
 async fn grpc_gateway_maps_upstream_statuses_parity() {
+    if reexec_with_enforced_admin_subscription("grpc_gateway_maps_upstream_statuses_parity") {
+        return;
+    }
     let (upstream_url, upstream) = start_grpc_status_upstream().await;
     let app = build_router(test_app_state().await);
     let token = login_admin(&app).await;

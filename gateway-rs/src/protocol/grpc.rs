@@ -19,7 +19,7 @@ use tonic::{
     Request, Status,
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     metadata::{Ascii, MetadataKey, MetadataValue},
-    transport::{Channel, Endpoint},
+    transport::Channel,
 };
 
 use crate::{
@@ -77,7 +77,7 @@ pub async fn execute_json_gateway(
 }
 
 pub async fn execute_web_gateway(
-    _state: &AppState,
+    state: &AppState,
     decision: &PolicyDecision,
     headers: &HeaderMap,
     body: &[u8],
@@ -195,25 +195,9 @@ pub async fn execute_web_gateway(
             return web_trailer_response(text_mode, tonic::Code::Unavailable, "Invalid upstream");
         }
     };
-    let channel = match Endpoint::from_shared(endpoint) {
-        Ok(endpoint) => match endpoint
-            .connect_timeout(Duration::from_millis(decision.request_timeout_ms.max(1)))
-            .timeout(Duration::from_millis(decision.request_timeout_ms.max(1)))
-            .connect()
-            .await
-        {
-            Ok(channel) => channel,
-            Err(_) => {
-                return web_trailer_response(
-                    text_mode,
-                    tonic::Code::Unavailable,
-                    "Upstream unavailable",
-                );
-            }
-        },
-        Err(_) => {
-            return web_trailer_response(text_mode, tonic::Code::Unavailable, "Invalid upstream");
-        }
+    let channel = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
+        Ok(channel) => channel,
+        Err(_) => return web_trailer_response(text_mode, tonic::Code::Unavailable, "Upstream unavailable"),
     };
     let path = match PathAndQuery::try_from(format!(
         "/{}/{}",
@@ -369,7 +353,7 @@ pub(crate) fn web_body_response(text_mode: bool, body: Vec<u8>) -> Response {
 }
 
 async fn execute(
-    _state: &AppState,
+    state: &AppState,
     decision: &PolicyDecision,
     headers: &HeaderMap,
     body: &[u8],
@@ -425,16 +409,13 @@ async fn execute(
             "No upstream servers configured".to_owned(),
         ));
     };
-    let endpoint = Endpoint::from_shared(normalize_endpoint(upstream)?)
-        .map_err(|error| GrpcGatewayError::Transport(error.to_string()))?
-        .connect_timeout(Duration::from_millis(decision.request_timeout_ms.max(1)))
-        .timeout(Duration::from_millis(decision.request_timeout_ms.max(1)));
+    let endpoint = normalize_endpoint(upstream)?;
     let attempts = decision
         .retry_count
         .max(env_u32("GRPC_MAX_RETRIES", 0))
         .saturating_add(1);
     for attempt in 0..attempts {
-        let result = match endpoint.clone().connect().await {
+        let result = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
             Ok(channel) => {
                 invoke(
                     channel,
@@ -461,7 +442,7 @@ async fn execute(
             Err(primary_error) => {
                 // The Python gateway makes one final compatibility attempt without the
                 // protobuf package. Some legacy gRPC services register that path.
-                let fallback = match endpoint.clone().connect().await {
+                let fallback = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
                     Ok(channel) => {
                         invoke(
                             channel,

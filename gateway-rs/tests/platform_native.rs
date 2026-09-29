@@ -2060,6 +2060,27 @@ async fn authorization_refresh_and_invalidate_match_python() {
         Some(json!({})),
     )
     .await;
+    let invalidate_cookies = invalidate
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    // Python's authorization_invalidate clears both the primary and dev cookie
+    // names with Max-Age=0.
+    assert!(
+        invalidate_cookies.iter().any(
+            |cookie| cookie.starts_with("access_token_cookie=") && cookie.contains("Max-Age=0")
+        ),
+        "{invalidate_cookies:?}"
+    );
+    assert!(
+        invalidate_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("access_token_cookie_dev=")
+                && cookie.contains("Max-Age=0")),
+        "{invalidate_cookies:?}"
+    );
     assert_eq!(invalidate.status(), StatusCode::OK);
     assert_eq!(
         response_json(invalidate).await,
@@ -3735,7 +3756,9 @@ async fn proto_upload_ignores_the_client_filename_like_python() {
 
 #[tokio::test]
 async fn proto_upload_extension_acceptance_matches_python_contract() {
-    let app = build_router(memory_state(false).await);
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    let app = build_router(state);
     let (cookie, _) = login(&app).await;
     let boundary = "doorman-proto-extension-boundary";
     let multipart = |filename: &str, content_type: &str, content: &str| {
@@ -3794,6 +3817,15 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
             .to_ascii_lowercase()
             .starts_with("proto file uploaded")
     );
+    let pending = storage
+        .find_one(
+            "grpc_proto_uploads",
+            &json!({"api_name": "sample", "api_version": "v1"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending["api_grpc_package"], "sample_v1");
 
     let updated = app
         .clone()
@@ -3873,6 +3905,53 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
             "API002",
             "{path}"
         );
+    }
+}
+
+#[tokio::test]
+async fn proto_content_validation_errors_match_python() {
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+    let cases = [
+        (
+            "missing",
+            b"edition = 2023;".to_vec(),
+            "Invalid proto file: Invalid proto file: missing proto syntax (syntax/message/service)",
+        ),
+        (
+            "binary",
+            b"syntax = \"proto3\";\0".to_vec(),
+            "Invalid proto file: Invalid proto file: binary content detected",
+        ),
+        (
+            "utf8",
+            vec![b's', b'y', b'n', b't', b'a', b'x', 0xff],
+            "Invalid proto file: Invalid proto file: not valid UTF-8",
+        ),
+        (
+            "suspicious",
+            b"syntax = \"proto3\"; curl example.test".to_vec(),
+            "Invalid proto file: Invalid proto file: suspicious content detected",
+        ),
+    ];
+    for (name, content, expected) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/platform/proto/{name}/v1"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(content))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        let body = response_json(response).await;
+        assert_eq!(body["error_code"], "REQ003", "{name}");
+        assert_eq!(body["error_message"], expected, "{name}");
     }
 }
 
@@ -3960,6 +4039,36 @@ async fn descriptor_backfill_compiles_active_grpc_apis_missing_descriptors() {
         )
         .await
         .unwrap();
+    storage
+        .insert_one(
+            "apis",
+            json!({
+                "api_name": "source-only", "api_version": "v1", "active": true,
+                "api_grpc_proto_source": "syntax = \"proto3\"; message SourceOnly {}"
+            }),
+        )
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "apis",
+            json!({
+                "api_name": "package-only", "api_version": "v1", "active": true,
+                "api_grpc_package": "package_only"
+            }),
+        )
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "apis",
+            json!({
+                "api_version": "v1", "active": true,
+                "api_grpc_proto_source": "syntax = \"proto3\"; message MissingName {}"
+            }),
+        )
+        .await
+        .unwrap();
     let app = build_router(state);
     let (cookie, _) = login(&app).await;
     let response = platform_request(
@@ -3973,10 +4082,14 @@ async fn descriptor_backfill_compiles_active_grpc_apis_missing_descriptors() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let result = response_json(response).await;
-    assert_eq!(result["scanned"], 2);
-    assert_eq!(result["updated"], 1);
+    assert_eq!(result["scanned"], 5);
+    assert_eq!(result["updated"], 2);
     assert_eq!(result["skipped"], 1);
-    assert_eq!(result["missing"], 0);
+    assert_eq!(result["missing"], 2);
+    assert_eq!(result["errors"][0]["api"], "package-only/v1");
+    assert_eq!(result["errors"][0]["error"], "Proto source not found");
+    assert_eq!(result["errors"][1]["api"], "/v1");
+    assert_eq!(result["errors"][1]["error"], "API name/version is missing");
     let orders = storage
         .find_one("apis", &json!({"api_name": "orders", "api_version": "v1"}))
         .await
@@ -4712,9 +4825,10 @@ async fn management_permissions_readiness_tools_and_restart_preserve_contract() 
     let admin_readiness: Value =
         serde_json::from_slice(&to_bytes(admin_readiness.into_body(), 4096).await.unwrap())
             .unwrap();
-    assert_eq!(admin_readiness.as_object().unwrap().len(), 7);
+    assert_eq!(admin_readiness.as_object().unwrap().len(), 8);
     assert!(admin_readiness.get("mongodb").is_some());
     assert!(admin_readiness.get("cache_backend").is_some());
+    assert!(admin_readiness.get("tls_certificates_valid").is_some());
 
     for (method, path, code) in [
         ("GET", "/platform/security/settings", "SEC001"),
@@ -5962,6 +6076,38 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
         "validation_schema": schema,
         "ignored": "field"
     });
+    let missing_endpoint = platform_request(
+        &app,
+        Method::POST,
+        "/platform/endpoint/validation",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "endpoint_id": "missing-endpoint",
+            "validation_enabled": true,
+            "validation_schema": validation["validation_schema"].clone()
+        })),
+    )
+    .await;
+    assert_eq!(missing_endpoint.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(missing_endpoint).await["error_code"],
+        "END015"
+    );
+    let missing_validation = platform_request(
+        &app,
+        Method::GET,
+        "/platform/endpoint/validation/missing-endpoint",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(missing_validation.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(missing_validation).await["error_code"],
+        "END018"
+    );
     let created = platform_request(
         &app,
         Method::POST,
@@ -5972,6 +6118,17 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     )
     .await;
     assert!(created.status().is_success());
+    let duplicate = platform_request(
+        &app,
+        Method::POST,
+        "/platform/endpoint/validation",
+        Some(&cookie),
+        None,
+        Some(validation.clone()),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(duplicate).await["error_code"], "END017");
     let fetched = platform_request(
         &app,
         Method::GET,
@@ -6001,6 +6158,37 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     )
     .await;
     assert_eq!(updated.status(), StatusCode::OK);
+    let disabled = platform_request(
+        &app,
+        Method::PUT,
+        &format!("/platform/endpoint/validation/{endpoint_id}"),
+        Some(&cookie),
+        None,
+        Some(json!({
+            "validation_enabled": false,
+            "validation_schema": validation["validation_schema"].clone()
+        })),
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(disabled).await["error_code"], "END020");
+    let missing_endpoint_update = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/endpoint/validation/missing-endpoint",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "validation_enabled": true,
+            "validation_schema": validation["validation_schema"].clone()
+        })),
+    )
+    .await;
+    assert_eq!(missing_endpoint_update.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(missing_endpoint_update).await["error_code"],
+        "END022"
+    );
     let invalid = platform_request(
         &app,
         Method::PUT,
@@ -6021,6 +6209,16 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     )
     .await;
     assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_again = platform_request(
+        &app,
+        Method::DELETE,
+        &format!("/platform/endpoint/validation/{endpoint_id}"),
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(deleted_again.status(), StatusCode::OK);
 }
 #[tokio::test]
 async fn python_config_export_sections_and_import_variants() {
@@ -6310,6 +6508,51 @@ async fn python_config_import_ignores_malformed_entries() {
             "{collection}"
         );
     }
+    let snapshots = storage
+        .find_many("config_snapshots", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0]["created_by"], "admin");
+    assert!(snapshots[0]["timestamp"].as_str().unwrap().contains(' '));
+    assert!(snapshots[0].get("created_at").is_none());
+
+    let falsy_sections = platform_request(
+        &app,
+        Method::POST,
+        "/platform/config/import",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "apis": "", "endpoints": [], "roles": {}, "groups": false, "routings": 0
+        })),
+    )
+    .await;
+    assert_eq!(falsy_sections.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(falsy_sections).await["imported"],
+        json!({"apis": 0, "endpoints": 0, "roles": 0, "groups": 0, "routings": 0})
+    );
+
+    let truthy_non_list = platform_request(
+        &app,
+        Method::POST,
+        "/platform/config/import",
+        Some(&cookie),
+        None,
+        Some(json!({"apis": "invalid"})),
+    )
+    .await;
+    assert_eq!(truthy_non_list.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response_json(truthy_non_list).await["error_code"], "GTW999");
+    assert_eq!(
+        storage
+            .find_many("config_snapshots", &json!({}))
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -6491,6 +6734,141 @@ async fn python_credit_definition_masks_secret_key_material() {
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert_eq!(response_json(missing).await["error_code"], "CRD021");
+}
+
+#[tokio::test]
+async fn tls_bindings_can_be_cleared_without_changing_other_api_fields() {
+    let state = memory_state(false).await;
+    let storage = state.storage.as_ref().unwrap().clone();
+    storage.insert_one("apis", json!({
+        "api_name": "mtls-clear", "api_version": "v1", "api_description": "keep",
+        "api_client_tls_policy": {"mode": "required", "ca_profile_id": "retired", "allowed_dns_sans": ["client.example"]},
+        "api_upstream_tls_profile": "retired"
+    })).await.unwrap();
+    storage.insert_one("endpoints", json!({
+        "api_name": "mtls-clear", "api_version": "v1", "endpoint_method": "GET",
+        "endpoint_uri": "/probe", "endpoint_description": "keep",
+        "endpoint_client_tls_policy": {"mode": "off"},
+        "endpoint_upstream_tls_profile": "retired"
+    })).await.unwrap();
+    let app = build_router(state);
+    let (cookie, _) = login(&app).await;
+
+    let api = platform_request(&app, Method::PUT, "/platform/api/mtls-clear/v1", Some(&cookie), None,
+        Some(json!({"api_client_tls_policy": null, "api_upstream_tls_profile": null}))).await;
+    assert_eq!(api.status(), StatusCode::OK);
+    let endpoint = platform_request(&app, Method::PUT, "/platform/endpoint/GET/mtls-clear/v1/probe", Some(&cookie), None,
+        Some(json!({"endpoint_client_tls_policy": null, "endpoint_upstream_tls_profile": null}))).await;
+    assert_eq!(endpoint.status(), StatusCode::OK);
+
+    let api = storage.find_one("apis", &json!({"api_name": "mtls-clear", "api_version": "v1"})).await.unwrap().unwrap();
+    let endpoint = storage.find_one("endpoints", &json!({"api_name": "mtls-clear", "api_version": "v1", "endpoint_method": "GET", "endpoint_uri": "/probe"})).await.unwrap().unwrap();
+    assert!(api["api_client_tls_policy"].is_null());
+    assert!(api["api_upstream_tls_profile"].is_null());
+    assert_eq!(api["api_description"], "keep");
+    assert!(endpoint["endpoint_client_tls_policy"].is_null());
+    assert!(endpoint["endpoint_upstream_tls_profile"].is_null());
+    assert_eq!(endpoint["endpoint_description"], "keep");
+}
+
+#[tokio::test]
+async fn credit_rotation_expiry_matches_pydantic_datetime_validation() {
+    let state = memory_state(false).await;
+    let storage = state.storage.as_ref().unwrap().clone();
+    let app = build_router(state);
+    let (cookie, _) = login(&app).await;
+    let credit = |expires: Value| {
+        json!({
+            "api_credit_group": "expiry", "api_key": "key", "api_key_header": "x-api-key",
+            "credit_tiers": [{
+                "tier_name": "default", "credits": 1, "input_limit": 0,
+                "output_limit": 0, "reset_frequency": "monthly"
+            }],
+            "api_key_rotation_expires": expires
+        })
+    };
+
+    let invalid_create = platform_request(
+        &app,
+        Method::POST,
+        "/platform/credit",
+        Some(&cookie),
+        None,
+        Some(credit(json!("not a datetime"))),
+    )
+    .await;
+    assert_eq!(invalid_create.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let create = platform_request(
+        &app,
+        Method::POST,
+        "/platform/credit",
+        Some(&cookie),
+        None,
+        Some(credit(json!("2025-01-15T10:00:00Z"))),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let stored = storage
+        .find_one("credit_defs", &json!({"api_credit_group": "expiry"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored["api_key_rotation_expires"],
+        "2025-01-15T10:00:00+00:00"
+    );
+
+    let invalid_update = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/credit/expiry",
+        Some(&cookie),
+        None,
+        Some(credit(json!("2025-99-99T10:00:00Z"))),
+    )
+    .await;
+    assert_eq!(invalid_update.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let stored = storage
+        .find_one("credit_defs", &json!({"api_credit_group": "expiry"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored["api_key_rotation_expires"],
+        "2025-01-15T10:00:00+00:00"
+    );
+
+    let update = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/credit/expiry",
+        Some(&cookie),
+        None,
+        Some(credit(json!(1_700_000_000))),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let stored = storage
+        .find_one("credit_defs", &json!({"api_credit_group": "expiry"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored["api_key_rotation_expires"],
+        "2023-11-14T22:13:20+00:00"
+    );
+
+    let numeric_string = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/credit/expiry",
+        Some(&cookie),
+        None,
+        Some(credit(json!(" 1700000000 "))),
+    )
+    .await;
+    assert_eq!(numeric_string.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -6722,6 +7100,17 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
         response_json(no_limits).await["detail"],
         "No limits found for user"
     );
+    let history = platform_request(
+        &no_tier_app,
+        Method::GET,
+        "/platform/quota/usage/history",
+        Some(&no_tier_cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(history.status(), StatusCode::OK);
+    assert_eq!(response_json(history).await["history"], json!([]));
     storage
         .insert_one(
             "tiers",
@@ -6733,6 +7122,16 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
                     "monthly_bandwidth_quota": 1000, "burst_per_minute": 3,
                     "burst_per_hour": 7, "burst_per_second": 1
                 }
+            }),
+        )
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "tiers",
+            json!({
+                "tier_id": "quota-legacy", "name": "custom", "display_name": "Legacy",
+                "limits": {"monthly_request_quota": 1}
             }),
         )
         .await
@@ -6856,6 +7255,22 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
             .contains("monthly_bandwidth")
     );
 
+    let json_export = platform_request(
+        &app,
+        Method::POST,
+        "/platform/quota/usage/export",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(json_export.status(), StatusCode::OK);
+    let json_export = response_json(json_export).await;
+    assert_eq!(json_export["format"], "json");
+    let export_date = json_export["data"]["export_date"].as_str().unwrap();
+    assert!(export_date.contains('T'));
+    assert!(!export_date.ends_with('Z'));
+
     let tier_info = platform_request(
         &app,
         Method::GET,
@@ -6869,6 +7284,7 @@ async fn quota_status_uses_nested_effective_limits_and_tracker_usage() {
     let tier_info = response_json(tier_info).await;
     assert_eq!(tier_info["current_tier"]["display_name"], "Quota Pro");
     assert_eq!(tier_info["upgrade_options"][0]["tier_id"], "quota-free");
+    assert_eq!(tier_info["upgrade_options"].as_array().unwrap().len(), 1);
 
     let burst = platform_request(
         &app,
@@ -7062,13 +7478,21 @@ async fn tier_assignment_create_returns_python_assignment_contract() {
         "/platform/tiers/compare",
         Some(&cookie),
         None,
-        Some(json!(["assignment-pro", "missing-tier"])),
+        Some(json!([
+            "assignment-pro",
+            "assignment-default",
+            "assignment-pro",
+            "missing-tier"
+        ])),
     )
     .await;
     assert_eq!(comparison.status(), StatusCode::OK);
     let comparison = response_json(comparison).await;
     assert!(comparison.is_array());
     assert_eq!(comparison[0]["tier_id"], "assignment-pro");
+    assert_eq!(comparison[1]["tier_id"], "assignment-default");
+    assert_eq!(comparison[2]["tier_id"], "assignment-pro");
+    assert_eq!(comparison.as_array().unwrap().len(), 3);
     assert!(comparison[0].get("enabled").is_none());
 
     let removed = platform_request(
@@ -7088,6 +7512,21 @@ async fn tier_assignment_create_returns_python_assignment_contract() {
     let absent = platform_request(
         &app,
         Method::DELETE,
+        "/platform/tiers/assignments/assignment-user",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(absent).await["detail"],
+        "No assignment found for user assignment-user"
+    );
+
+    let absent = platform_request(
+        &app,
+        Method::GET,
         "/platform/tiers/assignments/assignment-user",
         Some(&cookie),
         None,
@@ -7265,6 +7704,19 @@ async fn tier_users_and_statistics_match_python_shapes() {
     assert_eq!(users.as_array().unwrap().len(), 1);
     assert_eq!(users[0]["user_id"], "stats-future");
 
+    for query in ["skip=-1", "limit=0", "limit=1001", "limit=invalid"] {
+        let invalid = platform_request(
+            &app,
+            Method::GET,
+            &format!("/platform/tiers/stats-pro/users?{query}"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     let tier_stats = platform_request(
         &app,
         Method::GET,
@@ -7405,6 +7857,43 @@ async fn tier_crud_returns_normalized_python_tier_contracts() {
     assert_eq!(created["enabled"], true);
     assert!(created["created_at"].as_str().unwrap().contains('T'));
 
+    // TierName construction happens inside the Python handler's broad
+    // exception fallback. Pydantic has already coerced the other scalars, and
+    // the fallback response is returned without persisting the invalid tier.
+    let fallback = platform_request(
+        &app,
+        Method::POST,
+        "/platform/tiers/",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "tier_id": 99, "name": "future-plan", "display_name": true,
+            "limits": {"requests_per_minute": "25", "enable_throttling": "yes"},
+            "features": [1, false], "enabled": "off", "ignored": "field"
+        })),
+    )
+    .await;
+    assert_eq!(fallback.status(), StatusCode::CREATED);
+    let fallback = response_json(fallback).await;
+    assert_eq!(fallback["tier_id"], "99");
+    assert_eq!(fallback["display_name"], "True");
+    assert_eq!(fallback["limits"]["requests_per_minute"], 25);
+    assert_eq!(fallback["limits"]["enable_throttling"], true);
+    assert_eq!(fallback["features"], json!(["1", "False"]));
+    assert_eq!(fallback["enabled"], false);
+    assert!(fallback["created_at"].is_null());
+
+    let not_persisted = platform_request(
+        &app,
+        Method::GET,
+        "/platform/tiers/99",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(not_persisted.status(), StatusCode::NOT_FOUND);
+
     let duplicate = platform_request(
         &app,
         Method::POST,
@@ -7437,7 +7926,7 @@ async fn tier_crud_returns_normalized_python_tier_contracts() {
     let listed = platform_request(
         &app,
         Method::GET,
-        "/platform/tiers/?enabled_only=true&skip=0&limit=1",
+        "/platform/tiers/?enabled_only=YES&skip=0&limit=1",
         Some(&cookie),
         None,
         None,
@@ -7698,6 +8187,32 @@ async fn rate_limit_bulk_routes_preserve_pinned_python_failures() {
         response_json(deleted).await["detail"],
         "Failed to delete rules"
     );
+
+    let empty = platform_request(
+        &app,
+        Method::POST,
+        "/platform/rate-limits/bulk/delete",
+        None,
+        None,
+        Some(json!({"rule_ids": []})),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(response_json(empty).await["deleted_count"], 0);
+
+    for body in [json!({}), json!({"rule_ids": "bulk-rule"})] {
+        let invalid = platform_request(
+            &app,
+            Method::POST,
+            "/platform/rate-limits/bulk/delete",
+            None,
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response_json(invalid).await["error_code"], "VAL001");
+    }
 }
 
 #[tokio::test]
@@ -7917,6 +8432,18 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
     assert_eq!(numeric_copy.status(), StatusCode::CREATED);
     assert_eq!(response_json(numeric_copy).await["rule_id"], "456");
 
+    let empty_copy = platform_request(
+        &app,
+        Method::POST,
+        "/platform/rate-limits/crud-rule/duplicate",
+        None,
+        None,
+        Some(json!({"new_rule_id": ""})),
+    )
+    .await;
+    assert_eq!(empty_copy.status(), StatusCode::CREATED);
+    assert_eq!(response_json(empty_copy).await["rule_id"], "");
+
     let missing_copy = platform_request(
         &app,
         Method::POST,
@@ -8093,4 +8620,209 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         response_json(status_without_token).await["detail"],
         "Rule status not found"
     );
+}
+
+#[tokio::test]
+async fn monitor_report_validates_dates_and_generates_a_python_shaped_csv() {
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+
+    let bad_format = platform_request(
+        &app,
+        Method::GET,
+        "/platform/monitor/report?start=not-a-date&end=2024-01-02",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(bad_format.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(bad_format).await["error_code"], "MON003");
+
+    let backwards = platform_request(
+        &app,
+        Method::GET,
+        "/platform/monitor/report?start=2024-01-05&end=2024-01-01",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(backwards.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(backwards).await["error_message"],
+        "End date must be after start date"
+    );
+
+    let ok = platform_request(
+        &app,
+        Method::GET,
+        "/platform/monitor/report?start=2024-01-01&end=2024-01-02",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(
+        ok.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/csv; charset=utf-8"
+    );
+    assert_eq!(
+        ok.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+        "attachment; filename=doorman_report_2024-01-01_to_2024-01-02.csv"
+    );
+    let body =
+        String::from_utf8(to_bytes(ok.into_body(), 64 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(body.starts_with("Report,From,2024-01-01,To,2024-01-02\nOverview\n"));
+    for section in [
+        "Bandwidth Overview\n",
+        "Status Codes\nstatus,count\n",
+        "API Usage\napi,total,errors,successes,success_rate\n",
+        "User Usage\nusername,requests\n",
+        "Bandwidth (per day, UTC)\ndate,bytes_in,bytes_out,total\n",
+    ] {
+        assert!(
+            body.contains(section),
+            "missing section {section:?} in:\n{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_numeric_role_page_returns_fastapi_shaped_422_not_a_silent_default() {
+    // Python's `get_roles(page: int = ..., page_size: int = ...)` are typed
+    // FastAPI query params: a non-numeric value never reaches the handler and
+    // instead produces FastAPI's own 422 validation body, rather than being
+    // silently coerced to page=1 the way Rust's role listing used to.
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+
+    let response = platform_request(
+        &app,
+        Method::GET,
+        "/platform/role?page=not-a-number",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_json(response).await;
+    assert_eq!(body["detail"][0]["loc"], json!(["query", "page"]));
+    assert_eq!(body["detail"][0]["type"], "type_error.integer");
+
+    let response = platform_request(
+        &app,
+        Method::GET,
+        "/platform/role/all?page_size=not-a-number",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_json(response).await;
+    assert_eq!(body["detail"][0]["loc"], json!(["query", "page_size"]));
+}
+
+#[tokio::test]
+async fn non_numeric_page_returns_422_across_typed_fastapi_listing_routes() {
+    // The same typed `page: int`/`page_size: int` FastAPI parameter pattern
+    // covers get_groups, get_routings, get_apis, get_users, and the credit
+    // listing routes, not just get_roles.
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+    let request =
+        |path: &'static str| platform_request(&app, Method::GET, path, Some(&cookie), None, None);
+
+    for path in [
+        "/platform/group?page=nope",
+        "/platform/routing?page=nope",
+        "/platform/api?page=nope",
+        "/platform/api/all?page_size=nope",
+        "/platform/user?page=nope",
+        "/platform/user/all?page_size=nope",
+        "/platform/credit/defs?page=nope",
+        "/platform/credit/all?page_size=nope",
+    ] {
+        let response = request(path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}"
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["detail"][0]["type"], "type_error.integer", "{path}");
+    }
+}
+
+#[tokio::test]
+async fn demo_seed_uses_the_configurable_seeder_with_admin_check_and_python_defaults() {
+    let app = build_router(memory_state(false).await);
+    let (cookie, _) = login(&app).await;
+
+    // A small, explicit request exercises the real configurable seeder
+    // (SeedOptions/run_seed) rather than the old hardcoded 3-API stub.
+    let response = platform_request(
+        &app,
+        Method::POST,
+        "/platform/demo/seed?users=2&apis=1&endpoints=1&groups=1&protos=0&logs=0&seed=7",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["message"], "Seed completed");
+    // The comprehensive seeder reports per-collection counts; the old stub
+    // only ever returned a flat "message" body with no such detail.
+    assert!(
+        body.as_object().is_some_and(|object| object.len() > 1),
+        "expected seed result fields alongside message: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn demo_seed_denies_non_admin_with_pythons_error_code_and_message() {
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    storage
+        .insert_one(
+            "roles",
+            json!({"role_name": "viewer", "manage_gateway": false}),
+        )
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "users",
+            json!({
+                "username": "demo-viewer",
+                "email": "demo-viewer@doorman.dev",
+                "password": bcrypt::hash(fixture_password(), bcrypt::DEFAULT_COST).unwrap(),
+                "role": "viewer",
+                "groups": [],
+                "active": true
+            }),
+        )
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (viewer, _) = login_as(&app, "demo-viewer@doorman.dev", fixture_password()).await;
+
+    let response = platform_request(
+        &app,
+        Method::POST,
+        "/platform/demo/seed",
+        Some(&viewer),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response_json(response).await;
+    assert_eq!(body["error_code"], "DEMO001");
+    assert_eq!(body["error_message"], "Permission denied to run seeder");
 }

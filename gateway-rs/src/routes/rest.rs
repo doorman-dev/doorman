@@ -77,7 +77,8 @@ pub async fn rest_policy_then_proxy(
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|value| value.0.ip());
+        .map(|value| value.0.ip())
+        .or_else(|| request.extensions().get::<ConnectInfo<crate::tls::TlsConnectionInfo>>().map(|value| value.0.peer.ip()));
     let headers = request.headers().clone();
     let content_length = headers
         .get(header::CONTENT_LENGTH)
@@ -100,6 +101,12 @@ pub async fn rest_policy_then_proxy(
         direct_ip: peer,
         now_millis: now_millis(),
         content_length,
+        peer_certificates: request.extensions()
+            .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+            .map(|info| info.0.peer_certificates.clone())
+            .unwrap_or_default(),
+        native_tls: request.extensions().get::<ConnectInfo<crate::tls::TlsConnectionInfo>>().is_some(),
+        is_preflight: request.method() == http::Method::OPTIONS,
     };
 
     let documents = if let Some(injected) = &state.policy_documents {
@@ -120,7 +127,7 @@ pub async fn rest_policy_then_proxy(
             &mut documents,
             &policy_request,
             &state.config.shared_storage,
-            &PolicyRuntime::default(),
+            &PolicyRuntime { tls_profiles: state.tls_snapshot().profiles.clone(), ..PolicyRuntime::default() },
         ) {
             Ok(Some(mut decision)) => {
                 if let Some(storage) = &state.storage {
@@ -211,7 +218,7 @@ pub async fn rest_policy_then_proxy(
                             "1" | "true" | "yes" | "on"
                         )
                     })
-                && failure.error_code == "GTW003"
+                && matches!(failure.error_code.as_str(), "GTW002" | "GTW003")
             {
                 return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
             }
@@ -321,6 +328,22 @@ async fn execute_rest(
             }),
         )
             .into_response());
+    };
+    if !matches!(protocol, DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb)
+        && decision.upstream_tls_profile_id.as_deref()
+            .and_then(|id| state.tls_snapshot().profiles.upstreams.get(id).cloned())
+            .is_some_and(|profile| profile.server_name.is_some())
+    {
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(PolicyErrorBody {
+            error_code: "TLS004".to_owned(),
+            error_message: "HTTP upstream TLS server-name override is unsupported".to_owned(),
+        })).into_response());
+    }
+    let Some(proxy_client) = state.proxy_client_for(decision.upstream_tls_profile_id.as_deref()) else {
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(PolicyErrorBody {
+            error_code: "TLS004".to_owned(),
+            error_message: "Upstream TLS profile is unavailable".to_owned(),
+        })).into_response());
     };
     if !circuit_allows(&state.runtime.circuits, &circuit_key) {
         return Ok((
@@ -513,8 +536,7 @@ async fn execute_rest(
     let mut attempt = 0_u32;
     let upstream = loop {
         attempt += 1;
-        let result = state
-            .proxy_client
+        let result = proxy_client
             .request(parts.method.clone(), target.clone())
             .headers(headers.clone())
             .timeout(std::time::Duration::from_millis(
@@ -752,7 +774,10 @@ async fn execute_crud(
                 }
             }
             http::Method::POST => {
-                let mut value = parse_crud_body(&body)?;
+                let mut value = parse_crud_body(&body);
+                if !value.is_object() {
+                    return Ok(crud_internal_error(&crud_post_non_object_message(&value)));
+                }
                 if value.get("_id").is_none() {
                     value["_id"] = Value::String(uuid::Uuid::new_v4().to_string());
                 }
@@ -770,7 +795,36 @@ async fn execute_crud(
                         "Resource ID required for update",
                     ));
                 };
-                let value = parse_crud_body(&body)?;
+                let value = parse_crud_body(&body);
+                if !value.is_object() {
+                    let has_schema = decision
+                        .crud_schema
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .is_some_and(|schema| !schema.is_empty());
+                    if has_schema {
+                        return Ok(crud_internal_error(&format!(
+                            "'{}' object has no attribute 'get'",
+                            python_type_name(&value)
+                        )));
+                    }
+                    // Python checks existence first, then `$set`s the raw body.
+                    let Some(existing) = storage.crud_find_one(collection, resource_id).await?
+                    else {
+                        return Ok(policy_error_response(
+                            StatusCode::NOT_FOUND,
+                            "CRUD404",
+                            "Resource not found",
+                        ));
+                    };
+                    if python_truthy(&value) {
+                        return Ok(crud_internal_error(&format!(
+                            "'{}' object has no attribute 'items'",
+                            python_type_name(&value)
+                        )));
+                    }
+                    return Ok(crud_success(StatusCode::OK, existing));
+                }
                 validate_crud_schema(decision.crud_schema.as_ref(), &value, true)?;
                 storage
                     .crud_update(collection, resource_id, &value)
@@ -828,7 +882,6 @@ async fn execute_crud(
                 Json(serde_json::json!({
                     "error_code": "CRUD400",
                     "error_message": "Validation failed",
-                    "response": {"errors": error.split("; ").collect::<Vec<_>>()}
                 })),
             )
                 .into_response())
@@ -863,15 +916,59 @@ fn crud_resource_id(path: &str) -> Option<&str> {
     (endpoint.len() > 1).then(|| *endpoint.last().expect("endpoint is non-empty"))
 }
 
-fn parse_crud_body(body: &[u8]) -> Result<Value, crate::storage::runtime::StorageError> {
+fn parse_crud_body(body: &[u8]) -> Value {
     // Python treats request.json() failures as an empty object for CRUD REST.
-    let value: Value = serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
-    if !value.is_object() {
-        return Err(crate::storage::runtime::StorageError::InvalidDocument(
-            "CRUD request body must be a JSON object".to_owned(),
-        ));
+    serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn python_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(number) if number.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
     }
-    Ok(value)
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_none_or(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// The exception text Python's `CrudService.handle_rest` raises for a
+/// non-object POST body (`'_id' not in body`, then `body['_id'] = ...`).
+fn crud_post_non_object_message(value: &Value) -> String {
+    let has_id = match value {
+        Value::Array(items) => items.iter().any(|item| item.as_str() == Some("_id")),
+        Value::String(text) => text.contains("_id"),
+        _ => false,
+    };
+    match value {
+        Value::Array(_) => "list indices must be integers or slices, not str".to_owned(),
+        Value::String(_) if has_id => "string indices must be integers, not 'str'".to_owned(),
+        Value::String(_) => "'str' object does not support item assignment".to_owned(),
+        other => format!(
+            "argument of type '{}' is not iterable",
+            python_type_name(other)
+        ),
+    }
+}
+
+fn crud_internal_error(message: &str) -> Response {
+    policy_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "CRUD999",
+        &format!("Internal CRUD error: {message}"),
+    )
 }
 
 pub(crate) fn validate_crud_schema(
@@ -1164,13 +1261,17 @@ fn graphql_validation_schema(schema: &Value, query: &str) -> Value {
     let Some(mapping) = mapping else {
         return serde_json::json!({});
     };
-    let prefix = format!("{operation}.");
+    // Python: `field_path.startswith(operation)` then `field_path[len(operation) + 1:]`,
+    // which skips one character whether or not it is the `.` separator.
     Value::Object(
         mapping
             .iter()
             .filter_map(|(path, rules)| {
-                path.strip_prefix(&prefix)
-                    .map(|path| (path.to_owned(), rules.clone()))
+                path.strip_prefix(operation).map(|rest| {
+                    let mut rest = rest.chars();
+                    rest.next();
+                    (rest.as_str().to_owned(), rules.clone())
+                })
             })
             .collect(),
     )
@@ -1857,6 +1958,19 @@ mod tests {
         assert_eq!(
             graphql_validation_schema(&schema, "{ viewer { id } }"),
             json!({})
+        );
+    }
+
+    #[test]
+    fn graphql_scope_uses_python_startswith_and_skips_one_character() {
+        let schema = json!({"validation_schema": {
+            "getUser.id": {"required": true},
+            "getUserX/name": {"required": true},
+            "getOther.id": {"required": true}
+        }});
+        assert_eq!(
+            graphql_validation_schema(&schema, "query getUser($id: ID){ user }"),
+            json!({"id": {"required": true}, "/name": {"required": true}})
         );
     }
 

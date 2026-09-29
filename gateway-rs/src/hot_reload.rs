@@ -110,6 +110,14 @@ impl HotReloadConfig {
             .values
             .write()
             .map_err(|_| "hot-reload configuration lock is poisoned".to_owned())?;
+        // Python applies LOG_LEVEL immediately via a registered callback
+        // (`logging.getLogger().setLevel(new_value)`); apply it to the live
+        // tracing subscriber here instead of only recording it as reloaded.
+        if let Some(Value::String(level)) = loaded.get("LOG_LEVEL")
+            && values.get("LOG_LEVEL") != loaded.get("LOG_LEVEL")
+        {
+            crate::observability::logging::set_log_level(level);
+        }
         *values = loaded;
         Ok(())
     }
@@ -217,6 +225,36 @@ fn parse_env_value(value: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_level_changes_are_applied_without_erroring_the_reload() {
+        // The dynamic-apply path runs even when no tracing subscriber has been
+        // initialized in this test binary (`set_log_level` then safely no-ops);
+        // what this guards is that reload() itself never fails because of it,
+        // and that the new value is recorded either way.
+        // SAFETY: test-only; no other test in this crate reads LOG_LEVEL.
+        unsafe {
+            env::set_var("LOG_LEVEL", "debug");
+        }
+        let config = HotReloadConfig::new(None);
+        assert_eq!(
+            config.dump().get("LOG_LEVEL").and_then(Value::as_str),
+            Some("debug")
+        );
+        // SAFETY: test-only; no other test in this crate reads LOG_LEVEL.
+        unsafe {
+            env::set_var("LOG_LEVEL", "warn");
+        }
+        assert!(config.reload().is_ok());
+        assert_eq!(
+            config.dump().get("LOG_LEVEL").and_then(Value::as_str),
+            Some("warn")
+        );
+        // SAFETY: test-only.
+        unsafe {
+            env::remove_var("LOG_LEVEL");
+        }
+    }
 
     #[test]
     fn rejected_reload_retains_last_valid_runtime_settings() {

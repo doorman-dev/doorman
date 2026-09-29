@@ -60,6 +60,9 @@ const OBJECT_FIELDS: &[&str] = &[
 ];
 
 const RUST_EXTENSION_FIELDS: &[&str] = &[
+    "api_client_tls_policy",
+    "api_upstream_tls_profile",
+    "api_upstream_tls_profiles",
     "api_wsdl_content",
     "api_openapi_schema",
     "api_graphql_schema",
@@ -107,7 +110,10 @@ pub fn normalize_create_api(payload: &Value) -> Result<Value, Vec<Value>> {
 pub fn normalize_update_api(payload: &Value) -> Result<Value, Vec<Value>> {
     let mut normalized = normalize_api_fields(payload, true)?;
     if let Some(values) = normalized.as_object_mut() {
-        values.retain(|_, value| !value.is_null());
+        values.retain(|field, value| {
+            !value.is_null()
+                || matches!(field.as_str(), "api_client_tls_policy" | "api_upstream_tls_profile" | "api_upstream_tls_profiles")
+        });
     }
     Ok(normalized)
 }
@@ -410,10 +416,13 @@ mod tests {
         let value = normalize_update_api(&json!({
             "api_name": 123,
             "api_public": "yes",
-            "api_description": null
+            "api_description": null,
+            "api_client_tls_policy": null,
+            "api_upstream_tls_profile": null
         }))
         .unwrap();
-        assert_eq!(value, json!({"api_name": "123", "api_public": true}));
+        assert_eq!(value, json!({"api_name": "123", "api_public": true,
+            "api_client_tls_policy": null, "api_upstream_tls_profile": null}));
     }
 
     #[test]

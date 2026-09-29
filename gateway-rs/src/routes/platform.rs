@@ -36,7 +36,9 @@ use crate::{
         response_compat::MessageEnvelope,
     },
     observability::{
-        analytics_aggregator::{AggregatedPoint, EntityCounter, global_analytics},
+        analytics_aggregator::{
+            AggregatedPoint, EndpointEntity, EntityCounter, global_analytics, pooled_percentiles,
+        },
         audit::{self, global_ip_deny},
     },
     platform_contract::{normalize_create_api, normalize_update_api},
@@ -65,6 +67,17 @@ pub struct DescriptorBackfill {
 impl DescriptorBackfill {
     pub fn missing(&self) -> usize {
         self.errors.len()
+    }
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
     }
 }
 
@@ -201,6 +214,38 @@ pub async fn platform_dispatch(
             &request_id,
         );
     }
+    if (content_type_is_json(&headers) || body.is_empty())
+        && is_tier_typed_mutation(path, &method)
+        && normalize_tier_request(path, &method, &mut payload).is_err()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+    // A request with no body at all is a 422 for every route whose Python
+    // counterpart declares a required typed body parameter, regardless of
+    // Content-Type (see requires_nonempty_json_body).
+    if body.is_empty() && requires_nonempty_json_body(path, &method) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+    // Python's body: dict[str, Any] parameter has no default, so a request
+    // with no body at all is a 422 even though an explicit `{}` is valid.
+    if path == "/config/import" && method == Method::POST && (body.is_empty() || !payload.is_object()) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
 
     if path == "/authorization" && method == Method::POST {
         if let Some(response) = auth_account_rate_limit(
@@ -316,6 +361,16 @@ pub async fn platform_dispatch(
         Err(response) => return response,
     };
     let username = claims.sub.clone().unwrap_or_default();
+
+    if path == "/tls" || path.starts_with("/tls/") {
+        let response = if has_permission(&state, &username, "manage_security").await {
+            crate::routes::tls_admin::dispatch(&state, path, &method, payload, &request_id).await
+        } else {
+            error(StatusCode::FORBIDDEN, "TLSA001", "manage_security is required", &request_id)
+        };
+        audit_management_request(&username, &method, path, &response);
+        return with_platform_activity_context(response, &username, path);
+    }
 
     if path.starts_with("/authorization") {
         let response = authorization_routes(
@@ -619,7 +674,7 @@ pub async fn platform_dispatch(
                 }
             }
         }
-        (Method::POST, "/demo/seed") => demo_seed(&state, &username, &request_id).await,
+        (Method::POST, "/demo/seed") => demo_seed(&state, &username, &query, &request_id).await,
         (Method::POST, "/tools/cors/check") => {
             if !has_permission(&state, &username, "manage_security").await {
                 error(
@@ -1032,7 +1087,7 @@ async fn tier_delete_route(
         .await
     {
         Ok(assignments) => assignments.len(),
-        Err(_) => return unexpected(request_id),
+        Err(_) => return tier_detail_failure("delete", request_id),
     };
     if assigned > 0 {
         return http_detail(
@@ -1051,7 +1106,7 @@ async fn tier_delete_route(
             &format!("Tier {tier_id} not found"),
             request_id,
         ),
-        Err(_) => unexpected(request_id),
+        Err(_) => tier_detail_failure("delete", request_id),
     }
 }
 
@@ -1088,9 +1143,13 @@ async fn tier_crud_routes(
             Ok(value) => value,
             Err(()) => return tier_pagination_error("limit", request_id),
         };
-        let enabled_only = query
-            .get("enabled_only")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let enabled_only = match query.get("enabled_only") {
+            Some(value) => match pydantic_bool_string(value) {
+                Some(value) => value,
+                None => return tier_pagination_error("enabled_only", request_id),
+            },
+            None => false,
+        };
         let search = query
             .get("search")
             .map(|value| value.to_ascii_lowercase())
@@ -1149,14 +1208,10 @@ async fn tier_crud_routes(
                 request_id,
             );
         };
-        let Some(name) = payload
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "free" | "pro" | "enterprise" | "custom"))
-        else {
+        let Some(name) = payload.get("name").and_then(Value::as_str) else {
             return validation_errors(
                 vec![
-                    json!({"loc": ["body", "name"], "msg": "value is not a valid enumeration member", "type": "type_error.enum"}),
+                    json!({"loc": ["body", "name"], "msg": "field required", "type": "value_error.missing"}),
                 ],
                 request_id,
             );
@@ -1177,10 +1232,34 @@ async fn tier_crud_routes(
                 request_id,
             );
         };
-        if let Ok(Some(existing)) = storage
+        let fallback = || {
+            success(
+                StatusCode::CREATED,
+                tier_response(json!({
+                    "tier_id": tier_id, "name": name, "display_name": display_name,
+                    "description": payload.get("description").cloned().unwrap_or(Value::Null),
+                    "limits": tier_limits_response(limits),
+                    "price_monthly": payload.get("price_monthly").cloned().unwrap_or(Value::Null),
+                    "price_yearly": payload.get("price_yearly").cloned().unwrap_or(Value::Null),
+                    "features": payload.get("features").cloned().unwrap_or_else(|| json!([])),
+                    "is_default": payload.get("is_default").cloned().unwrap_or_else(|| json!(false)),
+                    "enabled": payload.get("enabled").cloned().unwrap_or_else(|| json!(true)),
+                    "created_at": Value::Null, "updated_at": Value::Null,
+                })),
+                request_id,
+            )
+        };
+        if !matches!(name, "free" | "pro" | "enterprise" | "custom") {
+            return fallback();
+        }
+        let existing = match storage
             .find_one("tiers", &json!({"tier_id": tier_id}))
             .await
         {
+            Ok(existing) => existing,
+            Err(_) => return fallback(),
+        };
+        if let Some(existing) = existing {
             return success(StatusCode::CREATED, tier_response(existing), request_id);
         }
         let now = timestamp_now_naive();
@@ -1200,7 +1279,7 @@ async fn tier_crud_routes(
         });
         return match storage.insert_one("tiers", tier.clone()).await {
             Ok(_) => success(StatusCode::CREATED, tier_response(tier), request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => fallback(),
         };
     }
     if suffix.is_empty() {
@@ -1222,7 +1301,7 @@ async fn tier_crud_routes(
                 &format!("Tier {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("get", request_id),
         };
     }
     if method == Method::PUT {
@@ -1254,7 +1333,7 @@ async fn tier_crud_routes(
                 &format!("Tier {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("update", request_id),
         };
     }
     error(
@@ -1286,6 +1365,414 @@ fn tier_pagination_error(field: &str, request_id: &str) -> Response {
         vec![json!({"loc": ["query", field], "msg": "value is not valid", "type": "value_error"})],
         request_id,
     )
+}
+
+fn tier_detail_failure(operation: &str, request_id: &str) -> Response {
+    let detail = match operation {
+        "get" => "Failed to get tier",
+        "update" => "Failed to update tier",
+        "delete" => "Failed to delete tier",
+        "assign" => "Failed to assign user",
+        "get_assignment" => "Failed to get assignment",
+        "get_user_tier" => "Failed to get user tier",
+        "remove_assignment" => "Failed to remove assignment",
+        "list_users" => "Failed to list users",
+        "upgrade" => "Failed to upgrade tier",
+        "downgrade" => "Failed to downgrade tier",
+        "temporary-upgrade" => "Failed to create temporary upgrade",
+        "trial/start" => "Failed to start trial",
+        "payment/failure" => "Failed to handle payment failure",
+        "compare" => "Failed to compare tiers",
+        _ => "An unexpected error occurred",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
+}
+
+fn tier_statistics_failure(request_id: &str) -> Response {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "TIER999",
+        "Failed to get statistics",
+        request_id,
+    )
+}
+
+fn pydantic_bool_string(value: &str) -> Option<bool> {
+    security_setting_bool(&Value::String(value.to_owned()))
+}
+
+fn is_tier_typed_mutation(path: &str, method: &Method) -> bool {
+    if method == Method::POST {
+        return matches!(
+            path,
+            "/tiers"
+                | "/tiers/"
+                | "/tiers/assignments"
+                | "/tiers/upgrade"
+                | "/tiers/downgrade"
+                | "/tiers/temporary-upgrade"
+                | "/tiers/trial/start"
+                | "/tiers/payment/failure"
+                | "/tiers/compare"
+        );
+    }
+    method == Method::PUT
+        && path
+            .strip_prefix("/tiers/")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/'))
+}
+
+fn tier_model_string(value: Option<&Value>, required: bool) -> Result<Option<Value>, ()> {
+    match value {
+        Some(Value::Null) if !required => Ok(None),
+        Some(value) => security_setting_string(value)
+            .map(|value| Some(Value::String(value)))
+            .ok_or(()),
+        None if !required => Ok(None),
+        None => Err(()),
+    }
+}
+
+fn tier_model_integer(value: Option<&Value>, default: Option<i64>) -> Result<Option<Value>, ()> {
+    match value {
+        Some(Value::Null) if default.is_none() => Ok(Some(Value::Null)),
+        Some(value) => rate_rule_integer(value)
+            .map(|value| Some(json!(value)))
+            .ok_or(()),
+        None => Ok(default.map(|value| json!(value))),
+    }
+}
+
+fn tier_model_float(value: Option<&Value>) -> Result<Option<Value>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let parsed = match value {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.parse::<f64>().ok(),
+        Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+    .ok_or(())?;
+    serde_json::Number::from_f64(parsed)
+        .map(Value::Number)
+        .map(Some)
+        .ok_or(())
+}
+
+fn tier_model_datetime(value: &Value) -> Option<Value> {
+    let numeric = match value {
+        Value::Number(value) => value.as_f64(),
+        Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    if let Some(mut seconds) = numeric {
+        if seconds.is_nan() {
+            return None;
+        }
+        if seconds > 3e20 {
+            return Some(json!("9999-12-31T23:59:59.999999"));
+        }
+        if seconds < -3e20 {
+            return Some(json!("0001-01-01T00:00:00"));
+        }
+        while seconds.abs() > 2e10 {
+            seconds /= 1_000.0;
+        }
+        let micros = (seconds * 1_000_000.0).round_ties_even() as i128;
+        let datetime = time::OffsetDateTime::from_unix_timestamp_nanos(micros * 1_000).ok()?;
+        return Some(Value::String(format_tier_datetime(datetime, Some(0))));
+    }
+
+    static DATETIME: OnceLock<Regex> = OnceLock::new();
+    let value = value.as_str()?;
+    let captures = DATETIME
+        .get_or_init(|| {
+            Regex::new(
+                r"^(\d{4})-(\d{1,2})-(\d{1,2})[T ](\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,12}))?)?(Z|[+-]\d{2}(?::?\d{2})?)?$",
+            )
+            .expect("tier datetime regex")
+        })
+        .captures(value)?;
+    let number = |index| captures.get(index)?.as_str().parse::<u8>().ok();
+    let year = captures.get(1)?.as_str().parse::<i32>().ok()?;
+    let month = time::Month::try_from(number(2)?).ok()?;
+    let day = number(3)?;
+    let hour = number(4)?;
+    let minute = number(5)?;
+    let second = captures
+        .get(6)
+        .map_or(Some(0), |value| value.as_str().parse::<u8>().ok())?;
+    let micros = captures.get(7).map_or(Some(0), |value| {
+        let digits = value.as_str();
+        let padded = format!("{digits:0<6}");
+        padded[..6].parse::<u32>().ok()
+    })?;
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let time = time::Time::from_hms_micro(hour, minute, second, micros).ok()?;
+    let offset_minutes = match captures.get(8).map(|value| value.as_str()) {
+        None => None,
+        Some("Z") => Some(0),
+        Some(offset) => {
+            let sign = if offset.starts_with('-') { -1 } else { 1 };
+            let digits = &offset[1..];
+            let hours = digits.get(..2)?.parse::<i32>().ok()?;
+            let minutes = match digits.len() {
+                2 => 0,
+                4 => digits.get(2..)?.parse::<i32>().ok()?,
+                5 if digits.as_bytes().get(2) == Some(&b':') => {
+                    digits.get(3..)?.parse::<i32>().ok()?
+                }
+                _ => return None,
+            };
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            Some(sign * (hours * 60 + minutes))
+        }
+    };
+    let datetime = time::PrimitiveDateTime::new(date, time).assume_utc();
+    Some(Value::String(format_tier_datetime(
+        datetime,
+        offset_minutes,
+    )))
+}
+
+fn format_tier_datetime(datetime: time::OffsetDateTime, offset_minutes: Option<i32>) -> String {
+    let mut value = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        datetime.year(),
+        u8::from(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+    );
+    if datetime.microsecond() != 0 {
+        write!(value, ".{:06}", datetime.microsecond()).expect("write to string");
+    }
+    if let Some(minutes) = offset_minutes {
+        let sign = if minutes < 0 { '-' } else { '+' };
+        let minutes = minutes.abs();
+        write!(value, "{sign}{:02}:{:02}", minutes / 60, minutes % 60).expect("write to string");
+    }
+    value
+}
+
+fn normalize_tier_limits(value: &Value) -> Result<Value, ()> {
+    let input = value.as_object().ok_or(())?;
+    let mut output = Map::new();
+    for field in [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "requests_per_day",
+        "requests_per_month",
+        "monthly_request_quota",
+        "daily_request_quota",
+        "monthly_bandwidth_quota",
+    ] {
+        if let Some(value) = tier_model_integer(input.get(field), None)? {
+            output.insert(field.to_owned(), value);
+        }
+    }
+    for (field, default) in [
+        ("burst_per_second", 0),
+        ("burst_per_minute", 0),
+        ("burst_per_hour", 0),
+        ("max_queue_time_ms", 5_000),
+    ] {
+        output.insert(
+            field.to_owned(),
+            tier_model_integer(input.get(field), Some(default))?.ok_or(())?,
+        );
+    }
+    output.insert(
+        "enable_throttling".to_owned(),
+        json!(match input.get("enable_throttling") {
+            Some(value) => security_setting_bool(value).ok_or(())?,
+            None => false,
+        }),
+    );
+    Ok(Value::Object(output))
+}
+
+fn tier_model_features(value: Option<&Value>, default: bool) -> Result<Option<Value>, ()> {
+    let Some(value) = value else {
+        return Ok(default.then(|| json!([])));
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value.as_array().ok_or(())?;
+    let values = values
+        .iter()
+        .map(|value| security_setting_string(value).map(Value::String).ok_or(()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Value::Array(values)))
+}
+
+fn insert_tier_optional(output: &mut Map<String, Value>, field: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        output.insert(field.to_owned(), value);
+    }
+}
+
+fn normalize_tier_create_or_update(payload: &Value, create: bool) -> Result<Value, ()> {
+    let input = payload.as_object().ok_or(())?;
+    let mut output = Map::new();
+    for field in ["tier_id", "name", "display_name"] {
+        if create || input.contains_key(field) {
+            insert_tier_optional(
+                &mut output,
+                field,
+                tier_model_string(input.get(field), create)?,
+            );
+        }
+    }
+    if let Some(value) = tier_model_string(input.get("description"), false)? {
+        output.insert("description".to_owned(), value);
+    }
+    if create || input.contains_key("limits") {
+        match input.get("limits") {
+            Some(Value::Null) if !create => {}
+            Some(value) => {
+                output.insert("limits".to_owned(), normalize_tier_limits(value)?);
+            }
+            None if create => return Err(()),
+            None => {}
+        }
+    }
+    for field in ["price_monthly", "price_yearly"] {
+        insert_tier_optional(&mut output, field, tier_model_float(input.get(field))?);
+    }
+    insert_tier_optional(
+        &mut output,
+        "features",
+        tier_model_features(input.get("features"), create)?,
+    );
+    for (field, default) in [("is_default", false), ("enabled", true)] {
+        match input.get(field) {
+            Some(Value::Null) if !create => {}
+            Some(value) => {
+                output.insert(
+                    field.to_owned(),
+                    json!(security_setting_bool(value).ok_or(())?),
+                );
+            }
+            None if create => {
+                output.insert(field.to_owned(), json!(default));
+            }
+            None => {}
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn tier_action_string(
+    input: &Map<String, Value>,
+    output: &mut Map<String, Value>,
+    field: &str,
+    required: bool,
+) -> Result<(), ()> {
+    insert_tier_optional(
+        output,
+        field,
+        tier_model_string(input.get(field), required)?,
+    );
+    Ok(())
+}
+
+fn normalize_tier_request(path: &str, method: &Method, payload: &mut Value) -> Result<(), ()> {
+    if path == "/tiers/compare" {
+        let input = payload.as_array().ok_or(())?;
+        *payload = Value::Array(
+            input
+                .iter()
+                .map(|value| security_setting_string(value).map(Value::String).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        return Ok(());
+    }
+    if matches!(path, "/tiers" | "/tiers/") {
+        *payload = normalize_tier_create_or_update(payload, true)?;
+        return Ok(());
+    }
+    if method == Method::PUT {
+        *payload = normalize_tier_create_or_update(payload, false)?;
+        return Ok(());
+    }
+
+    let input = payload.as_object().ok_or(())?;
+    let mut output = Map::new();
+    tier_action_string(input, &mut output, "user_id", true)?;
+    match path {
+        "/tiers/assignments" => {
+            tier_action_string(input, &mut output, "tier_id", true)?;
+            for field in ["effective_from", "effective_until"] {
+                if let Some(value) = input.get(field).filter(|value| !value.is_null()) {
+                    output.insert(field.to_owned(), tier_model_datetime(value).ok_or(())?);
+                }
+            }
+            if let Some(value) = input
+                .get("override_limits")
+                .filter(|value| !value.is_null())
+            {
+                output.insert("override_limits".to_owned(), normalize_tier_limits(value)?);
+            }
+            tier_action_string(input, &mut output, "notes", false)?;
+        }
+        "/tiers/upgrade" => {
+            tier_action_string(input, &mut output, "new_tier_id", true)?;
+            output.insert(
+                "immediate".to_owned(),
+                json!(match input.get("immediate") {
+                    Some(value) => security_setting_bool(value).ok_or(())?,
+                    None => true,
+                }),
+            );
+            if let Some(value) = input.get("scheduled_date").filter(|value| !value.is_null()) {
+                output.insert(
+                    "scheduled_date".to_owned(),
+                    tier_model_datetime(value).ok_or(())?,
+                );
+            }
+        }
+        "/tiers/downgrade" => {
+            tier_action_string(input, &mut output, "new_tier_id", true)?;
+            output.insert(
+                "grace_period_days".to_owned(),
+                tier_model_integer(input.get("grace_period_days"), Some(0))?.ok_or(())?,
+            );
+        }
+        "/tiers/temporary-upgrade" => {
+            tier_action_string(input, &mut output, "temp_tier_id", true)?;
+            let duration = input
+                .get("duration_days")
+                .filter(|value| !value.is_null())
+                .and_then(rate_rule_integer)
+                .ok_or(())?;
+            output.insert("duration_days".to_owned(), json!(duration));
+        }
+        "/tiers/trial/start" => {
+            tier_action_string(input, &mut output, "tier_id", true)?;
+            output.insert(
+                "days".to_owned(),
+                tier_model_integer(input.get("days"), Some(14))?.ok_or(())?,
+            );
+        }
+        "/tiers/payment/failure" => {
+            tier_action_string(input, &mut output, "reason", false)?;
+        }
+        _ => return Err(()),
+    }
+    *payload = Value::Object(output);
+    Ok(())
 }
 
 fn tier_limits_response(limits: &Value) -> Value {
@@ -1332,6 +1819,19 @@ fn tier_response(tier: Value) -> Value {
         "enabled": tier.get("enabled").cloned().unwrap_or_else(|| json!(true)),
         "created_at": tier.get("created_at").cloned().unwrap_or(Value::Null),
         "updated_at": tier.get("updated_at").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn tier_assignment_response(assignment: Value) -> Value {
+    json!({
+        "user_id": assignment.get("user_id").cloned().unwrap_or(Value::Null),
+        "tier_id": assignment.get("tier_id").cloned().unwrap_or(Value::Null),
+        "override_limits": assignment.get("override_limits").cloned().unwrap_or(Value::Null),
+        "effective_from": assignment.get("effective_from").cloned().unwrap_or(Value::Null),
+        "effective_until": assignment.get("effective_until").cloned().unwrap_or(Value::Null),
+        "assigned_at": assignment.get("assigned_at").cloned().unwrap_or(Value::Null),
+        "assigned_by": assignment.get("assigned_by").cloned().unwrap_or(Value::Null),
+        "notes": assignment.get("notes").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -1387,13 +1887,14 @@ async fn tier_management_routes(
                 request_id,
             );
         }
-        if storage
+        let tier_exists = match storage
             .find_one("tiers", &json!({"tier_id": &tier_id}))
             .await
-            .ok()
-            .flatten()
-            .is_none()
         {
+            Ok(tier) => tier.is_some(),
+            Err(_) => return tier_detail_failure("assign", request_id),
+        };
+        if !tier_exists {
             // Oracle: tier_service.assign_user_to_tier raises ValueError here,
             // which the FastAPI route exposes as a 400 detail response.
             return http_detail(
@@ -1402,11 +1903,13 @@ async fn tier_management_routes(
                 request_id,
             );
         }
-        let existing = storage
+        let existing = match storage
             .find_one("user_tier_assignments", &json!({"user_id": &user_id}))
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(existing) => existing,
+            Err(_) => return tier_detail_failure("assign", request_id),
+        };
         // Match UserTierAssignment.to_dict(), including explicit nulls.  In
         // particular, this is a replacement on reassignment: fields omitted
         // from the new request must not survive from the previous assignment.
@@ -1437,7 +1940,7 @@ async fn tier_management_routes(
         };
         return match result {
             Ok(()) => success(StatusCode::CREATED, assignment, request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("assign", request_id),
         };
     }
     if let Some(rest) = suffix.strip_prefix("assignments/") {
@@ -1448,19 +1951,31 @@ async fn tier_management_routes(
                 .await
             {
                 Ok(true) => message(StatusCode::OK, "Assignment removed", request_id),
-                _ => http_detail(
+                Ok(false) => http_detail(
                     StatusCode::NOT_FOUND,
                     &format!("No assignment found for user {user_id}"),
                     request_id,
                 ),
+                Err(_) => tier_detail_failure("remove_assignment", request_id),
             };
         }
         if method == Method::GET {
-            let assignment = storage
+            let assignment = match storage
                 .find_one("user_tier_assignments", &json!({"user_id": user_id}))
                 .await
-                .ok()
-                .flatten();
+            {
+                Ok(assignment) => assignment,
+                Err(_) => {
+                    return tier_detail_failure(
+                        if rest.ends_with("/tier") {
+                            "get_user_tier"
+                        } else {
+                            "get_assignment"
+                        },
+                        request_id,
+                    );
+                }
+            };
             if rest.ends_with("/tier") {
                 // UserTierAssignment.to_dict serializes datetimes, while the
                 // pinned dataclass loader leaves those strings unparsed.
@@ -1495,20 +2010,20 @@ async fn tier_management_routes(
                         .await
                 };
                 return match tier {
-                    Ok(Some(tier)) => success(StatusCode::OK, strip_internal(tier), request_id),
-                    _ => http_detail(
+                    Ok(Some(tier)) => success(StatusCode::OK, tier_response(tier), request_id),
+                    Ok(None) => http_detail(
                         StatusCode::NOT_FOUND,
                         &format!("No tier found for user {user_id}"),
                         request_id,
                     ),
+                    Err(_) => tier_detail_failure("get_user_tier", request_id),
                 };
             }
             return match assignment {
-                Some(value) => success(StatusCode::OK, strip_internal(value), request_id),
-                None => error(
+                Some(value) => success(StatusCode::OK, tier_assignment_response(value), request_id),
+                None => http_detail(
                     StatusCode::NOT_FOUND,
-                    "TIER404",
-                    "Assignment not found",
+                    &format!("No assignment found for user {user_id}"),
                     request_id,
                 ),
             };
@@ -1516,34 +2031,37 @@ async fn tier_management_routes(
     }
     if suffix.ends_with("/users") && method == Method::GET {
         let tier_id = suffix.trim_end_matches("/users");
-        let skip = query
-            .get("skip")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = query
-            .get("limit")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(100);
-        let users = storage
+        let skip = match tier_pagination(query, "skip", 0, 0, usize::MAX) {
+            Ok(value) => value,
+            Err(()) => return tier_pagination_error("skip", request_id),
+        };
+        let limit = match tier_pagination(query, "limit", 100, 1, 1_000) {
+            Ok(value) => value,
+            Err(()) => return tier_pagination_error("limit", request_id),
+        };
+        let users = match storage
             .find_many("user_tier_assignments", &json!({"tier_id": tier_id}))
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .skip(skip)
-            .take(limit)
-            .map(strip_internal)
-            .collect::<Vec<_>>();
+        {
+            Ok(users) => users,
+            Err(_) => return tier_detail_failure("list_users", request_id),
+        }
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(tier_assignment_response)
+        .collect::<Vec<_>>();
         return success(StatusCode::OK, json!(users), request_id);
     }
     if suffix == "statistics/all" && method == Method::GET {
-        let tiers = storage
-            .find_many("tiers", &json!({}))
-            .await
-            .unwrap_or_default();
-        let assignments = storage
-            .find_many("user_tier_assignments", &json!({}))
-            .await
-            .unwrap_or_default();
+        let tiers = match storage.find_many("tiers", &json!({})).await {
+            Ok(tiers) => tiers,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
+        let assignments = match storage.find_many("user_tier_assignments", &json!({})).await {
+            Ok(assignments) => assignments,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
         let result: Vec<Value> = tiers
             .into_iter()
             .map(|tier| {
@@ -1580,10 +2098,13 @@ async fn tier_management_routes(
     }
     if suffix.ends_with("/statistics") && method == Method::GET {
         let tier_id = suffix.trim_end_matches("/statistics");
-        let assignments = storage
+        let assignments = match storage
             .find_many("user_tier_assignments", &json!({"tier_id": tier_id}))
             .await
-            .unwrap_or_default();
+        {
+            Ok(assignments) => assignments,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
         let total_users = assignments.len();
         let active_users = assignments
             .iter()
@@ -1603,23 +2124,20 @@ async fn tier_management_routes(
         );
     }
     if suffix == "compare" && method == Method::POST {
-        let ids = payload
-            .as_array()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .get("tier_ids")
-                    .or_else(|| payload.get("tiers"))
-                    .and_then(Value::as_array)
-                    .cloned()
+        let ids = payload.as_array().cloned().unwrap_or_default();
+        let stored = match storage.find_many("tiers", &json!({})).await {
+            Ok(tiers) => tiers,
+            Err(_) => return tier_detail_failure("compare", request_id),
+        };
+        // TierService loops over the requested identifiers, so input order and
+        // duplicates are observable and must not be replaced by collection order.
+        let tiers = ids
+            .iter()
+            .filter_map(|tier_id| {
+                stored
+                    .iter()
+                    .find(|tier| tier.get("tier_id") == Some(tier_id))
             })
-            .unwrap_or_default();
-        let tiers = storage
-            .find_many("tiers", &json!({}))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|tier| ids.contains(tier.get("tier_id").unwrap_or(&Value::Null)))
             .map(|tier| {
                 json!({
                     "tier_id": tier.get("tier_id").cloned().unwrap_or(Value::Null),
@@ -1653,7 +2171,7 @@ async fn tier_management_routes(
             let serialized_effective_dates =
                 match tier_assignment_has_serialized_effective_dates(storage, user_id).await {
                     Ok(value) => value,
-                    Err(_) => return unexpected(request_id),
+                    Err(_) => return tier_detail_failure(suffix, request_id),
                 };
             if serialized_effective_dates {
                 let detail = match suffix {
@@ -1665,6 +2183,14 @@ async fn tier_management_routes(
                 return http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id);
             }
         }
+        let current_tier_id = if matches!(suffix, "upgrade" | "downgrade" | "payment/failure") {
+            match tier_action_current_tier_id(storage, user_id).await {
+                Ok(tier_id) => tier_id.unwrap_or_else(|| "default".to_owned()),
+                Err(_) => return tier_detail_failure(suffix, request_id),
+            }
+        } else {
+            "default".to_owned()
+        };
         let (tier_id, effective_from, effective_until, notes, assigned_by, missing_status) =
             match suffix {
                 "upgrade" => {
@@ -1692,14 +2218,7 @@ async fn tier_management_routes(
                         tier_id.to_owned(),
                         effective_from,
                         Value::Null,
-                        format!(
-                            "Upgraded from {}",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
-                        ),
+                        format!("Upgraded from {current_tier_id}"),
                         Value::Null,
                         StatusCode::BAD_REQUEST,
                     )
@@ -1723,12 +2242,7 @@ async fn tier_management_routes(
                         Value::String(effective_from),
                         Value::Null,
                         format!(
-                            "Downgraded from {} with {grace_days} day grace period",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
+                            "Downgraded from {current_tier_id} with {grace_days} day grace period"
                         ),
                         Value::Null,
                         StatusCode::BAD_REQUEST,
@@ -1782,7 +2296,7 @@ async fn tier_management_routes(
                                 request_id,
                             );
                         }
-                        Err(_) => return unexpected(request_id),
+                        Err(_) => return tier_detail_failure(suffix, request_id),
                     };
                     let Some(tier_id) = default_tier.get("tier_id").and_then(Value::as_str) else {
                         return http_detail(
@@ -1795,14 +2309,7 @@ async fn tier_management_routes(
                         tier_id.to_owned(),
                         Value::String(timestamp_after_days(0)),
                         Value::Null,
-                        format!(
-                            "Downgraded from {} with 0 day grace period",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
-                        ),
+                        format!("Downgraded from {current_tier_id} with 0 day grace period"),
                         json!("system:payment_failure"),
                         StatusCode::BAD_REQUEST,
                     )
@@ -1821,7 +2328,7 @@ async fn tier_management_routes(
                     request_id,
                 );
             }
-            Err(_) => return unexpected(request_id),
+            Err(_) => return tier_detail_failure(suffix, request_id),
         };
         let notification_effective_from = effective_from.clone();
         return match replace_tier_assignment(
@@ -1849,7 +2356,7 @@ async fn tier_management_routes(
                 .await;
                 success(StatusCode::OK, assignment, request_id)
             }
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure(suffix, request_id),
         };
     }
     error(
@@ -1999,7 +2506,7 @@ async fn rate_limit_management_routes(
         return http_detail(StatusCode::NOT_FOUND, "Rule status not found", request_id);
     }
     if suffix == "search" && method == Method::GET {
-        let Some(term) = query.get("q").map(|value| value.to_ascii_lowercase()) else {
+        let Some(term) = query.get("q") else {
             return rate_rule_validation("q", "field required", "value_error.missing", request_id);
         };
         // The pinned async in-memory backend does not evaluate the Mongo
@@ -2008,6 +2515,13 @@ async fn rate_limit_management_routes(
         if storage.is_memory() {
             return success(StatusCode::OK, json!([]), request_id);
         }
+        let pattern = match regex::RegexBuilder::new(term)
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(pattern) => pattern,
+            Err(_) => return rate_rule_failure("search", request_id),
+        };
         let mut rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
             Err(_) => {
@@ -2025,7 +2539,7 @@ async fn rate_limit_management_routes(
             ["rule_id", "description", "target_identifier"]
                 .iter()
                 .filter_map(|field| rule.get(*field).and_then(Value::as_str))
-                .any(|field| field.to_ascii_lowercase().contains(&term))
+                .any(|field| pattern.is_match(field))
         });
         rules.sort_by_key(|rule| {
             std::cmp::Reverse(rule.get("priority").and_then(Value::as_i64).unwrap_or(0))
@@ -2039,7 +2553,7 @@ async fn rate_limit_management_routes(
     if suffix == "statistics/summary" && method == Method::GET {
         let rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return rate_rule_failure("statistics", request_id),
         };
         let enabled = rules
             .iter()
@@ -2086,14 +2600,53 @@ async fn rate_limit_management_routes(
         && matches!(operation, "delete" | "enable" | "disable")
     {
         // The pinned Python app's bulk routes are internally inconsistent:
-        // `/bulk/enable` and `/bulk/disable` are shadowed by `{rule_id}` and
-        // fail as a missing rule, while its delete service raises a 500.
-        // Preserve the observed wire behavior instead of implementing the
-        // advertised OpenAPI success responses.
+        // `/bulk/enable` and `/bulk/disable` are shadowed by `{rule_id}`. The
+        // in-memory backend lacks delete_many, so non-empty bulk deletes fail;
+        // its early empty-list return and external-storage success remain live.
         return if operation == "delete" {
-            http_detail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to delete rules",
+            let Some(rule_ids) = payload.get("rule_ids").and_then(Value::as_array) else {
+                return rate_rule_validation(
+                    "rule_ids",
+                    "field required",
+                    "value_error.missing",
+                    request_id,
+                );
+            };
+            let rule_ids = match rule_ids
+                .iter()
+                .map(|value| security_setting_string(value).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(rule_ids) => rule_ids,
+                Err(()) => {
+                    return rate_rule_validation(
+                        "rule_ids",
+                        "str type expected",
+                        "type_error.str",
+                        request_id,
+                    );
+                }
+            };
+            if rule_ids.is_empty() {
+                return success(StatusCode::OK, json!({"deleted_count": 0}), request_id);
+            }
+            if storage.is_memory() {
+                return rate_rule_failure("bulk/delete", request_id);
+            }
+            let mut deleted_count = 0;
+            for rule_id in rule_ids {
+                match storage
+                    .delete_one("rate_limit_rules", &json!({"rule_id": rule_id}))
+                    .await
+                {
+                    Ok(true) => deleted_count += 1,
+                    Ok(false) => {}
+                    Err(_) => return rate_rule_failure("bulk/delete", request_id),
+                }
+            }
+            success(
+                StatusCode::OK,
+                json!({"deleted_count": deleted_count}),
                 request_id,
             )
         } else {
@@ -2121,26 +2674,25 @@ async fn rate_limit_management_routes(
                     &format!("Rule {id} not found"),
                     request_id,
                 ),
-                Err(_) => unexpected(request_id),
+                Err(_) => rate_rule_failure(parts[1], request_id),
             };
         }
         if parts[1] == "duplicate" {
-            let Some(mut rule) = storage
+            let mut rule = match storage
                 .find_one("rate_limit_rules", &json!({"rule_id": id}))
                 .await
-                .ok()
-                .flatten()
-            else {
-                return http_detail(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Source rule {id} not found"),
-                    request_id,
-                );
+            {
+                Ok(Some(rule)) => rule,
+                Ok(None) => {
+                    return http_detail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Source rule {id} not found"),
+                        request_id,
+                    );
+                }
+                Err(_) => return rate_rule_failure("duplicate", request_id),
             };
-            let Some(new_rule_id) = payload
-                .get("new_rule_id")
-                .and_then(security_setting_string)
-                .filter(|value| !value.is_empty())
+            let Some(new_rule_id) = payload.get("new_rule_id").and_then(security_setting_string)
             else {
                 return rate_rule_validation(
                     "new_rule_id",
@@ -2149,17 +2701,19 @@ async fn rate_limit_management_routes(
                     request_id,
                 );
             };
-            if matches!(
-                storage
-                    .find_one("rate_limit_rules", &json!({"rule_id": new_rule_id}))
-                    .await,
-                Ok(Some(_))
-            ) {
-                return http_detail(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Rule with ID {new_rule_id} already exists"),
-                    request_id,
-                );
+            match storage
+                .find_one("rate_limit_rules", &json!({"rule_id": new_rule_id}))
+                .await
+            {
+                Ok(Some(_)) => {
+                    return http_detail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Rule with ID {new_rule_id} already exists"),
+                        request_id,
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => return rate_rule_failure("duplicate", request_id),
             }
             rule["rule_id"] = json!(new_rule_id);
             rule["description"] = json!(format!("Copy of {id}"));
@@ -2170,7 +2724,7 @@ async fn rate_limit_management_routes(
             }
             return match storage.insert_one("rate_limit_rules", rule).await {
                 Ok(rule) => success(StatusCode::CREATED, rate_rule_response(rule), request_id),
-                Err(_) => unexpected(request_id),
+                Err(_) => rate_rule_failure("duplicate", request_id),
             };
         }
     }
@@ -2253,7 +2807,7 @@ async fn rate_limit_crud_routes(
         };
         let mut rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return rate_rule_failure("list", request_id),
         };
         rules.sort_by_key(|rule| {
             std::cmp::Reverse(rule.get("priority").and_then(Value::as_i64).unwrap_or(0))
@@ -2280,11 +2834,7 @@ async fn rate_limit_crud_routes(
                 request_id,
             );
         }
-        let Some(rule_id) = payload
-            .get("rule_id")
-            .and_then(security_setting_string)
-            .filter(|value| !value.is_empty())
-        else {
+        let Some(rule_id) = payload.get("rule_id").and_then(security_setting_string) else {
             return rate_rule_validation(
                 "rule_id",
                 "field required",
@@ -2437,17 +2987,19 @@ async fn rate_limit_crud_routes(
                 request_id,
             );
         }
-        if matches!(
-            storage
-                .find_one("rate_limit_rules", &json!({"rule_id": rule_id}))
-                .await,
-            Ok(Some(_))
-        ) {
-            return http_detail(
-                StatusCode::BAD_REQUEST,
-                &format!("Rule with ID {rule_id} already exists"),
-                request_id,
-            );
+        match storage
+            .find_one("rate_limit_rules", &json!({"rule_id": rule_id}))
+            .await
+        {
+            Ok(Some(_)) => {
+                return http_detail(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Rule with ID {rule_id} already exists"),
+                    request_id,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => return rate_rule_failure("create", request_id),
         }
         let rule = json!({
             "rule_id": rule_id,
@@ -2464,7 +3016,7 @@ async fn rate_limit_crud_routes(
         });
         return match storage.insert_one("rate_limit_rules", rule.clone()).await {
             Ok(_) => success(StatusCode::CREATED, rate_rule_response(rule), request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("create", request_id),
         };
     }
     if suffix.is_empty() {
@@ -2486,7 +3038,7 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("get", request_id),
         };
     }
     if method == Method::PUT {
@@ -2582,7 +3134,7 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("update", request_id),
         };
     }
     if method == Method::DELETE {
@@ -2600,7 +3152,7 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("delete", request_id),
         };
     }
     error(
@@ -2625,6 +3177,27 @@ fn rate_rule_validation(
         "Validation Error",
         request_id,
     )
+}
+
+fn rate_rule_failure(operation: &str, request_id: &str) -> Response {
+    let detail = match operation {
+        "create" => "Failed to create rule",
+        "list" => "Failed to list rules",
+        "search" => "Failed to search rules",
+        "get" => "Failed to get rule",
+        "update" => "Failed to update rule",
+        "delete" => "Failed to delete rule",
+        "enable" => "Failed to enable rule",
+        "disable" => "Failed to disable rule",
+        "bulk/delete" => "Failed to delete rules",
+        "bulk/enable" => "Failed to enable rules",
+        "bulk/disable" => "Failed to disable rules",
+        "duplicate" => "Failed to duplicate rule",
+        "statistics" => "Failed to get statistics",
+        "status" => "Failed to get rate limit status",
+        _ => "An unexpected error occurred",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
 }
 
 fn rate_rule_integer(value: &Value) -> Option<i64> {
@@ -2708,16 +3281,34 @@ async fn entity_routes(
                 request_id,
             );
         }
-        if spec.collection != "roles"
-            && let Err(message_text) = validate_pagination(query)
-        {
-            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
+        if spec.collection != "roles" {
+            // Python's `get_groups`/`get_routings` type `page`/`page_size` as
+            // typed FastAPI query params (a non-numeric value never reaches the
+            // handler and produces FastAPI's own 422), matching roles above.
+            if let Some(response) =
+                int_query_validation_error(query, &["page", "page_size"], request_id)
+            {
+                return response;
+            }
+            if let Err(message_text) = validate_pagination(query) {
+                return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
+            }
         }
         let mut items = match storage.find_many(spec.collection, &json!({})).await {
             Ok(items) => items.into_iter().map(strip_internal).collect::<Vec<_>>(),
             Err(_) => return unexpected(request_id),
         };
         if spec.collection == "roles" {
+            // Python's `get_roles(page: int = ..., page_size: int = ...)` are
+            // typed FastAPI query params: a non-numeric value never reaches the
+            // handler and instead produces FastAPI's own 422 validation body.
+            // Unlike the other collections above, this branch previously parsed
+            // page/page_size with `.unwrap_or(1)`, silently accepting garbage.
+            if let Some(response) =
+                int_query_validation_error(query, &["page", "page_size"], request_id)
+            {
+                return response;
+            }
             items.sort_by_key(|role| {
                 role.get("role_name")
                     .and_then(Value::as_str)
@@ -2930,7 +3521,13 @@ async fn entity_routes(
                 success(StatusCode::OK, strip_internal(item), request_id)
             }
             Ok(None) => error(
-                StatusCode::NOT_FOUND,
+                // Python's routing retrieval also returns 400 (RTG004) for a
+                // missing client_key, unlike groups/roles which use 404 here.
+                if spec.collection == "routings" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                },
                 spec.not_found_code,
                 if spec.collection == "roles" {
                     "Role does not exist"
@@ -2969,6 +3566,19 @@ async fn entity_routes(
             } else {
                 "Insufficient permissions"
             },
+            request_id,
+        );
+    }
+    // Python's update/delete service methods for groups and routings return
+    // 400 (not 404) when the target doesn't exist, matching the roles
+    // convention below rather than the generic 404 used elsewhere.
+    if matches!(spec.collection, "groups" | "routings")
+        && matches!(storage.find_one(spec.collection, &filter).await, Ok(None))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            spec.not_found_code,
+            "Resource not found",
             request_id,
         );
     }
@@ -3160,6 +3770,22 @@ fn merge_proto_metadata(target: &mut Value, source: &Value) {
     }
 }
 
+async fn lock_tls_binding_mutation(
+    state: &AppState,
+    payload: &Value,
+    prefix: &str,
+) -> Result<Option<crate::storage::runtime::TlsMutationGuard>, ()> {
+    let has_binding = ["client_tls_policy", "upstream_tls_profile", "upstream_tls_profiles"]
+        .iter()
+        .any(|field| payload.get(format!("{prefix}_{field}")).is_some_and(|value| !value.is_null()));
+    if !has_binding {
+        return Ok(None);
+    }
+    let guard = state.storage.as_ref().ok_or(())?.tls_mutation_lock().await.map_err(|_| ())?;
+    state.reload_tls_from_storage().await.map_err(|_| ())?;
+    Ok(Some(guard))
+}
+
 async fn api_routes(
     state: &AppState,
     path: &str,
@@ -3174,6 +3800,14 @@ async fn api_routes(
     };
     let suffix = path.strip_prefix("/api").unwrap_or("").trim_matches('/');
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
+        // Python's `get_apis(page: int = ..., page_size: int = ...)` typed
+        // FastAPI query params: a non-numeric value produces a 422, not a
+        // silently-defaulted page or a custom 400 PAG001 body.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
+        }
         if let Err(message_text) = validate_pagination(query) {
             return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
         }
@@ -3206,6 +3840,22 @@ async fn api_routes(
             Ok(payload) => payload,
             Err(errors) => return validation_errors(errors, request_id),
         };
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
+            Ok(guard) => guard,
+            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+        };
+        if let Some(policy) = payload.get("api_client_tls_policy").filter(|value| !value.is_null()) {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            ).is_err() {
+                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(&payload, "api", &state.tls_snapshot().profiles).is_err() {
+            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+        }
         let name = payload["api_name"]
             .as_str()
             .expect("validated API name")
@@ -3312,6 +3962,22 @@ async fn api_routes(
             Ok(payload) => payload,
             Err(errors) => return validation_errors(errors, request_id),
         };
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
+            Ok(guard) => guard,
+            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+        };
+        if let Some(policy) = payload.get("api_client_tls_policy").filter(|value| !value.is_null()) {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            ).is_err() {
+                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(&payload, "api", &state.tls_snapshot().profiles).is_err() {
+            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+        }
         let Some(updates) = payload.as_object() else {
             return unexpected(request_id);
         };
@@ -3448,6 +4114,13 @@ async fn user_routes(
         .unwrap_or("")
         .trim_matches('/');
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
+        // Python's `get_users(page: int = ..., page_size: int = ...)` typed
+        // FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
+        }
         if let Err(message_text) = validate_pagination(query) {
             return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
         }
@@ -3545,16 +4218,19 @@ async fn user_routes(
                 request_id,
             );
         }
-        if active_user == target
-            && !has_permission(state, active_user, "manage_users").await
-            && !self_update_fields_are_safe(&payload)
-        {
-            return error(
-                StatusCode::FORBIDDEN,
-                "USR023",
-                "Users without manage_users may not update restricted fields",
-                request_id,
-            );
+        if active_user == target && !has_permission(state, active_user, "manage_users").await {
+            let attempted = restricted_self_update_fields(&payload);
+            if !attempted.is_empty() {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "USR023",
+                    &format!(
+                        "Cannot modify restricted fields without manage_users permission: {}",
+                        attempted.join(", ")
+                    ),
+                    request_id,
+                );
+            }
         }
         let existing = match storage
             .find_one("users", &json!({"username": target}))
@@ -3855,18 +4531,82 @@ async fn endpoint_routes(
             return error(StatusCode::FORBIDDEN, code, text, request_id);
         }
         let filter = json!({"endpoint_id": endpoint_id});
-        return document_by_method(
-            state,
-            "endpoint_validations",
-            filter,
-            method,
-            payload,
-            username,
-            "manage_endpoints",
-            "Endpoint validation",
+        if method == Method::GET {
+            return match storage.find_one("endpoint_validations", &filter).await {
+                Ok(Some(validation)) => {
+                    success(StatusCode::OK, strip_internal(validation), request_id)
+                }
+                Ok(None) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END018",
+                    "Endpoint validation does not exist",
+                    request_id,
+                ),
+                Err(_) => unexpected(request_id),
+            };
+        }
+        if method == Method::PUT {
+            if payload.get("validation_enabled") == Some(&Value::Bool(false)) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END020",
+                    "Validation enabled is required",
+                    request_id,
+                );
+            }
+            match storage
+                .find_one("endpoints", &json!({"endpoint_id": endpoint_id}))
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "END022",
+                        "Endpoint does not exist",
+                        request_id,
+                    );
+                }
+                Err(_) => return unexpected(request_id),
+            }
+            return match storage
+                .update_one("endpoint_validations", &filter, &payload)
+                .await
+            {
+                Ok(_) => message(
+                    StatusCode::OK,
+                    "Endpoint validation updated successfully",
+                    request_id,
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END023",
+                    "Unable to update endpoint validation",
+                    request_id,
+                ),
+            };
+        }
+        if method == Method::DELETE {
+            return match storage.delete_one("endpoint_validations", &filter).await {
+                Ok(_) => message(
+                    StatusCode::OK,
+                    "Endpoint validation deleted successfully",
+                    request_id,
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END019",
+                    "Unable to delete endpoint validation",
+                    request_id,
+                ),
+            };
+        }
+        return error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GTW004",
+            "Method not allowed",
             request_id,
-        )
-        .await;
+        );
     }
     if (suffix == "endpoint/validation" || suffix == "validation") && method == Method::POST {
         if normalize_endpoint_validation_model(&mut payload, true).is_err() {
@@ -3885,13 +4625,47 @@ async fn endpoint_routes(
                 request_id,
             );
         }
-        if payload.get("endpoint_id").is_none() {
+        let endpoint_id = payload
+            .get("endpoint_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if endpoint_id.is_empty() {
             return error(
                 StatusCode::BAD_REQUEST,
-                "VAL001",
-                "endpoint_id is required",
+                "END013",
+                "Endpoint ID is required",
                 request_id,
             );
+        }
+        match storage
+            .find_one("endpoint_validations", &json!({"endpoint_id": endpoint_id}))
+            .await
+        {
+            Ok(Some(_)) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END017",
+                    "Endpoint validation already exists",
+                    request_id,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => return unexpected(request_id),
+        }
+        match storage
+            .find_one("endpoints", &json!({"endpoint_id": endpoint_id}))
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END015",
+                    "Endpoint does not exist",
+                    request_id,
+                );
+            }
+            Err(_) => return unexpected(request_id),
         }
         return match storage.insert_one("endpoint_validations", payload).await {
             Ok(_) => {
@@ -3907,7 +4681,12 @@ async fn endpoint_routes(
                     request_id,
                 )
             }
-            Err(_) => unexpected(request_id),
+            Err(_) => error(
+                StatusCode::BAD_REQUEST,
+                "END016",
+                "Unable to create endpoint validation",
+                request_id,
+            ),
         };
     }
     if method == Method::POST && suffix.is_empty() {
@@ -3918,6 +4697,22 @@ async fn endpoint_routes(
                 "Validation Error",
                 request_id,
             );
+        }
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "endpoint").await {
+            Ok(guard) => guard,
+            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+        };
+        if let Some(policy) = payload.get("endpoint_client_tls_policy").filter(|value| !value.is_null()) {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            ).is_err() {
+                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(&payload, "endpoint", &state.tls_snapshot().profiles).is_err() {
+            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
         }
         if !has_permission(state, username, "manage_endpoints").await {
             return error(
@@ -4024,7 +4819,12 @@ async fn endpoint_routes(
                     request_id,
                 )
             }
-            Err(_) => unexpected(request_id),
+            Err(_) => error(
+                StatusCode::BAD_REQUEST,
+                "END003",
+                "Unable to insert endpoint",
+                request_id,
+            ),
         };
     }
     let parts = suffix.split('/').collect::<Vec<_>>();
@@ -4061,6 +4861,28 @@ async fn endpoint_routes(
                 "Validation Error",
                 request_id,
             );
+        }
+        let _tls_guard = if method == Method::PUT {
+            match lock_tls_binding_mutation(state, &payload, "endpoint").await {
+                Ok(guard) => guard,
+                Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+            }
+        } else {
+            None
+        };
+        if method == Method::PUT {
+            if let Some(policy) = payload.get("endpoint_client_tls_policy").filter(|value| !value.is_null()) {
+                if crate::tls::policy::ClientTlsPolicy::validate_value(
+                    policy,
+                    &state.tls_snapshot().profiles,
+                    state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+                ).is_err() {
+                    return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+                }
+            }
+            if crate::tls::profiles::validate_upstream_bindings(&payload, "endpoint", &state.tls_snapshot().profiles).is_err() {
+                return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+            }
         }
         let uri = format!("/{}", parts[3..].join("/"));
         let filter = json!({"endpoint_method": parts[0], "api_name": parts[1], "api_version": parts[2], "endpoint_uri": uri});
@@ -4175,7 +4997,12 @@ async fn endpoint_routes(
                     "Endpoint does not exist for the requested API name, version and URI",
                     request_id,
                 ),
-                Err(_) => unexpected(request_id),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END009",
+                    "Unable to delete endpoint",
+                    request_id,
+                ),
             };
         }
         if method == Method::GET {
@@ -4190,114 +5017,22 @@ async fn endpoint_routes(
                 Err(_) => unexpected(request_id),
             };
         }
-        return document_by_method(
-            state,
-            "endpoints",
-            filter,
-            method,
-            payload,
-            username,
-            "manage_endpoints",
-            "Endpoint",
-            request_id,
-        )
-        .await;
+        if method == Method::PUT {
+            return match storage.update_one("endpoints", &filter, &payload).await {
+                Ok(Some(_)) => message(StatusCode::OK, "Endpoint updated successfully", request_id),
+                Ok(None) | Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END003",
+                    "Unable to update endpoint",
+                    request_id,
+                ),
+            };
+        }
     }
     error(
         StatusCode::NOT_FOUND,
         "EPT002",
         "Endpoint not found",
-        request_id,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn document_by_method(
-    state: &AppState,
-    collection: &str,
-    filter: Value,
-    method: &Method,
-    payload: Value,
-    username: &str,
-    permission: &str,
-    label: &str,
-    request_id: &str,
-) -> Response {
-    let Some(storage) = &state.storage else {
-        return unexpected(request_id);
-    };
-    if method == Method::GET {
-        return match storage.find_one(collection, &filter).await {
-            Ok(Some(item)) => success(StatusCode::OK, strip_internal(item), request_id),
-            Ok(None) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    if !has_permission(state, username, permission).await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "END010",
-            "Insufficient permissions",
-            request_id,
-        );
-    }
-    if method == Method::PUT {
-        return match storage.update_one(collection, &filter, &payload).await {
-            Ok(Some(_)) => {
-                audit::management_mutation(
-                    username,
-                    &format!("{}.update", label.to_ascii_lowercase().replace(' ', "_")),
-                    &filter.to_string(),
-                    "success",
-                );
-                message(
-                    StatusCode::OK,
-                    &format!("{label} updated successfully"),
-                    request_id,
-                )
-            }
-            Ok(None) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    if method == Method::DELETE {
-        return match storage.delete_one(collection, &filter).await {
-            Ok(true) => {
-                audit::management_mutation(
-                    username,
-                    &format!("{}.delete", label.to_ascii_lowercase().replace(' ', "_")),
-                    &filter.to_string(),
-                    "success",
-                );
-                message(
-                    StatusCode::OK,
-                    &format!("{label} deleted successfully"),
-                    request_id,
-                )
-            }
-            Ok(false) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    error(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "GTW004",
-        "Method not allowed",
         request_id,
     )
 }
@@ -4794,7 +5529,10 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
                 | "client_uri"
                 | "api_id"
                 | "endpoint_id"
-        ) && (create || !value.is_null())
+                | "endpoint_client_tls_policy"
+                | "endpoint_upstream_tls_profile"
+                | "endpoint_upstream_tls_profiles"
+        ) && (create || !value.is_null() || matches!(field.as_str(), "endpoint_client_tls_policy" | "endpoint_upstream_tls_profile" | "endpoint_upstream_tls_profiles"))
     });
     for (field, configured_minimum, configured_maximum) in [
         ("api_name", 1, 50),
@@ -5011,8 +5749,12 @@ fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
                 }
                 continue;
             }
-            let value = security_setting_string(value).ok_or(())?;
-            object.insert(field.to_owned(), json!(value));
+            let value = if field == "api_key_rotation_expires" {
+                tier_model_datetime(value).ok_or(())?
+            } else {
+                json!(security_setting_string(value).ok_or(())?)
+            };
+            object.insert(field.to_owned(), value);
         } else if create {
             object.insert(field.to_owned(), Value::Null);
         }
@@ -5589,10 +6331,20 @@ async fn authorization_routes(
             "Your token has been invalidated",
             request_id,
         );
-        response.headers_mut().append(
-            header::SET_COOKIE,
-            HeaderValue::from_static("access_token_cookie=; Path=/; Max-Age=0; HttpOnly"),
-        );
+        // Python scopes the deleted cookie to COOKIE_DOMAIN unless the host is a
+        // local/dev host, and clears both the primary and dev cookie names.
+        let domain_attribute = cookie_domain(headers)
+            .map(|domain| format!("; Domain={domain}"))
+            .unwrap_or_default();
+        for cookie_name in ["access_token_cookie", "access_token_cookie_dev"] {
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&format!(
+                    "{cookie_name}=; Path=/; Max-Age=0; HttpOnly{domain_attribute}"
+                ))
+                .unwrap(),
+            );
+        }
         return response;
     }
     let parts = path
@@ -6240,7 +6992,11 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
                 vec![json!({"error": "storage is unavailable"})],
             )
         };
-    let ready = mongo_ok && redis_ok && missing_grpc_descriptors == 0;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(i64::MAX);
+    let tls_certificates_valid = state.runtime.tls_certificate_expiries.lock()
+        .map(|expiries| expiries.values().all(|expiry| *expiry > now))
+        .unwrap_or(false);
+    let ready = mongo_ok && redis_ok && missing_grpc_descriptors == 0 && tls_certificates_valid;
     let status = if ready { "ready" } else { "degraded" };
     if !privileged {
         return success(StatusCode::OK, json!({"status": status}), request_id);
@@ -6254,7 +7010,8 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
             "mode": if memory_only { "memory" } else { "mongodb" },
             "cache_backend": if memory_only { "memory" } else { "redis" },
             "missing_grpc_descriptors": missing_grpc_descriptors,
-            "grpc_descriptor_errors": grpc_descriptor_errors
+            "grpc_descriptor_errors": grpc_descriptor_errors,
+            "tls_certificates_valid": tls_certificates_valid
         }),
         request_id,
     )
@@ -6440,7 +7197,7 @@ async fn monitor_metrics(
                     "test_count": 0,
                     "error_count": point.errors,
                     "avg_ms": point.latency_ms,
-                    "p95_ms": 0.0,
+                    "p95_ms": point.p95_ms(),
                     "bytes_in": point.bytes_in,
                     "bytes_out": point.bytes_out,
                     "error_rate": if point.requests == 0 { 0.0 } else { point.errors as f64 / point.requests as f64 },
@@ -6467,6 +7224,48 @@ async fn monitor_metrics(
             .sum::<f64>()
             / total_requests as f64
     };
+    // Python's MetricsStore.snapshot: top_apis/top_users/unique_users are
+    // aggregated only from the buckets in the selected range (with a
+    // documented global fallback when the range attributed no traffic),
+    // not from the process-global all-time counters.
+    let (range_start, range_end) = (
+        selected.first().map_or(0, |point| point.timestamp),
+        selected.last().map_or(u64::MAX, |point| point.timestamp),
+    );
+    let range_top_apis = analytics.get_top_apis_in_range(range_start, range_end, 10);
+    let top_apis: Vec<(String, u64)> = if range_top_apis.is_empty() {
+        analytics
+            .get_top_apis(10)
+            .into_iter()
+            .map(|entry| (entry.name, entry.count))
+            .collect()
+    } else {
+        range_top_apis
+            .into_iter()
+            .map(|entry| (entry.name, entry.count))
+            .collect()
+    };
+    let range_top_users = analytics.get_top_users_in_range(range_start, range_end, 10);
+    let (top_users, unique_users): (Vec<(String, u64)>, usize) = if range_top_users.is_empty() {
+        let global = analytics.get_top_users(10);
+        let count = global.len();
+        (
+            global
+                .into_iter()
+                .map(|entry| (entry.name, entry.count))
+                .collect(),
+            count,
+        )
+    } else {
+        let count = range_top_users.len();
+        (
+            range_top_users
+                .into_iter()
+                .map(|entry| (entry.name, entry.count))
+                .collect(),
+            count,
+        )
+    };
     success(
         StatusCode::OK,
         json!({
@@ -6478,9 +7277,9 @@ async fn monitor_metrics(
             "avg_response_ms": average_response_ms,
             "status_counts": analytics.get_status_distribution(),
             "series": series,
-            "top_apis": analytics.get_top_apis(10),
-            "top_users": analytics.get_top_users(10),
-            "unique_users": analytics.user_count(),
+            "top_apis": top_apis,
+            "top_users": top_users,
+            "unique_users": unique_users,
             "total_upstream_timeouts": 0,
             "total_retries": 0,
             "total_bytes_in": state.runtime.total_bytes_in.load(std::sync::atomic::Ordering::Relaxed),
@@ -6493,91 +7292,333 @@ async fn monitor_metrics(
 async fn monitor_report(
     state: &AppState,
     query: &HashMap<String, String>,
-    _request_id: &str,
+    request_id: &str,
 ) -> Response {
-    let analytics = global_analytics();
-    let points = analytics.get_timeseries();
-    let total_requests = points.iter().map(|point| point.requests).sum::<u64>();
-    let total_errors = points.iter().map(|point| point.errors).sum::<u64>();
-    let total_ms = points
-        .iter()
-        .map(|point| point.latency_ms * point.requests as f64)
-        .sum::<f64>();
-    let average_ms = if total_requests == 0 {
-        0.0
-    } else {
-        total_ms / total_requests as f64
-    };
-    let successes = total_requests.saturating_sub(total_errors);
-    let success_rate = if total_requests == 0 {
-        0.0
-    } else {
-        successes as f64 * 100.0 / total_requests as f64
-    };
     let start = query.get("start").map(String::as_str).unwrap_or("");
     let end = query.get("end").map(String::as_str).unwrap_or("");
+    let start_ts = match parse_report_timestamp(start) {
+        Ok(ts) => ts,
+        Err(message_text) => {
+            return error(StatusCode::BAD_REQUEST, "MON003", &message_text, request_id);
+        }
+    };
+    let end_ts = match parse_report_timestamp(end) {
+        Ok(ts) => ts,
+        Err(message_text) => {
+            return error(StatusCode::BAD_REQUEST, "MON003", &message_text, request_id);
+        }
+    };
+    if end_ts < start_ts {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "MON003",
+            "End date must be after start date",
+            request_id,
+        );
+    }
+
+    let (start_date, start_time_str) = report_date_time_utc(start_ts);
+    let (end_date, end_time_str) = report_date_time_utc(end_ts);
+    let directory = state
+        .config
+        .logs_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("platform-logs"));
+    let mut log_query = HashMap::new();
+    log_query.insert("start_date".to_owned(), start_date);
+    log_query.insert("end_date".to_owned(), end_date);
+    log_query.insert("start_time".to_owned(), start_time_str);
+    log_query.insert("end_time".to_owned(), end_time_str);
+    // Python pages through up to 100 * 1000 = 100,000 log-service results;
+    // read_log_records already bounds total bytes read via MAX_LOG_EXPORT_BYTES.
+    let logs = read_log_records(&directory, &log_query, 100_000).unwrap_or_default();
+
+    let mut total = 0u64;
+    let mut errors = 0u64;
+    let mut total_ms = 0.0f64;
+    let mut status_counts: std::collections::BTreeMap<u16, u64> = std::collections::BTreeMap::new();
+    let mut api_totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut api_errors: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut user_totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for record in &logs {
+        let endpoint = record.get("endpoint").and_then(Value::as_str).unwrap_or("");
+        if endpoint.is_empty() || endpoint == "/platform" || endpoint.starts_with("/platform/") {
+            continue;
+        }
+        total += 1;
+        let status_code = record
+            .get("status_code")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u16>().ok())
+            .or_else(|| {
+                record
+                    .get("status_code")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u16)
+            });
+        let level = record
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let is_error = status_code.is_some_and(|code| code >= 400)
+            || !matches!(level.as_str(), "INFO" | "DEBUG");
+        if is_error {
+            errors += 1;
+        }
+        if let Some(code) = status_code {
+            *status_counts.entry(code).or_default() += 1;
+        }
+        if let Some(response_time) = record.get("response_time").and_then(log_number) {
+            total_ms += response_time;
+        }
+        let api_key = report_api_from_endpoint(endpoint);
+        *api_totals.entry(api_key.clone()).or_default() += 1;
+        if is_error {
+            *api_errors.entry(api_key).or_default() += 1;
+        }
+        if let Some(username) = record
+            .get("user")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            *user_totals.entry(username.to_owned()).or_default() += 1;
+        }
+    }
+
+    let analytics = global_analytics();
+    let points_in_range = analytics
+        .get_timeseries()
+        .into_iter()
+        .filter(|point| {
+            point.timestamp >= start_ts.max(0) as u64 && point.timestamp <= end_ts.max(0) as u64
+        })
+        .collect::<Vec<_>>();
+    // Python's own defensive fallback: if no log lines matched (e.g. logs
+    // rotated away), reconstruct totals from the retained metrics buckets
+    // instead of reporting an empty period.
+    if total == 0 {
+        total = points_in_range.iter().map(|point| point.requests).sum();
+        errors = points_in_range.iter().map(|point| point.errors).sum();
+        total_ms = points_in_range
+            .iter()
+            .map(|point| point.latency_ms * point.requests as f64)
+            .sum();
+        for (status, count) in analytics.get_status_distribution() {
+            if let Ok(code) = status.parse::<u16>() {
+                *status_counts.entry(code).or_default() += count;
+            }
+        }
+        for entry in analytics.get_top_apis_in_range(
+            start_ts.max(0) as u64,
+            end_ts.max(0) as u64,
+            usize::MAX,
+        ) {
+            api_totals.insert(entry.name.clone(), entry.count);
+            if entry.error_count > 0 {
+                api_errors.insert(entry.name, entry.error_count);
+            }
+        }
+        for entry in analytics.get_top_users_in_range(
+            start_ts.max(0) as u64,
+            end_ts.max(0) as u64,
+            usize::MAX,
+        ) {
+            user_totals.insert(entry.name, entry.count);
+        }
+    }
+
+    let total_bytes_in: u64 = points_in_range.iter().map(|point| point.bytes_in).sum();
+    let total_bytes_out: u64 = points_in_range.iter().map(|point| point.bytes_out).sum();
+    let mut daily_bandwidth: std::collections::BTreeMap<u64, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for point in &points_in_range {
+        let day_ts = (point.timestamp / 86_400) * 86_400;
+        let entry = daily_bandwidth.entry(day_ts).or_default();
+        entry.0 += point.bytes_in;
+        entry.1 += point.bytes_out;
+    }
+
+    let average_ms = if total == 0 {
+        0.0
+    } else {
+        total_ms / total as f64
+    };
+    let successes = total.saturating_sub(errors);
+    let success_rate = if total == 0 {
+        0.0
+    } else {
+        successes as f64 * 100.0 / total as f64
+    };
+
     let mut csv = String::new();
     let _ = writeln!(csv, "Report,From,{},To,{}", csv_cell(start), csv_cell(end));
     csv.push_str("Overview\n");
-    let _ = writeln!(csv, "total_requests,{total_requests}");
-    let _ = writeln!(csv, "total_errors,{total_errors}");
+    let _ = writeln!(csv, "total_requests,{total}");
+    let _ = writeln!(csv, "total_errors,{errors}");
     let _ = writeln!(csv, "successes,{successes}");
     let _ = writeln!(csv, "success_rate,{success_rate:.2}%");
     let _ = writeln!(csv, "avg_response_ms,{average_ms:.2}");
     csv.push_str("\nBandwidth Overview\n");
-    let bytes_in = state
-        .runtime
-        .total_bytes_in
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let bytes_out = state
-        .runtime
-        .total_bytes_out
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let _ = writeln!(csv, "total_bytes_in,{bytes_in}");
-    let _ = writeln!(csv, "total_bytes_out,{bytes_out}");
-    let _ = writeln!(csv, "total_bytes,{}", bytes_in.saturating_add(bytes_out));
+    let _ = writeln!(csv, "total_bytes_in,{total_bytes_in}");
+    let _ = writeln!(csv, "total_bytes_out,{total_bytes_out}");
+    let _ = writeln!(
+        csv,
+        "total_bytes,{}",
+        total_bytes_in.saturating_add(total_bytes_out)
+    );
     csv.push_str("\nStatus Codes\nstatus,count\n");
-    let mut status_counts = analytics
-        .get_status_distribution()
-        .into_iter()
-        .collect::<Vec<_>>();
-    status_counts.sort_by_key(|(status, _)| status.parse::<u16>().unwrap_or(u16::MAX));
-    for (status, count) in status_counts {
-        let _ = writeln!(csv, "{},{}", csv_cell(&status), count);
+    for (status, count) in &status_counts {
+        let _ = writeln!(csv, "{status},{count}");
     }
     csv.push_str("\nAPI Usage\napi,total,errors,successes,success_rate\n");
-    for api in analytics.get_top_apis(analytics.api_count()) {
-        let successes = api.count.saturating_sub(api.error_count);
-        let rate = if api.count == 0 {
+    let mut apis = api_totals.into_iter().collect::<Vec<_>>();
+    apis.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (api, count) in apis {
+        let err = api_errors.get(&api).copied().unwrap_or_default();
+        let succ = count.saturating_sub(err);
+        let rate = if count == 0 {
             0.0
         } else {
-            successes as f64 * 100.0 / api.count as f64
+            succ as f64 * 100.0 / count as f64
         };
-        let _ = writeln!(
-            csv,
-            "{},{},{},{},{rate:.2}%",
-            csv_cell(&api.name),
-            api.count,
-            api.error_count,
-            successes
-        );
+        let _ = writeln!(csv, "{},{count},{err},{succ},{rate:.2}%", csv_cell(&api));
     }
     csv.push_str("\nUser Usage\nusername,requests\n");
-    for user in analytics.get_top_users(analytics.user_count()) {
-        let _ = writeln!(csv, "{},{}", csv_cell(&user.name), user.count);
+    let mut users = user_totals.into_iter().collect::<Vec<_>>();
+    users.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (user, count) in users {
+        let _ = writeln!(csv, "{},{count}", csv_cell(&user));
+    }
+    csv.push_str("\nBandwidth (per day, UTC)\ndate,bytes_in,bytes_out,total\n");
+    for (day_ts, (bytes_in, bytes_out)) in daily_bandwidth {
+        let (date_str, _) = report_date_time_utc(day_ts as i64);
+        let _ = writeln!(
+            csv,
+            "{date_str},{bytes_in},{bytes_out},{}",
+            bytes_in.saturating_add(bytes_out)
+        );
     }
 
+    let mut response = ([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], csv).into_response();
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "attachment; filename=doorman_report_{start}_to_{end}.csv"
+    )) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// `api` key derivation matching Python's `_api_from_endpoint` in
+/// `monitor_routes.py::generate_report`.
+fn report_api_from_endpoint(endpoint: &str) -> String {
+    if let Some(rest) = endpoint.strip_prefix("/api/rest/") {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        return format!("rest:{}", parts.first().copied().unwrap_or("unknown"));
+    }
+    if let Some(rest) = endpoint.strip_prefix("/api/graphql/") {
+        let name = rest
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        return format!("graphql:{name}");
+    }
+    if let Some(rest) = endpoint.strip_prefix("/api/soap/") {
+        let name = rest
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        return format!("soap:{name}");
+    }
+    "platform".to_owned()
+}
+
+/// Python's `_parse_ts`: try `%Y-%m-%dT%H:%M`, then `%Y-%m-%d`, then a
+/// best-effort ISO-8601 fallback via `datetime.fromisoformat`. A naive
+/// `datetime.strptime(...).timestamp()` in Python interprets the value in the
+/// process's local timezone; this deployment (like the pinned reference's
+/// container images) runs in UTC, so the two are equivalent here.
+fn parse_report_timestamp(value: &str) -> Result<i64, String> {
+    let invalid = || "Invalid date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM".to_owned();
+    let parse_date = |text: &str| -> Option<time::Date> {
+        let mut parts = text.splitn(3, '-');
+        let year = parts.next()?.parse::<i32>().ok()?;
+        let month = parts.next()?.parse::<u8>().ok()?;
+        let day = parts.next()?.parse::<u8>().ok()?;
+        time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()
+    };
+    let parse_time = |text: &str| -> Option<time::Time> {
+        // Strict "%H:%M" callers pass exactly two fields; the fromisoformat
+        // fallback below may also hand this "%H:%M:%S[.ffffff]", in which
+        // case the seconds (whole part only; unix timestamps here are
+        // second-resolution) are preserved rather than silently dropped.
+        let mut fields = text.splitn(3, ':');
+        let hour = fields.next()?;
+        let minute = fields.next()?;
+        let second = fields
+            .next()
+            .and_then(|value| value.split(['.', ',']).next())
+            .unwrap_or("0");
+        time::Time::from_hms(
+            hour.parse().ok()?,
+            minute.parse().ok()?,
+            second.parse().ok()?,
+        )
+        .ok()
+    };
+    let to_ts = |date: time::Date, time_value: time::Time| {
+        time::PrimitiveDateTime::new(date, time_value)
+            .assume_utc()
+            .unix_timestamp()
+    };
+
+    if let Some((date_part, time_part)) = value.split_once('T')
+        && let (Some(date), Some(time_value)) = (parse_date(date_part), parse_time(time_part))
+    {
+        return Ok(to_ts(date, time_value));
+    }
+    if let Some(date) = parse_date(value) {
+        return Ok(to_ts(date, time::Time::MIDNIGHT));
+    }
+    // fromisoformat fallback: accept "date time" (space separator) and an
+    // optional trailing "Z"/offset the two strict formats above reject.
+    let normalized = value.trim().replace('Z', "+00:00");
+    let date_part = normalized.split(['T', ' ']).next().unwrap_or_default();
+    let Some(date) = parse_date(date_part) else {
+        return Err(invalid());
+    };
+    let time_part = normalized
+        .split_once(['T', ' '])
+        .map(|(_, rest)| rest)
+        .map(|rest| rest.split(['+', '-']).next().unwrap_or_default())
+        .unwrap_or_default();
+    let time_value = if time_part.is_empty() {
+        time::Time::MIDNIGHT
+    } else {
+        parse_time(time_part).ok_or_else(invalid)?
+    };
+    Ok(to_ts(date, time_value))
+}
+
+/// Formats a unix timestamp as UTC `(YYYY-MM-DD, HH:MM)`, matching Python's
+/// `datetime.fromtimestamp(ts, timezone.utc).strftime(...)`.
+fn report_date_time_utc(timestamp: i64) -> (String, String) {
+    let Ok(value) = time::OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return (String::new(), String::new());
+    };
     (
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=doorman_report.csv",
-            ),
-        ],
-        csv,
+        format!(
+            "{:04}-{:02}-{:02}",
+            value.year(),
+            value.month() as u8,
+            value.day()
+        ),
+        format!("{:02}:{:02}", value.hour(), value.minute()),
     )
-        .into_response()
 }
 
 fn csv_cell(value: &str) -> String {
@@ -6587,14 +7628,18 @@ fn csv_cell(value: &str) -> String {
         value.to_owned()
     }
 }
-fn analytics_query_error(
+/// Matches FastAPI's automatic validation of a typed integer query parameter
+/// (e.g. `page: int = 1`): a present-but-non-numeric value never reaches the
+/// route handler and instead produces a 422 with this `detail` shape, rather
+/// than being silently coerced to a default.
+fn int_query_validation_error(
     query: &HashMap<String, String>,
-    has_limit: bool,
+    fields: &[&str],
     request_id: &str,
 ) -> Option<Response> {
-    for field in ["start_ts", "end_ts"] {
+    for field in fields {
         if query
-            .get(field)
+            .get(*field)
             .is_some_and(|value| value.parse::<i64>().is_err())
         {
             return Some(validation_errors(
@@ -6606,6 +7651,17 @@ fn analytics_query_error(
                 request_id,
             ));
         }
+    }
+    None
+}
+
+fn analytics_query_error(
+    query: &HashMap<String, String>,
+    has_limit: bool,
+    request_id: &str,
+) -> Option<Response> {
+    if let Some(response) = int_query_validation_error(query, &["start_ts", "end_ts"], request_id) {
+        return Some(response);
     }
     if !has_limit {
         return None;
@@ -6689,26 +7745,23 @@ fn analytics_limit(query: &HashMap<String, String>) -> usize {
         .clamp(1, 100)
 }
 
+/// Python's `PercentileMetrics.calculate`: pool every raw latency sample from
+/// every bucket (not per-bucket averages), sort, and index each percentile at
+/// `max(0, int(p * n) - 1)`.
 fn analytics_percentiles(points: &[AggregatedPoint]) -> Value {
-    let mut values = points
+    let values: Vec<f64> = points
         .iter()
-        .map(|point| point.latency_ms)
-        .collect::<Vec<_>>();
-    values.sort_by(|left, right| left.total_cmp(right));
-    let percentile = |fraction: f64| {
-        if values.is_empty() {
-            0.0
-        } else {
-            let index = ((values.len() - 1) as f64 * fraction).round() as usize;
-            values[index]
-        }
-    };
+        .flat_map(|point| point.latencies_ms.iter().copied())
+        .collect();
+    let (min, max) = (
+        values.iter().copied().fold(f64::INFINITY, f64::min),
+        values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let (p50, p75, p90, p95, p99) = pooled_percentiles(values.iter().copied());
     json!({
-        "p50": percentile(0.50),
-        "p75": percentile(0.75),
-        "p90": percentile(0.90),
-        "p95": percentile(0.95),
-        "p99": percentile(0.99)
+        "p50": p50, "p75": p75, "p90": p90, "p95": p95, "p99": p99,
+        "min": if values.is_empty() { 0.0 } else { min },
+        "max": if values.is_empty() { 0.0 } else { max }
     })
 }
 
@@ -6716,19 +7769,20 @@ fn analytics_entity(entity: &EntityCounter, key: &str) -> Value {
     json!({key: entity.name, "count": entity.count})
 }
 
-fn analytics_endpoint(entity: &EntityCounter) -> Value {
+fn analytics_endpoint(entity: &EndpointEntity) -> Value {
     let error_rate = if entity.count == 0 {
         0.0
     } else {
         entity.error_count as f64 / entity.count as f64
     };
+    let (p50, p75, p90, p95, p99) = entity.percentiles;
     json!({
         "endpoint_uri": entity.name,
         "count": entity.count,
         "error_count": entity.error_count,
         "error_rate": error_rate,
-        "avg_ms": 0.0,
-        "percentiles": {"p50": 0.0, "p75": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0}
+        "avg_ms": entity.avg_ms,
+        "percentiles": {"p50": p50, "p75": p75, "p90": p90, "p95": p95, "p99": p99}
     })
 }
 
@@ -6752,13 +7806,7 @@ fn analytics_series_point(point: &AggregatedPoint, metric_type: Option<&str>) ->
             value.insert("avg_ms".to_owned(), json!(point.latency_ms));
             value.insert(
                 "percentiles".to_owned(),
-                json!({
-                    "p50": point.latency_ms,
-                    "p75": point.latency_ms,
-                    "p90": point.latency_ms,
-                    "p95": point.latency_ms,
-                    "p99": point.latency_ms
-                }),
+                analytics_percentiles(std::slice::from_ref(point)),
             );
         }
         Some("bandwidth") => {
@@ -6773,13 +7821,7 @@ fn analytics_series_point(point: &AggregatedPoint, metric_type: Option<&str>) ->
             value.insert("avg_ms".to_owned(), json!(point.latency_ms));
             value.insert(
                 "percentiles".to_owned(),
-                json!({
-                    "p50": point.latency_ms,
-                    "p75": point.latency_ms,
-                    "p90": point.latency_ms,
-                    "p95": point.latency_ms,
-                    "p99": point.latency_ms
-                }),
+                analytics_percentiles(std::slice::from_ref(point)),
             );
             value.insert("bytes_in".to_owned(), json!(point.bytes_in));
             value.insert("bytes_out".to_owned(), json!(point.bytes_out));
@@ -6814,44 +7856,53 @@ fn analytics_top(kind: &str, query: &HashMap<String, String>, request_id: &str) 
     let (start_ts, end_ts) = analytics_time_range(query);
     let limit = analytics_limit(query);
     let analytics = global_analytics();
+    let (start_bound, end_bound) = (start_ts.max(0) as u64, end_ts.max(0) as u64);
     let response = match kind {
         "api" => {
-            let entries = analytics
-                .get_top_apis(limit)
+            // Reconstructed from only the minute buckets in [start_ts, end_ts],
+            // matching Python's enhanced_metrics_store.get_snapshot-backed top_apis
+            // rather than an all-time process-global total.
+            let all = analytics.get_top_apis_in_range(start_bound, end_bound, usize::MAX);
+            let entries = all
                 .iter()
+                .take(limit)
                 .map(|entry| analytics_entity(entry, "api"))
                 .collect::<Vec<_>>();
             json!({
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "top_apis": entries,
-                "total_apis": analytics.api_count()
+                "total_apis": all.len()
             })
         }
         "user" => {
-            let entries = analytics
-                .get_top_users(limit)
+            let all = analytics.get_top_users_in_range(start_bound, end_bound, usize::MAX);
+            let entries = all
                 .iter()
+                .take(limit)
                 .map(|entry| analytics_entity(entry, "user"))
                 .collect::<Vec<_>>();
             json!({
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "top_users": entries,
-                "total_users": analytics.user_count()
+                "total_users": all.len()
             })
         }
         _ => {
-            let mut entries = analytics
-                .get_top_endpoints(analytics.endpoint_count())
-                .iter()
-                .map(analytics_endpoint)
-                .collect::<Vec<_>>();
+            let all = analytics.get_top_endpoints_in_range(start_bound, end_bound, usize::MAX);
+            let mut entries = all.iter().map(analytics_endpoint).collect::<Vec<_>>();
+            let total_endpoints = entries.len();
             let sort_by = query.get("sort_by").map(String::as_str).unwrap_or("count");
-            if sort_by == "error_rate" {
+            let sort_key = match sort_by {
+                "error_rate" => Some("error_rate"),
+                "avg_ms" => Some("avg_ms"),
+                _ => None,
+            };
+            if let Some(key) = sort_key {
                 entries.sort_by(|left, right| {
-                    right["error_rate"]
+                    right[key]
                         .as_f64()
                         .unwrap_or_default()
-                        .total_cmp(&left["error_rate"].as_f64().unwrap_or_default())
+                        .total_cmp(&left[key].as_f64().unwrap_or_default())
                 });
             }
             entries.truncate(limit);
@@ -6859,7 +7910,7 @@ fn analytics_top(kind: &str, query: &HashMap<String, String>, request_id: &str) 
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "sort_by": sort_by,
                 "top_endpoints": entries,
-                "total_endpoints": analytics.endpoint_count()
+                "total_endpoints": total_endpoints
             })
         }
     };
@@ -7406,28 +8457,139 @@ async fn config_import(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let imported = match storage
-        .import_configuration_atomically(
-            &payload,
+    let mut snapshot_data = Map::new();
+    for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
+        let values = match storage.find_many(collection, &json!({})).await {
+            Ok(values) => values.into_iter().map(strip_internal).collect::<Vec<_>>(),
+            Err(_) => return unexpected(request_id),
+        };
+        snapshot_data.insert(collection.to_owned(), json!(values));
+    }
+    let timestamp = timestamp_now_naive().replace('T', " ");
+    if storage
+        .insert_one(
+            "config_snapshots",
             json!({
                 "snapshot_id": Uuid::new_v4().to_string(),
-                "created_at": timestamp_now(),
-                "actor": username
+                "timestamp": timestamp,
+                "created_by": username,
+                "data": snapshot_data,
             }),
         )
         .await
+        .is_err()
     {
-        Ok(imported) => imported,
-        Err(_) => return unexpected(request_id),
-    };
+        return unexpected(request_id);
+    }
+    let mut imported = Map::new();
+    for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
+        let values = match payload.get(collection) {
+            None => Vec::new(),
+            Some(value) if !python_truthy_json(value) => Vec::new(),
+            Some(Value::Array(values)) => values.clone(),
+            Some(_) => return unexpected(request_id),
+        };
+        let mut count = 0;
+        for value in values {
+            let Some(document) = value.as_object() else {
+                return unexpected(request_id);
+            };
+            if config_upsert(storage, collection, document).await.is_err() {
+                return unexpected(request_id);
+            }
+            count += 1;
+        }
+        imported.insert(collection.to_owned(), json!(count));
+    }
     audit::management_mutation(username, "config.import", "configuration", "success");
-    success(StatusCode::OK, json!({"imported": imported}), request_id)
+    success(
+        StatusCode::OK,
+        json!({"imported": Value::Object(imported)}),
+        request_id,
+    )
+}
+
+async fn config_upsert(
+    storage: &SharedStorage,
+    collection: &str,
+    document: &Map<String, Value>,
+) -> Result<(), crate::storage::runtime::StorageError> {
+    let required: &[&str] = match collection {
+        "apis" => &["api_name", "api_version"],
+        "endpoints" => &["api_name", "api_version", "endpoint_method", "endpoint_uri"],
+        "roles" => &["role_name"],
+        "groups" => &["group_name"],
+        "routings" => &["client_key"],
+        _ => return Ok(()),
+    };
+    if required.iter().any(|field| {
+        document
+            .get(*field)
+            .is_none_or(|value| !python_truthy_json(value))
+    }) {
+        return Ok(());
+    }
+    let filter = Value::Object(
+        required
+            .iter()
+            .map(|field| ((*field).to_owned(), document[*field].clone()))
+            .collect(),
+    );
+    let mut value = Value::Object(document.clone());
+    strip_mongo_id(&mut value);
+    if collection == "endpoints" {
+        if let Some(api) = storage
+            .find_one(
+                "apis",
+                &json!({
+                    "api_name": document["api_name"],
+                    "api_version": document["api_version"],
+                }),
+            )
+            .await?
+            && let Some(api_id) = api.get("api_id")
+        {
+            value["api_id"] = api_id.clone();
+        }
+        if value.get("endpoint_id").is_none() {
+            value["endpoint_id"] = json!(Uuid::new_v4().to_string());
+        }
+    }
+    let existing = storage.find_one(collection, &filter).await?;
+    if collection == "apis" {
+        if existing.is_none() {
+            if value.get("api_id").is_none() {
+                value["api_id"] = json!(Uuid::new_v4().to_string());
+            }
+            if value.get("api_path").is_none() {
+                value["api_path"] = json!(format!(
+                    "/{}/{}",
+                    python_string(&document["api_name"]),
+                    python_string(&document["api_version"]),
+                ));
+            }
+        } else if value.get("api_id").is_none()
+            && let Some(api_id) = existing.as_ref().and_then(|api| api.get("api_id"))
+        {
+            value["api_id"] = api_id.clone();
+        }
+    }
+    if existing.is_some() {
+        storage.update_one(collection, &filter, &value).await?;
+    } else {
+        storage.insert_one(collection, value).await?;
+    }
+    Ok(())
+}
+
+fn python_string(value: &Value) -> String {
+    security_setting_string(value).unwrap_or_else(|| value.to_string())
 }
 
 async fn config_rollback(
     state: &AppState,
     username: &str,
-    payload: Value,
+    _payload: Value,
     request_id: &str,
 ) -> Response {
     if !has_permission(state, username, "manage_gateway").await {
@@ -7440,70 +8602,56 @@ async fn config_rollback(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let requested_snapshot_id = payload.get("snapshot_id").and_then(Value::as_str);
-    let snapshot = if let Some(snapshot_id) = requested_snapshot_id {
-        match storage
-            .find_one("config_snapshots", &json!({"snapshot_id": snapshot_id}))
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "CFG404",
-                    "Configuration snapshot not found",
-                    request_id,
-                );
-            }
-            Err(_) => return unexpected(request_id),
-        }
-    } else {
-        let snapshots = match storage.find_many("config_snapshots", &json!({})).await {
-            Ok(snapshots) => snapshots,
-            Err(_) => return unexpected(request_id),
-        };
-        let Some(snapshot) = snapshots.into_iter().max_by(|left, right| {
-            left.get("created_at")
-                .and_then(Value::as_str)
-                .cmp(&right.get("created_at").and_then(Value::as_str))
-        }) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "CFG404",
-                "No snapshot found",
+    let snapshots = match storage.find_many("config_snapshots", &json!({})).await {
+        Ok(snapshots) => snapshots,
+        Err(_) => {
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
                 request_id,
             );
-        };
-        snapshot
+        }
     };
-    let Some(data) = snapshot.get("data").and_then(Value::as_object) else {
+    let Some(snapshot) = snapshots.into_iter().max_by(|left, right| {
+        left.get("timestamp")
+            .and_then(Value::as_str)
+            .cmp(&right.get("timestamp").and_then(Value::as_str))
+    }) else {
         return error(
-            StatusCode::BAD_REQUEST,
-            "CFG007",
-            "Configuration snapshot is invalid",
+            StatusCode::NOT_FOUND,
+            "CFG404",
+            "No snapshot found",
             request_id,
         );
     };
-    let mut replacements = Vec::new();
+    let Some(data) = snapshot.get("data").and_then(Value::as_object) else {
+        return http_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Rollback failed",
+            request_id,
+        );
+    };
     for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
         let Some(values) = data.get(collection).and_then(Value::as_array) else {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "CFG007",
-                "Configuration snapshot is invalid",
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
                 request_id,
             );
         };
-        replacements.push((collection.to_owned(), values.clone()));
+        if storage
+            .replace_collection(collection, values.clone())
+            .await
+            .is_err()
+        {
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
+                request_id,
+            );
+        }
     }
-    if storage
-        .replace_collections_atomically(&replacements, None)
-        .await
-        .is_err()
-    {
-        return unexpected(request_id);
-    }
-    let restored_to = snapshot.get("created_at").cloned().unwrap_or(Value::Null);
+    let restored_to = snapshot.get("timestamp").cloned().unwrap_or(Value::Null);
     let snapshot_id = snapshot.get("snapshot_id").cloned().unwrap_or(Value::Null);
     audit::management_mutation(
         username,
@@ -7555,7 +8703,15 @@ async fn analytics_detail(
                 endpoint.name.starts_with(&endpoint_prefix)
                     || endpoint.name.starts_with(&gateway_prefix)
             })
-            .map(analytics_endpoint)
+            .map(|endpoint| {
+                analytics_endpoint(&EndpointEntity {
+                    name: endpoint.name.clone(),
+                    count: endpoint.count,
+                    error_count: endpoint.error_count,
+                    avg_ms: 0.0,
+                    percentiles: (0.0, 0.0, 0.0, 0.0, 0.0),
+                })
+            })
             .collect::<Vec<_>>();
         return success(
             StatusCode::OK,
@@ -7664,43 +8820,72 @@ fn restart_required_keys() -> Value {
     )
 }
 
-async fn demo_seed(state: &AppState, username: &str, request_id: &str) -> Response {
-    if username != "admin" {
+async fn demo_seed(
+    state: &AppState,
+    username: &str,
+    query: &HashMap<String, String>,
+    request_id: &str,
+) -> Response {
+    // Python: `if not await is_admin_user(username)` -- a role-based admin
+    // check, not a literal username comparison.
+    if !is_admin_user(state, username).await {
         return error(
             StatusCode::FORBIDDEN,
-            "AUTH006",
-            "Admin access required",
+            "DEMO001",
+            "Permission denied to run seeder",
             request_id,
         );
     }
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
+    // Python has no such gate and will happily seed a real MongoDB; Rust
+    // deliberately refuses outside memory mode as an additional safety guard
+    // against seeding synthetic data into a production database. This is a
+    // documented approved addition, not a parity gap, so it uses its own
+    // error code rather than colliding with DEMO001 above.
     if !storage.is_memory() {
         return error(
             StatusCode::BAD_REQUEST,
-            "DEMO001",
+            "DEMO002",
             "Demo seed is available only in memory mode",
             request_id,
         );
     }
-    for (name, version, server) in [
-        ("customers", "v1", "http://localhost:8080"),
-        ("orders", "v1", "http://localhost:8081"),
-        ("weather", "v1", "http://localhost:8082"),
-    ] {
-        if storage
-            .find_one("apis", &json!({"api_name": name, "api_version": version}))
-            .await
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            let _ = storage.insert_one("apis", json!({"api_name": name, "api_version": version, "api_id": Uuid::new_v4().to_string(), "api_path": format!("/{name}/{version}"), "api_servers": [server], "api_type": "REST", "api_public": false, "api_auth_required": true, "active": true})).await;
-            let _ = storage.insert_one("endpoints", json!({"api_name": name, "api_version": version, "endpoint_id": Uuid::new_v4().to_string(), "endpoint_method": "GET", "endpoint_uri": "/status", "client_uri": "/status", "endpoint_description": "Demo status"})).await;
+    let query_usize = |key: &str, default: usize| {
+        query
+            .get(key)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let options = crate::demo_seed::SeedOptions {
+        users: query_usize("users", 40),
+        apis: query_usize("apis", 15),
+        endpoints: query_usize("endpoints", 6),
+        groups: query_usize("groups", 8),
+        protos: query_usize("protos", 6),
+        logs: query_usize("logs", 1500),
+        seed: query
+            .get("seed")
+            .and_then(|value| value.parse::<u64>().ok()),
+    };
+    match crate::demo_seed::run_seed(storage, &options).await {
+        Ok(mut result) => {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("message".to_owned(), json!("Seed completed"));
+            }
+            success(StatusCode::OK, result, request_id)
+        }
+        Err(error_value) => {
+            tracing::error!(error = %error_value, "demo seed error");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEMO999",
+                "Failed to seed demo data",
+                request_id,
+            )
         }
     }
-    message(StatusCode::OK, "Demo data seeded successfully", request_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8410,6 +9595,13 @@ async fn credit_routes(
                 .and_then(Value::as_str)
                 .cmp(&right.get("api_credit_group").and_then(Value::as_str))
         });
+        // Python's `list_credit_definitions(page: int = 1, page_size: int = 50)`
+        // typed FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
+        }
         if let Err(message_text) = validate_pagination(query) {
             return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
         }
@@ -8445,6 +9637,13 @@ async fn credit_routes(
                 "Unable to retrieve credits for all users",
                 request_id,
             );
+        }
+        // Python's `get_all_users_credits(page: int = 1, page_size: int = 10, ...)`
+        // typed FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
         }
         if let Err(message_text) = validate_pagination(query) {
             return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
@@ -8925,10 +10124,6 @@ async fn quota_routes(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let (tier, limits) = match quota_tier_and_limits(storage, username).await {
-        Ok(value) => value,
-        Err(_) => return unexpected(request_id),
-    };
     if path == "/quota/usage/history" && method == Method::GET {
         return success(
             StatusCode::OK,
@@ -8936,6 +10131,10 @@ async fn quota_routes(
             request_id,
         );
     }
+    let (tier, limits) = match quota_tier_and_limits(storage, username).await {
+        Ok(value) => value,
+        Err(_) => return quota_route_failure(path, request_id),
+    };
     if path == "/quota/usage/export" && method == Method::POST {
         let Some(limits) = limits.as_ref() else {
             return http_detail(
@@ -8946,7 +10145,7 @@ async fn quota_routes(
         };
         let quotas = match quota_values(storage, username, limits).await {
             Ok(quotas) => quotas,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return quota_route_failure(path, request_id),
         };
         // The pinned Python export intentionally contains request quotas only;
         // monthly bandwidth is present in the dashboard but not this payload.
@@ -8956,7 +10155,7 @@ async fn quota_routes(
             .collect::<Vec<_>>();
         let export_data = json!({
             "user_id": username,
-            "export_date": timestamp_now(),
+            "export_date": timestamp_now_naive(),
             "quotas": export_quotas.iter().map(|quota| quota_export_value(quota)).collect::<Vec<_>>(),
         });
         if query.get("format").is_some_and(|format| format == "csv") {
@@ -8997,7 +10196,7 @@ async fn quota_routes(
                                 && candidate
                                     .get("enabled")
                                     .and_then(Value::as_bool)
-                                    .unwrap_or(true)
+                                    == Some(true)
                         })
                         .map(|candidate| {
                             json!({
@@ -9008,7 +10207,7 @@ async fn quota_routes(
                             })
                         })
                         .collect::<Vec<_>>(),
-                    Err(_) => return unexpected(request_id),
+                    Err(_) => return quota_route_failure(path, request_id),
                 };
                 success(
                     StatusCode::OK,
@@ -9070,7 +10269,7 @@ async fn quota_routes(
         };
         let quotas = match quota_values(storage, username, limits).await {
             Ok(quotas) => quotas,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return quota_route_failure(path, request_id),
         };
         let request_quotas = quotas.iter().filter(|quota| {
             quota["quota_type"]
@@ -9136,7 +10335,7 @@ async fn quota_routes(
         };
         return match quota_status(storage, username, quota_type, limit).await {
             Ok(status) => success(StatusCode::OK, status, request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => quota_route_failure(path, request_id),
         };
     }
     error(
@@ -9145,6 +10344,17 @@ async fn quota_routes(
         "Platform route does not exist",
         request_id,
     )
+}
+
+fn quota_route_failure(path: &str, request_id: &str) -> Response {
+    let detail = match path {
+        "/quota/usage/history" => "Failed to get usage history",
+        "/quota/usage/export" => "Failed to export usage data",
+        "/quota/tier/info" => "Failed to get tier info",
+        "/quota/burst/status" => "Failed to get burst status",
+        _ => "Failed to get quota status",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
 }
 
 async fn quota_tier_and_limits(
@@ -9222,11 +10432,14 @@ async fn quota_status(
     limit: u64,
 ) -> Result<Value, crate::storage::runtime::StorageError> {
     let (counter_type, period_key, reset_at) = quota_period(name);
+    // QuotaTracker.check_quota deliberately fails open when Redis is
+    // unavailable, returning zero usage with the configured limit intact.
     let current_usage = storage
         .current_counter(&format!(
             "quota:user:{username}:{counter_type}:month:{period_key}:usage"
         ))
-        .await?;
+        .await
+        .unwrap_or(0);
     let percentage_used = current_usage as f64 / limit as f64 * 100.0;
     Ok(json!({
         "quota_type": name,
@@ -10102,29 +11315,65 @@ pub async fn backfill_grpc_descriptors(storage: &SharedStorage) -> DescriptorBac
     };
     let mut backfill = DescriptorBackfill::default();
     for api in apis {
-        if !api
+        let grpc_configured = api
             .get("api_type")
             .and_then(Value::as_str)
             .is_some_and(|kind| kind.eq_ignore_ascii_case("GRPC"))
-            || !bool_field_default(&api, "active", true)
-        {
+            || api.get("api_grpc_proto_source").is_some_and(python_truthy)
+            || api.get("api_grpc_package").is_some_and(python_truthy);
+        if !grpc_configured || api.get("active") == Some(&Value::Bool(false)) {
             continue;
         }
-        let Some(source) = api.get("api_grpc_proto_source").and_then(Value::as_str) else {
-            continue;
-        };
         backfill.scanned += 1;
         if api
             .get("api_grpc_descriptor_set")
-            .and_then(Value::as_str)
-            .is_some_and(|descriptor| !descriptor.trim().is_empty())
+            .is_some_and(python_truthy)
         {
             backfill.skipped += 1;
             continue;
         }
-        let api_name = api.get("api_name").cloned().unwrap_or(Value::Null);
-        let api_version = api.get("api_version").cloned().unwrap_or(Value::Null);
-        match compile_proto(source) {
+        let api_name = api
+            .get("api_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_version = api
+            .get("api_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_label = format!("{api_name}/{api_version}");
+        if api_name.is_empty() || api_version.is_empty() {
+            backfill.errors.push(json!({
+                "api": api_label,
+                "error": "API name/version is missing",
+            }));
+            continue;
+        }
+        let Some(source) = api
+            .get("api_grpc_proto_source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+        else {
+            backfill.errors.push(json!({
+                "api": api_label,
+                "error": "Proto source not found",
+            }));
+            continue;
+        };
+        let max_proto_size = env::var("MAX_PROTO_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1024 * 1024);
+        let source = match validate_proto_content(source.as_bytes(), max_proto_size) {
+            Ok(source) => source,
+            Err(error_value) => {
+                backfill.errors.push(json!({
+                    "api": api_label,
+                    "error": error_value.chars().take(500).collect::<String>(),
+                }));
+                continue;
+            }
+        };
+        match compile_proto(&source) {
             Ok((descriptor, digest)) => {
                 let filter = json!({"api_name": api_name, "api_version": api_version});
                 match storage
@@ -10140,18 +11389,18 @@ pub async fn backfill_grpc_descriptors(storage: &SharedStorage) -> DescriptorBac
                 {
                     Ok(Some(_)) => backfill.updated += 1,
                     Ok(None) => backfill.errors.push(json!({
-                        "api": filter.get("api_name"),
+                        "api": api_label,
                         "error": "API disappeared while descriptor backfill was running",
                     })),
                     Err(error_value) => backfill.errors.push(json!({
-                        "api": filter.get("api_name"),
+                        "api": api_label,
                         "error": error_value.to_string(),
                     })),
                 }
             }
             Err(error_value) => backfill.errors.push(json!({
-                "api": api_name,
-                "error": error_value,
+                "api": api_label,
+                "error": error_value.chars().take(500).collect::<String>(),
             })),
         }
     }
@@ -10167,6 +11416,25 @@ async fn proto_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
+    if method == Method::POST {
+        let max_size = env::var(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_DEFAULT);
+        if headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > max_size)
+        {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                crate::constants::ErrorCodes::REQUEST_TOO_LARGE,
+                crate::constants::Messages::FILE_TOO_LARGE,
+                request_id,
+            );
+        }
+    }
     if !has_permission(state, username, "manage_apis").await {
         let (code, message_text) = if method == Method::PUT {
             ("API008", "You do not have permission to update proto files")
@@ -10274,20 +11542,12 @@ async fn proto_routes(
         );
     }
     if method == Method::POST || method == Method::PUT {
-        let max_size = env::var(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_ENV)
+        let max_proto_size = env::var("MAX_PROTO_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_DEFAULT);
-        let source = match extract_proto_source(headers, body) {
-            Ok(source) if source.len() <= max_size => source,
-            Ok(_) => {
-                return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    crate::constants::ErrorCodes::REQUEST_TOO_LARGE,
-                    crate::constants::Messages::FILE_TOO_LARGE,
-                    request_id,
-                );
-            }
+            .unwrap_or(1024 * 1024);
+        let content = match extract_proto_source(headers, body) {
+            Ok(content) => content,
             Err(error_value) => {
                 return error(
                     StatusCode::BAD_REQUEST,
@@ -10301,26 +11561,29 @@ async fn proto_routes(
                 );
             }
         };
-        if source.contains('`')
-            || source.contains("$(")
-            || !(source.contains("syntax")
-                || source.contains("message")
-                || source.contains("service"))
-        {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "REQ002",
-                "Invalid proto file",
-                request_id,
-            );
-        }
+        let source = match validate_proto_content(&content, max_proto_size) {
+            Ok(source) => source,
+            Err(error_value) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    crate::constants::ErrorCodes::REQUEST_FILE_TYPE,
+                    &format!("Invalid proto file: {error_value}"),
+                    request_id,
+                );
+            }
+        };
         let (descriptor, digest) = match compile_proto(&source) {
             Ok(result) => result,
             Err(error_value) => {
+                let message_text = if method == Method::PUT {
+                    "Failed to generate gRPC code from proto file".to_owned()
+                } else {
+                    format!("Failed to generate gRPC code: {error_value}")
+                };
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "API009",
-                    &format!("Failed to generate gRPC descriptor: {error_value}"),
+                    &message_text,
                     request_id,
                 );
             }
@@ -10397,13 +11660,13 @@ async fn proto_routes(
     )
 }
 
-fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, String> {
+fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !content_type.starts_with("multipart/form-data") {
-        return String::from_utf8(body.to_vec()).map_err(|_| "Proto file must be UTF-8".to_owned());
+        return Ok(body.to_vec());
     }
     let boundary = content_type
         .split("boundary=")
@@ -10411,9 +11674,19 @@ fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, Stri
         .map(str::trim)
         .map(|value| value.trim_matches('"'))
         .ok_or_else(|| "Multipart boundary is missing".to_owned())?;
-    let text =
-        String::from_utf8(body.to_vec()).map_err(|_| "Proto file must be UTF-8".to_owned())?;
-    let disposition = text
+    let header_end = body
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4))
+        .or_else(|| {
+            body.windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| (index, 2))
+        })
+        .ok_or_else(|| "Invalid multipart body".to_owned())?;
+    let multipart_headers = std::str::from_utf8(&body[..header_end.0])
+        .map_err(|_| "Invalid multipart body".to_owned())?;
+    let disposition = multipart_headers
         .lines()
         .find(|line| {
             line.to_ascii_lowercase()
@@ -10432,40 +11705,51 @@ fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, Stri
     if !filename.to_ascii_lowercase().ends_with(".proto") {
         return Err("Only .proto files are allowed".to_owned());
     }
-    let header_end = text
-        .find("\r\n\r\n")
-        .or_else(|| text.find("\n\n"))
-        .ok_or_else(|| "Invalid multipart body".to_owned())?;
-    let separator = if text[header_end..].starts_with("\r\n\r\n") {
-        4
-    } else {
-        2
-    };
-    let content = &text[header_end + separator..];
-    let marker = format!("\r\n--{boundary}");
-    Ok(content
-        .split(&marker)
-        .next()
-        .unwrap_or(content)
-        .trim_end_matches(['\r', '\n'])
-        .to_owned())
+    let content = &body[header_end.0 + header_end.1..];
+    let marker = format!("\r\n--{boundary}").into_bytes();
+    let content_end = content
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap_or(content.len());
+    let mut content = content[..content_end].to_vec();
+    while content
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        content.pop();
+    }
+    Ok(content)
 }
 
 fn extract_proto_package(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("package") {
-            let pkg = rest.trim().trim_matches(';').trim();
-            if !pkg.is_empty()
-                && pkg
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            {
-                return Some(pkg.to_owned());
-            }
-        }
+    static PACKAGE: OnceLock<Regex> = OnceLock::new();
+    PACKAGE
+        .get_or_init(|| Regex::new(r"\bpackage\s+([a-zA-Z0-9_.]+)\s*;").unwrap())
+        .captures(source)
+        .and_then(|captures| captures.get(1))
+        .map(|package| package.as_str().to_owned())
+}
+
+fn validate_proto_content(content: &[u8], max_size: usize) -> Result<String, String> {
+    if content.len() > max_size {
+        return Err(format!("File too large (max {max_size} bytes)"));
     }
-    None
+    if content.contains(&0) {
+        return Err("Invalid proto file: binary content detected".to_owned());
+    }
+    let source = std::str::from_utf8(content)
+        .map_err(|_| "Invalid proto file: not valid UTF-8".to_owned())?;
+    if !(source.contains("syntax") || source.contains("message") || source.contains("service")) {
+        return Err("Invalid proto file: missing proto syntax (syntax/message/service)".to_owned());
+    }
+    static SUSPICIOUS: OnceLock<Regex> = OnceLock::new();
+    if SUSPICIOUS
+        .get_or_init(|| Regex::new(r"`|\$\(|;\s*(?:rm|mv|cp|chmod|cat|wget|curl)").unwrap())
+        .is_match(source)
+    {
+        return Err("Invalid proto file: suspicious content detected".to_owned());
+    }
+    Ok(source.to_owned())
 }
 
 fn compile_proto(source: &str) -> Result<(String, String), String> {
@@ -10523,6 +11807,14 @@ async fn logging_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
+    if !state.config.logs_enabled {
+        return error(
+            StatusCode::NOT_FOUND,
+            "GTW003",
+            "Platform route does not exist",
+            request_id,
+        );
+    }
     if method != Method::GET {
         return error(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -11312,13 +12604,23 @@ fn password_hash(user: &Value) -> Option<String> {
     }
 }
 
-fn self_update_fields_are_safe(payload: &Value) -> bool {
-    matches!(
-        payload.as_object(),
-        Some(fields) if fields.keys().all(|field| {
-            !matches!(field.as_str(), "role" | "groups" | "active" | "username")
+/// Restricted fields the caller attempted to set, sorted like Python's
+/// `sorted(attempted_restricted)`. Python only counts a field as "attempted"
+/// when its incoming value is not null, so a null-valued restricted field is
+/// treated as safe here too.
+fn restricted_self_update_fields(payload: &Value) -> Vec<String> {
+    let Some(fields) = payload.as_object() else {
+        return Vec::new();
+    };
+    let mut restricted: Vec<String> = fields
+        .iter()
+        .filter(|(field, value)| {
+            matches!(field.as_str(), "role" | "groups" | "active" | "username") && !value.is_null()
         })
-    )
+        .map(|(field, _)| field.clone())
+        .collect();
+    restricted.sort();
+    restricted
 }
 
 fn bootstrap_admin_update_fields_are_safe(payload: &Value) -> bool {
@@ -11672,6 +12974,39 @@ fn is_typed_json_mutation(path: &str, method: &Method) -> bool {
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+/// Routes whose Python counterpart declares a required (non-Optional) typed
+/// Pydantic body parameter, so FastAPI's global RequestValidationError
+/// handler returns 422 VAL001 for a request with no body at all -- before
+/// authentication, permission, or existence checks run -- regardless of
+/// Content-Type. Confirmed against the pinned reference for every listed
+/// route; routes with an `Optional`/defaulted body (memory dump/restore,
+/// security settings) are deliberately excluded.
+fn requires_nonempty_json_body(path: &str, method: &Method) -> bool {
+    match method {
+        &Method::POST => {
+            path == "/credit/rotate-key"
+                || (path.starts_with("/proto/") && path != "/proto/descriptors/backfill")
+                || (path.starts_with("/rate-limits/") && path.ends_with("/duplicate"))
+        }
+        &Method::PUT => {
+            path.starts_with("/api/")
+                || path.starts_with("/endpoint/")
+                || path.starts_with("/group/")
+                || path.starts_with("/proto/")
+                || (path.starts_with("/rate-limits/") && !path.ends_with("/duplicate"))
+                || path.starts_with("/role/")
+                || path.starts_with("/routing/")
+                || ((path.starts_with("/user/") || path.starts_with("/users/"))
+                    && !path.ends_with("/update-password"))
+                || path.starts_with("/vault/")
+                || (path
+                    .strip_prefix("/tiers/")
+                    .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/')))
+        }
+        _ => false,
+    }
+}
+
 fn is_subscription_mutation(path: &str, method: &Method) -> bool {
     matches!(method, &Method::POST)
         && matches!(
@@ -11906,7 +13241,7 @@ fn unexpected(request_id: &str) -> Response {
     )
 }
 
-fn json_response(status: StatusCode, payload: Value, request_id: &str) -> Response {
+pub(crate) fn json_response(status: StatusCode, payload: Value, request_id: &str) -> Response {
     let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let length = body.len().to_string();
     let mut response = (
@@ -11938,12 +13273,6 @@ fn env_bool(name: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
-}
-
-fn timestamp_now() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 // VaultService stores `datetime.now(UTC).isoformat()` directly. Unlike the
@@ -11997,6 +13326,297 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_report_timestamp_matches_pythons_strptime_cascade() {
+        // "%Y-%m-%dT%H:%M"
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30").unwrap(),
+            1_705_314_600
+        );
+        // "%Y-%m-%d" (midnight UTC)
+        assert_eq!(parse_report_timestamp("2024-01-15").unwrap(), 1_705_276_800);
+        // fromisoformat fallback: space separator and a trailing Z.
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30:00Z").unwrap(),
+            1_705_314_600
+        );
+        // Seconds in the fromisoformat fallback are preserved, not truncated.
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30:45Z").unwrap(),
+            1_705_314_645
+        );
+        assert!(parse_report_timestamp("not-a-date").is_err());
+        assert_eq!(
+            parse_report_timestamp("garbage").unwrap_err(),
+            "Invalid date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+        );
+    }
+
+    #[test]
+    fn report_date_time_utc_matches_python_strftime() {
+        assert_eq!(
+            report_date_time_utc(1_705_314_600),
+            ("2024-01-15".to_owned(), "10:30".to_owned())
+        );
+    }
+
+    #[test]
+    fn report_api_from_endpoint_matches_python_classification() {
+        assert_eq!(
+            report_api_from_endpoint("/api/rest/orders/v1/list"),
+            "rest:orders"
+        );
+        // Matches Python: `ep.split('/')` on "/api/rest/" yields a trailing
+        // empty segment, so `parts[3]` is "" rather than ever reaching the
+        // `len(parts) > 3` "unknown" fallback (unreachable via this prefix).
+        assert_eq!(report_api_from_endpoint("/api/rest/"), "rest:");
+        assert_eq!(
+            report_api_from_endpoint("/api/graphql/catalog"),
+            "graphql:catalog"
+        );
+        assert_eq!(
+            report_api_from_endpoint("/api/soap/billing"),
+            "soap:billing"
+        );
+        assert_eq!(report_api_from_endpoint("/platform/users"), "platform");
+    }
+
+    #[test]
+    fn analytics_percentiles_pools_raw_samples_like_python_percentile_metrics() {
+        let mut a = AggregatedPoint {
+            timestamp: 0,
+            requests: 2,
+            ..Default::default()
+        };
+        a.latencies_ms.extend([10.0, 20.0]);
+        let mut b = AggregatedPoint {
+            timestamp: 60,
+            requests: 1,
+            ..Default::default()
+        };
+        b.latencies_ms.extend([100.0]);
+        // Pooled sorted samples: [10, 20, 100], n = 3.
+        // k = max(0, int(p*3) - 1): p50 -> int(1.5)-1=0 -> 10; p95 -> int(2.85)-1=1 -> 20.
+        let result = analytics_percentiles(&[a, b]);
+        assert_eq!(result["p50"], json!(10.0));
+        assert_eq!(result["p95"], json!(20.0));
+        assert_eq!(result["min"], json!(10.0));
+        assert_eq!(result["max"], json!(100.0));
+
+        let empty = analytics_percentiles(&[]);
+        assert_eq!(empty["p50"], json!(0.0));
+        assert_eq!(empty["min"], json!(0.0));
+    }
+
+    #[test]
+    fn restricted_self_update_fields_matches_python_attempted_set() {
+        // Null-valued restricted fields are not "attempted" in Python, since it
+        // filters `v is not None` before intersecting with the restricted set.
+        assert!(restricted_self_update_fields(&json!({"email": "a@b.com"})).is_empty());
+        assert!(restricted_self_update_fields(&json!({"role": null})).is_empty());
+        assert_eq!(
+            restricted_self_update_fields(&json!({
+                "username": "new", "active": true, "role": "admin", "email": "a@b.com"
+            })),
+            vec!["active", "role", "username"]
+        );
+    }
+
+    #[test]
+    fn tier_request_models_coerce_scalars_and_apply_defaults() {
+        let mut create = json!({
+            "tier_id": 7,
+            "name": "not-an-enum",
+            "display_name": true,
+            "limits": {"requests_per_minute": "12", "enable_throttling": "yes"},
+            "price_monthly": "19.5",
+            "features": [1, false],
+            "enabled": "off",
+            "ignored": "field"
+        });
+        normalize_tier_request("/tiers", &Method::POST, &mut create).unwrap();
+        assert_eq!(create["tier_id"], "7");
+        assert_eq!(create["name"], "not-an-enum");
+        assert_eq!(create["display_name"], "True");
+        assert_eq!(create["limits"]["requests_per_minute"], 12);
+        assert_eq!(create["limits"]["burst_per_second"], 0);
+        assert_eq!(create["limits"]["max_queue_time_ms"], 5000);
+        assert_eq!(create["limits"]["enable_throttling"], true);
+        assert_eq!(create["price_monthly"], 19.5);
+        assert_eq!(create["features"], json!(["1", "False"]));
+        assert_eq!(create["is_default"], false);
+        assert_eq!(create["enabled"], false);
+        assert!(create.get("ignored").is_none());
+
+        let mut action = json!({
+            "user_id": 42,
+            "new_tier_id": false,
+            "grace_period_days": "3",
+            "ignored": true
+        });
+        normalize_tier_request("/tiers/downgrade", &Method::POST, &mut action).unwrap();
+        assert_eq!(
+            action,
+            json!({"user_id": "42", "new_tier_id": "False", "grace_period_days": 3})
+        );
+
+        let mut assignment = json!({
+            "user_id": "dated",
+            "tier_id": "pro",
+            "effective_from": 0,
+            "effective_until": "2020-1-2 3:04:05.12Z"
+        });
+        normalize_tier_request("/tiers/assignments", &Method::POST, &mut assignment).unwrap();
+        assert_eq!(assignment["effective_from"], "1970-01-01T00:00:00+00:00");
+        assert_eq!(
+            assignment["effective_until"],
+            "2020-01-02T03:04:05.120000+00:00"
+        );
+    }
+
+    #[test]
+    fn tier_request_models_reject_invalid_shapes_and_drop_update_nulls() {
+        for mut invalid in [
+            json!({"tier_id": "x", "name": "free", "display_name": "X", "limits": []}),
+            json!({"user_id": "x", "temp_tier_id": "pro", "duration_days": null}),
+            json!({"user_id": "x", "new_tier_id": "pro", "immediate": "sometimes"}),
+            json!({"user_id": "x", "tier_id": "pro", "effective_from": "not-a-date"}),
+            json!({"tier_ids": ["free"]}),
+        ] {
+            let (path, method) = if invalid.get("effective_from").is_some() {
+                ("/tiers/assignments", Method::POST)
+            } else if invalid.get("tier_id").is_some() {
+                ("/tiers", Method::POST)
+            } else if invalid.get("temp_tier_id").is_some() {
+                ("/tiers/temporary-upgrade", Method::POST)
+            } else if invalid.get("new_tier_id").is_some() {
+                ("/tiers/upgrade", Method::POST)
+            } else {
+                ("/tiers/compare", Method::POST)
+            };
+            assert!(normalize_tier_request(path, &method, &mut invalid).is_err());
+        }
+
+        let mut update = json!({
+            "display_name": null,
+            "limits": null,
+            "enabled": null,
+            "features": null,
+            "price_monthly": null,
+            "description": null
+        });
+        normalize_tier_request("/tiers/pro", &Method::PUT, &mut update).unwrap();
+        assert_eq!(update, json!({}));
+
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("YES", Some(true)),
+            ("on", Some(true)),
+            ("1", Some(true)),
+            ("false", Some(false)),
+            ("No", Some(false)),
+            ("off", Some(false)),
+            ("0", Some(false)),
+            (" true ", None),
+        ] {
+            assert_eq!(pydantic_bool_string(value), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_exception_envelopes_match_each_python_route() {
+        for (operation, detail) in [
+            ("get", "Failed to get tier"),
+            ("update", "Failed to update tier"),
+            ("delete", "Failed to delete tier"),
+            ("assign", "Failed to assign user"),
+            ("get_assignment", "Failed to get assignment"),
+            ("get_user_tier", "Failed to get user tier"),
+            ("remove_assignment", "Failed to remove assignment"),
+            ("list_users", "Failed to list users"),
+            ("upgrade", "Failed to upgrade tier"),
+            ("downgrade", "Failed to downgrade tier"),
+            ("temporary-upgrade", "Failed to create temporary upgrade"),
+            ("trial/start", "Failed to start trial"),
+            ("payment/failure", "Failed to handle payment failure"),
+            ("compare", "Failed to compare tiers"),
+        ] {
+            let response = tier_detail_failure(operation, "tier-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+
+        let response = tier_statistics_failure("tier-error");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error_code"], "TIER999");
+        assert_eq!(body["error_message"], "Failed to get statistics");
+    }
+
+    #[tokio::test]
+    async fn rate_rule_exception_envelopes_match_each_python_route() {
+        for (operation, detail) in [
+            ("create", "Failed to create rule"),
+            ("list", "Failed to list rules"),
+            ("search", "Failed to search rules"),
+            ("get", "Failed to get rule"),
+            ("update", "Failed to update rule"),
+            ("delete", "Failed to delete rule"),
+            ("enable", "Failed to enable rule"),
+            ("disable", "Failed to disable rule"),
+            ("bulk/delete", "Failed to delete rules"),
+            ("bulk/enable", "Failed to enable rules"),
+            ("bulk/disable", "Failed to disable rules"),
+            ("duplicate", "Failed to duplicate rule"),
+            ("statistics", "Failed to get statistics"),
+            ("status", "Failed to get rate limit status"),
+        ] {
+            let response = rate_rule_failure(operation, "rule-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_exception_envelopes_match_each_python_route() {
+        for (path, detail) in [
+            ("/quota/status", "Failed to get quota status"),
+            (
+                "/quota/status/monthly_requests",
+                "Failed to get quota status",
+            ),
+            ("/quota/usage/history", "Failed to get usage history"),
+            ("/quota/usage/export", "Failed to export usage data"),
+            ("/quota/tier/info", "Failed to get tier info"),
+            ("/quota/burst/status", "Failed to get burst status"),
+        ] {
+            let response = quota_route_failure(path, "quota-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+    }
 
     #[test]
     fn log_parsing_and_filters_match_python_service() {
@@ -12294,13 +13914,13 @@ mod tests {
 
     #[test]
     fn self_updates_without_user_management_cannot_change_authorization_fields() {
-        assert!(self_update_fields_are_safe(
+        assert!(restricted_self_update_fields(
             &json!({"email": "user@example.com", "custom_attributes": {}, "rate_limit_duration": 1})
-        ));
-        assert!(!self_update_fields_are_safe(&json!({"groups": ["admin"]})));
-        assert!(!self_update_fields_are_safe(&json!({"role": "admin"})));
-        assert!(!self_update_fields_are_safe(&json!({"active": true})));
-        assert!(!self_update_fields_are_safe(&json!({"username": "other"})));
+        ).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"groups": ["admin"]})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"role": "admin"})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"active": true})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"username": "other"})).is_empty());
     }
 
     #[test]

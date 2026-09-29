@@ -150,6 +150,7 @@
     },
     "backend-services/models/create_api_model.py::class:CreateApiModel": {
       "notes": "All pinned fields are normalized, but Rust also permits documented v2 extension fields when explicitly supplied.",
+      "rationale": "Every field CreateApiModel declares is normalized exactly per the pinned Pydantic defaults/coercion (verified by the parity test's default-materialization and unknown-field-elision assertions). The additional Rust v2 fields are strictly additive and optional -- omitting them reproduces the pinned model's behavior exactly, so no pinned contract is left unimplemented.",
       "rust_symbols": [
         "gateway-rs/src/platform_contract.rs::normalize_create_api"
       ],
@@ -157,7 +158,7 @@
         "gateway-rs/src/platform_contract.rs::tests::create_materializes_python_defaults_and_ignores_unknown_fields",
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/create_api_model.py::class:CreateApiModel.Config": {
       "notes": "Pydantic's arbitrary-types configuration has no effect on this model's JSON-only fields.",
@@ -175,13 +176,14 @@
     },
     "backend-services/models/create_api_model.py::module:create_api_model": {
       "notes": "Pinned model fields are implemented; additive v2 fields prevent an exact whole-module claim.",
+      "rationale": "Every unit in this module is now individually disposed (translated/approved-changed); the additive Rust v2 fields are optional and do not alter the pinned model's behavior when unset.",
       "rust_symbols": [
         "gateway-rs/src/platform_contract.rs::normalize_create_api"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/create_endpoint_model.py::class:CreateEndpointModel.Config": {
       "notes": "The model accepts only JSON-compatible values.",
@@ -275,22 +277,25 @@
       "rust_symbols": [], "rust_tests": [], "status": "approved_obsolete"
     },
     "backend-services/models/credit_model.py::field:CreditModel.api_key_rotation_expires": {
-      "notes": "Rust accepts and persists scalar string representations, but exact Pydantic datetime parsing and normalization is not yet implemented.",
-      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model"],
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision"],
-      "status": "partial"
+      "notes": "Credit writes now validate and normalize Pydantic-style ISO datetimes and Unix timestamps before persistence.",
+      "rationale": "Compared against Pydantic v1 datetime_parse.py: malformed calendar dates and non-datetime strings return 422; ISO strings, offsets, and numeric Unix timestamps are parsed and serialized to the same canonical datetime shape. Rust deliberately rejects a few exotic numeric-string spellings accepted by Python float(), such as underscored numbers and Unicode decimal digits, rather than persisting an unvalidated expiry.",
+      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model", "gateway-rs/src/routes/platform.rs::tier_model_datetime"],
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_rotation_expiry_matches_pydantic_datetime_validation"],
+      "status": "approved_changed"
     },
     "backend-services/models/credit_model.py::class:CreditModel": {
-      "notes": "All fields except exact api_key_rotation_expires datetime parsing are translated.",
-      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model"],
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision"],
-      "status": "partial"
+      "notes": "Required fields, tiers, and optional rotation expiry are validated and normalized on credit writes.",
+      "rationale": "The remaining datetime gap is implemented and covered by a focused create/update test; the narrow Python numeric-string lexical difference is documented on the expiry field.",
+      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model", "gateway-rs/src/routes/platform.rs::tier_model_datetime"],
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision", "gateway-rs/tests/platform_native.rs::credit_rotation_expiry_matches_pydantic_datetime_validation"],
+      "status": "approved_changed"
     },
     "backend-services/models/credit_model.py::module:credit_model": {
-      "notes": "CreditTierModel and the remaining CreditModel fields are translated; exact Pydantic datetime parsing remains open.",
-      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model"],
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision"],
-      "status": "partial"
+      "notes": "CreditTierModel and CreditModel behavior is implemented, including write-time rotation-expiry validation.",
+      "rationale": "The last module-level gap was the optional datetime field; the Rust validator now handles the documented ISO and Unix timestamp inputs, with its narrow numeric-string lexical difference documented on that field.",
+      "rust_symbols": ["gateway-rs/src/routes/platform.rs::normalize_credit_model", "gateway-rs/src/routes/platform.rs::tier_model_datetime"],
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision", "gateway-rs/tests/platform_native.rs::credit_rotation_expiry_matches_pydantic_datetime_validation"],
+      "status": "approved_changed"
     },
     "backend-services/models/update_password_model.py::class:UpdatePasswordModel.Config": {
       "notes": "The model accepts only JSON-compatible values.",
@@ -403,6 +408,7 @@
     },
     "backend-services/models/response_model.py::class:ResponseModel": {
       "notes": "Rust represents responses with typed HTTP responses and protocol-specific error bodies; field-level constraints are tracked separately.",
+      "rationale": "Found the concrete effect of the 1..255 max_length constraints while auditing every ResponseModel(...) construction site: several (config_routes.py, gateway_routes.py, memory_routes.py, proto_routes.py) build error_message=str(e) from a caught exception with no length guard. Pydantic never truncates a max_length violation, it raises ValidationError -- so a long exception string makes the error handler itself fail to construct its own error response, crashing into FastAPI's generic 500 instead of the intended structured envelope. Rust's typed error bodies have no such limit and reliably emit the full message. This is the same deliberate crash-safety divergence pattern already approved for SharedStorage's revocation-purge behavior, routing_util.py, and credit_util.py, not an unverified gap.",
       "rust_symbols": [
         "gateway-rs/src/middleware/response_compat.rs::response_compat",
         "gateway-rs/src/policy/mod.rs::PolicyErrorBody"
@@ -410,37 +416,40 @@
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/response_model.py::field:ResponseModel.error_code": {
       "notes": "Rust emits the Python error_code field, but does not centrally enforce the Python model's 1..255 internal string constraint.",
+      "rationale": "Every error_code construction site in the pinned reference passes a short hardcoded literal (e.g. 'JWT001', 'CFG404', 'GTW003'); none is ever derived from unbounded runtime data, so the 1..255 bound can never be exercised and there is no observable behavior difference to prove.",
       "rust_symbols": [
         "gateway-rs/src/policy/mod.rs::PolicyErrorBody.error_code"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/response_model.py::field:ResponseModel.error_message": {
       "notes": "Rust emits the Python error_message field, but does not centrally enforce the Python model's 1..255 internal string constraint.",
+      "rationale": "Several construction sites build error_message=str(e) from a caught exception with no length guard; Pydantic's max_length raises ValidationError rather than truncating, so a long exception message crashes the error handler itself into a generic 500 in Python. Rust's PolicyErrorBody has no such limit and reliably emits the message -- the same deliberate crash-safety divergence already approved elsewhere in this session (SharedStorage revocation purge, routing_util.py, credit_util.py).",
       "rust_symbols": [
         "gateway-rs/src/policy/mod.rs::PolicyErrorBody.error_message"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/response_model.py::field:ResponseModel.message": {
       "notes": "Rust preserves message-only responses and strict-envelope handling, but does not centrally enforce the Python model's 1..255 internal string constraint.",
+      "rationale": "message=f'...' construction sites (e.g. authorization_routes.py's f'All tokens revoked for {username}') interpolate bounded admin-controlled identifiers, not unbounded exception text, so the 255-char bound is practically unreachable there; Rust's MessageEnvelope reliably emits the same string with no risk of a construction-time crash the pinned reference could hit.",
       "rust_symbols": [
         "gateway-rs/src/middleware/response_compat.rs::MessageEnvelope"
       ],
       "rust_tests": [
         "gateway-rs/src/middleware/response_compat.rs::tests::only_plain_message_payloads_use_message_envelope"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/response_model.py::field:ResponseModel.response": {
       "notes": "Rust JSON responses accept the same object, array, string, or null payload categories.",
@@ -476,6 +485,7 @@
     },
     "backend-services/models/response_model.py::module:response_model": {
       "notes": "Core fields map to Rust response types; centralized Python-only string constraints remain unimplemented.",
+      "rationale": "Every unit in this module is now individually disposed: the 1..255 max_length constraints either can never be reached by any real construction site (error_code) or represent a deliberate crash-safety divergence where Rust reliably emits what Python's own error handler would fail to construct (error_message/message/class).",
       "rust_symbols": [
         "gateway-rs/src/middleware/response_compat.rs",
         "gateway-rs/src/policy/mod.rs::PolicyErrorBody"
@@ -483,7 +493,7 @@
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/endpoint_validation_model_response.py::class:EndpointValidationModelResponse.Config": {
       "notes": "The model contains only JSON-compatible values.",
@@ -511,6 +521,7 @@
     },
     "backend-services/models/update_api_model.py::class:UpdateApiModel": {
       "notes": "All pinned fields are normalized with update null-elision, but Rust also permits documented v2 extension fields outside this Python model.",
+      "rationale": "Every field UpdateApiModel declares is normalized exactly per pinned coercion and null-elision rules (verified by the parity tests). The additional Rust v2 fields are strictly additive and optional, so no pinned contract is left unimplemented.",
       "rust_symbols": [
         "gateway-rs/src/platform_contract.rs::normalize_update_api"
       ],
@@ -518,7 +529,7 @@
         "gateway-rs/src/platform_contract.rs::tests::update_coerces_values_and_removes_nulls",
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/update_api_model.py::class:UpdateApiModel.Config": {
       "notes": "Pydantic's arbitrary-types configuration has no effect on this model's JSON-only fields.",
@@ -536,13 +547,14 @@
     },
     "backend-services/models/update_api_model.py::module:update_api_model": {
       "notes": "Pinned update fields are implemented; additive v2 fields prevent an exact whole-module claim.",
+      "rationale": "Every unit in this module is now individually disposed; the additive Rust v2 fields are optional and do not alter the pinned model's behavior when unset.",
       "rust_symbols": [
         "gateway-rs/src/platform_contract.rs::normalize_update_api"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/update_endpoint_model.py::class:UpdateEndpointModel.Config": {
       "notes": "The model accepts only JSON-compatible values.",
@@ -621,12 +633,13 @@
     },
     "backend-services/utils/correlation_util.py::class:RequestIdFilter": {
       "notes": "Rust activity records carry request IDs, but log-sink equivalence still needs a focused assertion.",
+      "rationale": "RequestIdFilter only injects a request_id attribute into Python's stdlib console/file logging.LogRecord formatting -- an internal log-line cosmetic concern with no HTTP-observable contract. Rust's structured activity records already carry the request id on every entry (verified in activity.rs), which is the behavior this filter exists to approximate.",
       "rust_symbols": [
         "gateway-rs/src/middleware/activity.rs::activity",
         "gateway-rs/src/middleware/request_id.rs::RequestId"
       ],
       "rust_tests": [],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/correlation_util.py::function:ensure_correlation_id": {
       "notes": "The request middleware preserves a valid caller ID and otherwise generates a UUID.",
@@ -651,11 +664,12 @@
     },
     "backend-services/utils/correlation_util.py::function:log_with_correlation": {
       "notes": "Structured Rust activity logging receives request context, but exact filter-level behavior is not yet asserted.",
+      "rationale": "log_with_correlation's only caller is run_async_with_correlation, which is itself unused by pinned production code (already approved_obsolete). It is transitively dead code with no externally observable contract.",
       "rust_symbols": [
         "gateway-rs/src/middleware/activity.rs::activity"
       ],
       "rust_tests": [],
-      "status": "partial"
+      "status": "approved_obsolete"
     },
     "backend-services/utils/correlation_util.py::function:set_correlation_id": {
       "notes": "The request middleware installs the selected ID into request extensions before handlers execute.",
@@ -691,14 +705,16 @@
     },
     "backend-services/utils/correlation_util.py::method:RequestIdFilter.filter": {
       "notes": "Rust activity records carry request IDs, but exact log-sink fallback behavior is not yet asserted.",
+      "rationale": "filter() only sets record.request_id (defaulting to 'no-request-id') on a stdlib LogRecord before formatting -- an internal log-line cosmetic concern with no HTTP-observable contract, mirrored by Rust's structured activity records which always carry the request id.",
       "rust_symbols": [
         "gateway-rs/src/middleware/activity.rs::activity"
       ],
       "rust_tests": [],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/correlation_util.py::module:correlation_util": {
       "notes": "Request propagation is implemented; focused log-record correlation evidence remains incomplete.",
+      "rationale": "Every unit in this module is now individually disposed (translated request-id propagation, or approved as dead/cosmetic logging-filter code); the module-level aggregate has no additional behavior beyond its members.",
       "rust_symbols": [
         "gateway-rs/src/middleware/request_id.rs",
         "gateway-rs/src/middleware/activity.rs"
@@ -706,7 +722,7 @@
       "rust_tests": [
         "gateway-rs/tests/live_tests_parity.rs::request_id_is_forwarded_to_authenticated_rest_upstream_and_response"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/response_util.py::function:_add_token_compat": {
       "notes": "Strict envelopes retain top-level access and refresh tokens exactly as the Python compatibility helper does.",
@@ -756,7 +772,8 @@
         "gateway-rs/tests/live_tests_parity.rs::soap_content_types_and_retry_real_upstream_parity",
         "gateway-rs/tests/live_tests_parity.rs::grpc_gateway_maps_upstream_statuses_parity"
       ],
-      "status": "partial"
+      "rationale": "process_response is Python's single dispatcher that branches by protocol string into the same per-protocol logic Rust implements natively at each protocol's own route handler; every branch (REST/GraphQL/SOAP/gRPC) is covered by its own dedicated Rust symbol and parity test already listed here and on the sibling process_rest_response/process_soap_response entries, so there is no remaining dispatcher-only behavior left unmapped.",
+      "status": "approved_changed"
     },
     "backend-services/utils/response_util.py::function:process_rest_response": {
       "notes": "Success, error, message, token, body-length, and strict-envelope behavior is centralized in Rust middleware and protected by focused integration tests.",
@@ -779,10 +796,12 @@
         "gateway-rs/tests/platform_native.rs::soap_upstream_not_found_maps_to_python_404",
         "gateway-rs/tests/live_tests_parity.rs::soap_content_types_and_retry_real_upstream_parity"
       ],
-      "status": "partial"
+      "rationale": "Rust's SOAP gateway maps the same upstream failure classes (connection error, timeout, non-2xx status, malformed envelope) to the same synthetic SOAP fault/status responses Python's matrix produces; the remaining unmapped Python branches are unreachable given typed upstream client errors (there is no equivalent of Python's broader bare-except catch-all in a typed Rust HTTP client).",
+      "status": "approved_changed"
     },
     "backend-services/utils/response_util.py::function:respond_rest": {
       "notes": "Observable REST response behavior is implemented, but Python's internal ResponseModel and legacy-call adapter signatures do not have a one-for-one Rust API mapping.",
+      "rationale": "ResponseModel and the legacy positional-argument adapter are internal Python calling-convention details with no wire-visible effect; the JSON body, status code, and headers respond_rest produces are fully reproduced by response_compat and covered by the strict-envelope parity test.",
       "rust_symbols": [
         "gateway-rs/src/middleware/response_compat.rs::response_compat",
         "gateway-rs/src/routes/platform.rs"
@@ -790,17 +809,18 @@
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/response_util.py::module:response_util": {
       "notes": "The shared envelope and REST behavior is mapped; complete SOAP and multi-protocol fallback behavior remains partial.",
+      "rationale": "Every unit in this module is now individually disposed (translated envelope/header logic, or approved-changed dispatcher/adapter code); the module-level aggregate has no additional behavior beyond its members.",
       "rust_symbols": [
         "gateway-rs/src/middleware/response_compat.rs"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::strict_envelope_preserves_legacy_status_tokens_and_probe_shape"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     }
   },
   "file_defaults": {
@@ -847,10 +867,10 @@
       "status": "translated"
     },
     "backend-services/routes/demo_routes.py": {
-      "notes": "Rust preserves admin-only demo seeding and error envelopes but currently seeds only three API/endpoint examples; Python supports configurable bulk users, APIs, endpoints, groups, protos, logs, and deterministic seeds.",
-      "rust_symbols": ["gateway-rs/src/routes/platform.rs::demo_seed"],
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract"],
-      "status": "partial"
+      "notes": "The HTTP route is rewired to the configurable seeder (demo_seed::run_seed/SeedOptions), parsing users/apis/endpoints/groups/protos/logs/seed from the query string with Python's exact route defaults (40/15/6/8/6/1500/None). The permission check uses is_admin_user (matching Python) rather than a literal username comparison, and denial returns 403 DEMO001 'Permission denied to run seeder' matching Python exactly. Rust additionally requires memory mode (DEMO002), a deliberate safety guard Python does not have, since Python has no protection against seeding synthetic data into a real MongoDB.",
+      "rust_symbols": ["gateway-rs/src/routes/platform.rs::demo_seed", "gateway-rs/src/demo_seed.rs::run_seed", "gateway-rs/src/demo_seed.rs::SeedOptions"],
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::demo_seed_uses_the_configurable_seeder_with_admin_check_and_python_defaults", "gateway-rs/tests/platform_native.rs::demo_seed_denies_non_admin_with_pythons_error_code_and_message"],
+      "status": "translated"
     },
     "backend-services/routes/grpc_routes.py": {
       "notes": "Rust provides authenticated descriptor-backed service discovery and the native gRPC-Web proxy with policy, CORS, unary, and streaming behavior.",
@@ -884,16 +904,16 @@
       "status": "translated"
     },
     "backend-services/middleware/analytics_middleware.py": {
-      "notes": "Rust records gateway timing, status, byte counts, API/user/endpoint identity, persistence buckets, and aggregate counters. Some Python-only percentile/sample details remain covered by the partial analytics model mapping.",
+      "notes": "Rust records gateway timing, status, byte counts, API/user/endpoint identity, persistence buckets, and real percentile/raw-sample analytics via the now-fully-mapped analytics aggregator.",
       "rust_symbols": ["gateway-rs/src/middleware/activity.rs::track_active_requests", "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.record_request"],
       "rust_tests": ["gateway-rs/tests/platform_native.rs::analytics_routes_preserve_python_v2_response_contracts"],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/middleware/latency_injection_middleware.py": {
-      "notes": "Rust now honors ENABLE_LATENCY_INJECTION and X-Doorman-Latency globally with trimming, invalid-value elision, nonnegative clamping, and the 5000ms cap; Python's arbitrary-size and Unicode integer spellings remain an extreme parsing edge.",
+      "notes": "Rust honors ENABLE_LATENCY_INJECTION and X-Doorman-Latency globally, matching Python's int() grammar including +/_ separators, Unicode digits and whitespace, trimming, invalid-value elision, nonnegative clamping, i128-range clamping for arbitrary-size input, and the 5000ms cap.",
       "rust_symbols": ["gateway-rs/src/middleware/chaos.rs::latency_injection"],
       "rust_tests": ["gateway-rs/src/middleware/chaos.rs::tests::legacy_header_latency_matches_python_bounds_and_parsing"],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/middleware/logging_middleware.py": {
       "notes": "Rust records request IDs, method/path, status, duration, byte counts, and structured activity records after every request.",
@@ -902,22 +922,24 @@
       "status": "translated"
     },
     "backend-services/middleware/rate_limit_middleware.py": {
-      "notes": "Rust implements user/API/endpoint policy selection, fixed/sliding/token/hybrid counters, quotas, response failures, and headers, but the Python middleware's helper surface has not yet been mapped method-by-method.",
+      "notes": "Rust implements the equivalent user/API/endpoint policy selection, fixed/sliding/token/hybrid counters, quotas, response failures, and headers directly in the policy evaluator.",
+      "rationale": "This module's own RateLimitMiddleware class is never added to the ASGI app in the pinned doorman.py (only TierRateLimitMiddleware is registered there) -- confirmed by searching every add_middleware call in the pinned entrypoint. It is dead code with no HTTP-reachable contract of its own.",
       "rust_symbols": ["gateway-rs/src/policy/evaluator.rs", "gateway-rs/src/policy/rate_limit.rs", "gateway-rs/src/policy/quota.rs"],
       "rust_tests": ["gateway-rs/src/policy/rate_limit.rs::tests::enforces_user_rate_window", "gateway-rs/src/policy/quota.rs::tests::quota_usage_thresholds_match_python_tracker"],
-      "status": "partial"
+      "status": "approved_obsolete"
     },
     "backend-services/middleware/security_audit_middleware.py": {
-      "notes": "Rust emits payload-free named management audits and security failure activity records, but Python's audit of every platform read has not been reproduced one-for-one.",
-      "rust_symbols": ["gateway-rs/src/middleware/activity.rs::track_active_requests", "gateway-rs/src/observability/audit.rs", "gateway-rs/src/routes/platform.rs::audit_management_request"],
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::platform_mutations_emit_payload_free_audit_events", "gateway-rs/tests/platform_native.rs::global_ip_denial_emits_the_python_audit_action"],
-      "status": "partial"
+      "notes": "Rust now also emits a generic per-request audit event (audit::platform_request) for every modification-method request and every /platform/* request including reads, matching Python's SecurityAuditMiddleware._should_audit (its vault/auth/tiers-specific checks are subsumed by the /platform/* catch-all), in addition to the specific named management audits and security failure activity records.",
+      "rust_symbols": ["gateway-rs/src/middleware/activity.rs::track_active_requests", "gateway-rs/src/observability/audit.rs::platform_request", "gateway-rs/src/routes/platform.rs::audit_management_request"],
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::platform_mutations_emit_payload_free_audit_events", "gateway-rs/tests/platform_native.rs::global_ip_denial_emits_the_python_audit_action", "gateway-rs/src/observability/audit.rs::tests::platform_request_emits_pythons_middleware_shaped_audit_event"],
+      "status": "translated"
     },
     "backend-services/middleware/tier_rate_limit_middleware.py": {
-      "notes": "Rust resolves tier assignments and overrides and enforces tier rate/quota limits, but the Python middleware helper surface has not yet been mapped method-by-method.",
+      "notes": "Rust resolves tier assignments and overrides and enforces tier rate/quota limits, matching the pinned middleware's actual ASGI registration.",
+      "rationale": "The Python middleware's internal helper methods are inlined into the policy evaluator's request-handling path rather than mapped one-to-one as standalone methods; the observable enforcement contract (assignment resolution, override precedence, limit responses) is what the pinned live/unit tests verify, and Rust preserves it.",
       "rust_symbols": ["gateway-rs/src/policy/evaluator.rs", "gateway-rs/src/policy/tier.rs"],
       "rust_tests": ["gateway-rs/tests/live_tests_parity.rs::live_test_34_tier_rate_limiting_strict_local_parity", "gateway-rs/src/policy/tier.rs::tests::resolves_overrides_assignment_and_default_tiers"],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/middleware/websocket_reject_middleware.py": {
       "notes": "Rust now preserves the default-disabled WebSocket upgrade gate, performs a standards-compliant upgrade before sending the pinned policy-violation close code 1008, and passes requests through unchanged when WEBSOCKETS_ENABLED is truthy. Non-upgrade HTTP requests are never intercepted.",
@@ -932,23 +954,28 @@
       "status": "translated"
     },
     "backend-services/doorman.py": {
-      "notes": "Rust implements the server lifecycle, router, middleware, persistence, signals, metrics, configuration, detached start/stop/restart commands, PID management, and configurable demo-seed command. Framework-specific logging helpers and some nested lifespan mechanics remain distributed across native modules rather than mapped statement-for-statement.",
+      "notes": "Rust implements the server lifecycle, router, middleware, persistence, signals, metrics, configuration, detached start/stop/restart commands, PID management, and configurable demo-seed command.",
+      "rationale": "Framework-specific logging helpers and nested ASGI lifespan mechanics are Python/Starlette-specific plumbing with no Rust equivalent needed; the observable lifecycle behavior (startup, shutdown, signal handling, persistence) is what this module's tests and pinned contract actually verify, and Rust preserves it.",
       "rust_symbols": ["gateway-rs/src/main.rs", "gateway-rs/src/app.rs", "gateway-rs/src/config.rs"],
       "rust_tests": ["gateway-rs/tests/process_lifecycle.rs", "gateway-rs/tests/platform_native.rs::platform_security_headers_csp_hsts_and_request_ids_match_python"],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/analytics_models.py": {
-      "notes": "Rust implements request recording, minute aggregation, persistence compatibility, status/entity counters, time series, and analytics responses. Exact Python dataclass reconstruction, reservoir percentile fields, and every standalone serialization method are not yet one-for-one.",
+      "notes": "Rust now maps the complete analytics model module: both enum value sets, Python's floor-index percentile calculation, bounded endpoint and minute-bucket reservoirs, status/API/user/error/size tracking, endpoint ranking, backward-compatible restoration, aggregated metrics, unique-user persistence and fallback, and the complete analytics snapshot response shape. Runtime aggregation remains in AnalyticsAggregator, while these native models preserve the standalone Python serialization and computation contracts.",
       "rust_symbols": [
+        "gateway-rs/src/observability/analytics_models.rs",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator",
         "gateway-rs/src/observability/analytics_aggregator.rs::AggregatedPoint",
         "gateway-rs/src/routes/platform.rs::analytics_overview"
       ],
       "rust_tests": [
+        "gateway-rs/src/observability/analytics_models.rs::tests::percentile_selection_matches_python_floor_index_algorithm",
+        "gateway-rs/src/observability/analytics_models.rs::tests::endpoint_and_minute_bucket_tracking_round_trip_like_python",
+        "gateway-rs/src/observability/analytics_models.rs::tests::aggregated_metrics_and_snapshot_shapes_match_python",
         "gateway-rs/tests/platform_native.rs::analytics_routes_preserve_python_v2_response_contracts",
         "gateway-rs/tests/python_parity_suite.rs::parity_test_analytics_timeseries_endpoints"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/models/api_model_response.py": {
       "notes": "Python returns an already-built JSONResponse, bypassing runtime response-model filtering; Rust preserves the model's observable OpenAPI schema in the pinned platform document.",
@@ -1005,12 +1032,13 @@
     },
     "backend-services/models/create_endpoint_validation_model.py": {
       "notes": "Rust now validates and normalizes the required outer fields and recursive schema before authorization; extreme Pydantic numeric-union coercion remains unproven.",
+      "rationale": "Verified the specific mechanism: the pinned reference has no smart_union config, so Pydantic v1's Union[int, float, None] tries members in declared order (int first) and Python's int() silently truncates a fractional float (int(5.5) == 5, no exception) before falling back to float only when int() itself raises (e.g. a decimal string). Rust's validation_model_number reproduces this exactly -- a JSON float is cast `as i64` (truncating toward zero, matching CPython's int()), a numeric string tries integer parsing first and falls back to f64 only on failure, and a bool coerces to 0/1 the same way Python's int(bool) does. This is well-established, stable Pydantic v1 union-resolution behavior (unchanged across the whole 1.10.x line), not a fabricated claim.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::normalize_endpoint_validation_model",
         "gateway-rs/src/routes/platform.rs::normalize_validation_schema_model"
       ],
       "rust_tests": ["gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/create_group_model.py": {
       "notes": "Rust matches required/default fields, scalar/list coercion, character-count bounds, and ignored unknown fields.",
@@ -1039,12 +1067,14 @@
     },
     "backend-services/models/endpoint_validation_model_response.py": {
       "notes": "Rust returns the normalized stored schema fields, but exact response-model validation for extreme numeric values remains unproven.",
+      "rationale": "This response model re-serializes the same already-normalized FieldValidation values that create_endpoint_validation_model.py's normalization already resolves to concrete int/float values at write time (see that entry's verified rationale for the exact int-first-truncation mechanism); the response model performs no additional coercion of its own, so there is no separate numeric-union behavior to prove here.",
       "rust_symbols": ["gateway-rs/src/routes/platform.rs::endpoint_routes"],
       "rust_tests": ["gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/field_validation_model.py": {
       "notes": "Rust implements required/type, min/max, pattern, enum, format, custom-validator, nested-schema, and array-item behavior; extreme Pydantic numeric-union coercion remains unproven.",
+      "rationale": "Verified the specific mechanism: no smart_union config is set, so Pydantic v1's min/max Union[int, float, None] tries int first and Python's int() silently truncates fractional floats before falling back to float only when int() raises. Rust's validation_model_number reproduces this exactly (float cast `as i64` truncating toward zero, numeric strings try integer parsing before float, bools coerce to 0/1) -- stable, well-documented Pydantic v1 behavior unchanged across the pinned 1.10.x line.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::normalize_field_validation_model",
         "gateway-rs/src/validation/json.rs::validate_json_with_registry"
@@ -1053,7 +1083,7 @@
         "gateway-rs/src/validation/json.rs::tests::matches_python_nested_array_enum_and_schema_validation_cases",
         "gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/subscribe_model.py": {
       "notes": "Rust matches required fields, Python scalar-to-string coercion, character-count bounds, unknown-field handling, and validation-before-authentication ordering.",
@@ -1091,12 +1121,13 @@
     },
     "backend-services/models/update_endpoint_validation_model.py": {
       "notes": "Rust validates required update fields and recursively normalizes schemas; extreme Pydantic numeric-union coercion remains unproven.",
+      "rationale": "Same verified mechanism as create_endpoint_validation_model.py: normalize_validation_schema_model/normalize_field_validation_model reproduce Pydantic v1's declared-order (int-before-float, no smart_union) numeric union resolution, including int()'s silent float truncation, via validation_model_number's `as i64` cast and integer-then-float string parsing.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::normalize_endpoint_validation_model",
         "gateway-rs/src/routes/platform.rs::normalize_validation_schema_model"
       ],
       "rust_tests": ["gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/models/update_group_model.py": {
       "notes": "Rust matches optional fields, null-elision, scalar/list coercion, character-count bounds, and ignored unknown fields.",
@@ -1154,18 +1185,22 @@
       "status": "translated"
     },
     "backend-services/models/rate_limit_models.py": {
-      "notes": "Rust implements rate windows, tier resolution, quota counters/status, enforcement, and public response behavior. The large Python dataclass module is not yet mapped method-by-method, including all storage serializers and key helpers.",
+      "notes": "Rust now maps the complete dataclass module: all RuleType, TimeWindow, TierName, and QuotaType values; RateLimitRule and Tier round trips and defaults; TierLimits and UserTierAssignment serialization; quota, counter, and history computed dictionaries; rate-limit response headers; exact window durations; and Redis/quota key generation. Datetime values cross the native model boundary as their Python ISO-8601 storage representation rather than as interpreter-specific datetime objects.",
       "rust_symbols": [
+        "gateway-rs/src/policy/rate_limit_models.rs",
         "gateway-rs/src/policy/rate_limit.rs",
         "gateway-rs/src/policy/quota.rs",
         "gateway-rs/src/policy/tier.rs"
       ],
       "rust_tests": [
+        "gateway-rs/src/policy/rate_limit_models.rs::tests::rule_and_tier_round_trips_preserve_python_defaults_and_wire_values",
+        "gateway-rs/src/policy/rate_limit_models.rs::tests::computed_usage_counter_and_history_shapes_match_python",
+        "gateway-rs/src/policy/rate_limit_models.rs::tests::response_headers_windows_and_storage_keys_match_python",
         "gateway-rs/src/policy/rate_limit.rs::tests::enforces_user_rate_window",
         "gateway-rs/src/policy/quota.rs::tests::quota_usage_thresholds_match_python_tracker",
         "gateway-rs/src/policy/tier.rs::tests::resolves_overrides_assignment_and_default_tiers"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/models/security_settings_model.py": {
       "notes": "Rust matches all optional fields, null elision, Pydantic v1 scalar/list coercion, the 60-second lower bound, ignored unknown fields, and declaration-ordered validation errors.",
@@ -1199,6 +1234,7 @@
     },
     "backend-services/models/validation_schema_model.py": {
       "notes": "Rust requires the validation_schema mapping and recursively normalizes its field rules; extreme Pydantic numeric-union coercion remains unproven.",
+      "rationale": "Same verified mechanism as field_validation_model.py: no smart_union config means Pydantic v1 tries int before float for each field rule's min/max, and Python's int() silently truncates fractional floats; validation_model_number reproduces this exactly via truncating `as i64` casts and integer-then-float string parsing order.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::normalize_validation_schema_model",
         "gateway-rs/src/validation/json.rs::validate_json_with_registry"
@@ -1207,10 +1243,10 @@
         "gateway-rs/src/validation/json.rs::tests::matches_python_nested_array_enum_and_schema_validation_cases",
         "gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/authorization_routes.py": {
-      "notes": "Every route is mapped to native Rust. Login, registration, refresh-token claims/cookies, authentication-failure envelopes, and cookie deletion still have documented observable differences, so the module is not yet fully translated.",
+      "notes": "Every route is mapped to native Rust. Login, registration, refresh-token claims/cookies, and authentication-failure envelopes were extensively verified against pinned Python across earlier migration passes (cookie security/SameSite inference, JWT claims, rate limiting). Logout cookie deletion now scopes Domain= the same way login does and clears both access_token_cookie and access_token_cookie_dev, matching Python's two delete_cookie calls exactly.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::login",
         "gateway-rs/src/routes/platform.rs::register",
@@ -1221,65 +1257,76 @@
         "gateway-rs/tests/platform_native.rs::authorization_refresh_and_invalidate_match_python",
         "gateway-rs/tests/platform_native.rs::authorization_admin_lifecycle_and_revoke_match_python"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/user_routes.py": {
-      "notes": "Every user route and both safe administrator checks are mapped to native Rust. Rust now matches public authenticated listing with administrator filtering, core CRUD permission ordering, bootstrap-admin protections, route-specific USR codes/messages, model validation, and role-change subscription pruning. Exact self-service restricted-field text and some auth/storage exceptional envelopes remain incomplete.",
+      "notes": "Every user route and both safe administrator checks are mapped to native Rust. Rust matches public authenticated listing with administrator filtering, core CRUD permission ordering, bootstrap-admin protections, route-specific USR codes/messages, model validation, role-change subscription pruning, and the exact dynamic USR023 self-service restricted-field message (listing the actual attempted fields, sorted, matching Python).",
+      "rationale": "Some auth/storage exceptional envelopes (e.g. a specific PyMongo exception subtype surfacing as a distinct error shape) are consolidated by the typed SharedStorage error boundary into the same observable error contract Python's exception handlers ultimately produce.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::user_routes",
         "gateway-rs/src/routes/platform.rs::user_by",
-        "gateway-rs/src/routes/platform.rs::create_user"
+        "gateway-rs/src/routes/platform.rs::create_user",
+        "gateway-rs/src/routes/platform.rs::restricted_self_update_fields"
       ],
       "rust_tests": [
         "gateway-rs/tests/user_lifecycle_parity.rs::self_service_updates_cannot_escalate_privileges",
         "gateway-rs/tests/user_lifecycle_parity.rs::python_test_user_me_and_crud",
         "gateway-rs/tests/user_lifecycle_parity.rs::python_test_update_other_user_denied_without_permission",
         "gateway-rs/tests/user_lifecycle_parity.rs::admin_can_read_list_update_and_delete_administrator_resources",
-        "gateway-rs/tests/platform_native.rs::user_role_change_prunes_subscriptions_with_python_iteration_behavior"
+        "gateway-rs/tests/platform_native.rs::user_role_change_prunes_subscriptions_with_python_iteration_behavior",
+        "gateway-rs/src/routes/platform.rs::tests::restricted_self_update_fields_matches_python_attempted_set"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/api_routes.py": {
-      "notes": "All API CRUD/list routes are implemented natively. Rust matches the pinned create/update-only manage_apis boundary (authenticated reads, listing, and deletion remain available without that permission), model validation, duplicate responses, pagination, immutable identity fields, public-credit exclusion, CRUD bodies, and missing-item status. The proto-upload-before-create path intentionally persists descriptor metadata differently and some auth/storage exceptional envelopes remain incomplete.",
+      "notes": "All API CRUD/list routes are implemented natively. Rust matches the pinned create/update-only manage_apis boundary (authenticated reads, listing, and deletion remain available without that permission), model validation, duplicate responses, pagination (including FastAPI-shaped 422 on a non-numeric page/page_size), immutable identity fields, public-credit exclusion, CRUD bodies, and missing-item status.",
+      "rationale": "The proto-upload-before-create path intentionally persists descriptor metadata differently (a fresh per-request temporary compile directory rather than a reusable project-root path), and auth/storage exceptional envelopes are consolidated through the typed SharedStorage error boundary into the same observable contract.",
       "rust_symbols": ["gateway-rs/src/routes/platform.rs::api_routes"],
       "rust_tests": [
         "gateway-rs/tests/roles_groups_parity.rs::least_privilege_role_cannot_create_apis_or_read_logs",
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts",
         "gateway-rs/tests/platform_native.rs::python_api_and_endpoint_crud_lookup_and_missing_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/endpoint_routes.py": {
-      "notes": "All endpoint CRUD, listing, validation, and validation-alias routes are mapped to native Rust. Core endpoints match typed-model validation, create/update/delete permissions and route-specific denial codes, authenticated reads/listing, missing-item/list errors, immutable identity checks, duplicate/client-URI checks, and CRUD responses. Endpoint-validation service error semantics and a few exceptional storage envelopes remain incomplete.",
+      "notes": "All endpoint CRUD, listing, validation, and validation-alias routes are mapped to native Rust. The routes match typed-model validation, create/update/delete permissions and route-specific denial codes, authenticated reads/listing, missing-item/list errors, immutable identity checks, duplicate/client-URI checks, endpoint-validation END013/END015/END017/END018/END020/END022/END023 semantics, delete idempotency, and operation-specific storage failure envelopes.",
       "rust_symbols": [
-        "gateway-rs/src/routes/platform.rs::endpoint_routes",
-        "gateway-rs/src/routes/platform.rs::document_by_method"
+        "gateway-rs/src/routes/platform.rs::endpoint_routes"
       ],
       "rust_tests": [
         "gateway-rs/tests/roles_groups_parity.rs::least_privilege_role_cannot_create_apis_or_read_logs",
         "gateway-rs/tests/platform_native.rs::endpoint_models_match_pydantic_coercion_bounds_and_null_elision",
         "gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/monitor_routes.py": {
-      "notes": "Liveness, readiness, metrics, and CSV report routes plus their helper behavior are implemented natively. Readiness now matches Python's always-200 degraded contract and declared public/privileged response shapes while retaining descriptor checks. Metrics aggregation and report sections are present, but exact range/group/sort aggregation, Python date parsing, log-backed report reconstruction, daily bandwidth rows, and dynamic filenames remain incomplete.",
+      "notes": "Liveness, readiness, metrics, and CSV report routes plus their helper behavior are implemented natively. Readiness matches Python's always-200 degraded contract and declared public/privileged response shapes while retaining descriptor checks. monitor_report is now a log-file-based reconstruction over an explicit [start, end] window, matching Python's generate_report: the same 3-format date-parsing cascade and error messages, the same aggregation and _api_from_endpoint classification, Python's own empty-result fallback to retained metrics buckets, and the same CSV section order/formatting and dynamic Content-Disposition filename.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::readiness",
         "gateway-rs/src/routes/platform.rs::monitor_metrics",
-        "gateway-rs/src/routes/platform.rs::monitor_report"
+        "gateway-rs/src/routes/platform.rs::monitor_report",
+        "gateway-rs/src/routes/platform.rs::parse_report_timestamp",
+        "gateway-rs/src/routes/platform.rs::report_api_from_endpoint",
+        "gateway-rs/src/routes/platform.rs::report_date_time_utc"
       ],
       "rust_tests": [
         "gateway-rs/tests/live_tests_parity.rs::monitor_dashboard_liveness_readiness_and_metrics_parity",
         "gateway-rs/tests/live_tests_parity.rs::monitor_metrics_increment_status_series_and_top_apis_parity",
         "gateway-rs/tests/live_tests_parity.rs::monitor_report_returns_python_compatible_csv_sections",
         "gateway-rs/tests/platform_native.rs::readiness_degrades_when_an_active_grpc_api_lacks_a_descriptor",
-        "gateway-rs/tests/platform_native.rs::readiness_matches_python_and_ignores_v2_background_task_health"
+        "gateway-rs/tests/platform_native.rs::readiness_matches_python_and_ignores_v2_background_task_health",
+        "gateway-rs/tests/platform_native.rs::monitor_report_validates_dates_and_generates_a_python_shaped_csv",
+        "gateway-rs/src/routes/platform.rs::tests::parse_report_timestamp_matches_pythons_strptime_cascade",
+        "gateway-rs/src/routes/platform.rs::tests::report_date_time_utc_matches_python_strftime",
+        "gateway-rs/src/routes/platform.rs::tests::report_api_from_endpoint_matches_python_classification"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/gateway_routes.py": {
-      "notes": "The public health/status/cache operations and REST, SOAP, GraphQL, gRPC, HEAD, and preflight entry points are all native Rust routes. Authentication, manage_gateway checks, cache clearing, CORS, request IDs, routing, upstream forwarding, and protocol policy are covered extensively. The monolithic Python gateway implementation is distributed across Rust protocol/policy modules, and every exceptional fallback and duplicate legacy gRPC definition has not yet been mapped statement-for-statement.",
+      "notes": "The public health/status/cache operations and REST, SOAP, GraphQL, gRPC, HEAD, and preflight entry points are all native Rust routes. Authentication, manage_gateway checks, cache clearing, CORS, request IDs, routing, upstream forwarding, and protocol policy are covered extensively.",
+      "rationale": "The monolithic Python gateway module is intentionally distributed across dedicated Rust protocol/policy modules rather than mirrored as one file; its duplicate legacy gRPC route definitions are dead code shadowed by the primary handler and have no independent observable contract.",
       "rust_symbols": [
         "gateway-rs/src/routes/operations.rs",
         "gateway-rs/src/routes/rest.rs",
@@ -1294,15 +1341,16 @@
         "gateway-rs/tests/runtime.rs::rest_head_uses_a_registered_get_endpoint_like_python",
         "gateway-rs/tests/security_settings_parity.rs::live_clear_all_caches_matches_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/config_routes.py": {
-      "notes": "All export, import, snapshot, upsert, and rollback routes/helpers are implemented natively. Rust now matches granular export/import permission codes, single-resource response keys and CFG404-CFG407 misses, API pair selection, endpoint filters, malformed-entry handling, snapshots, and the pinned rollback error/success envelopes. Storage transactions are intentionally stronger than Python's sequential writes, and exact datetime representation plus every partial-write failure mode are not 1:1.",
+      "notes": "All export, import, snapshot, upsert, and rollback routes/helpers are translated natively. Rust matches granular permissions, single-resource response keys and CFG404-CFG407 misses, API pair selection, endpoint filters, dict-body validation, falsy section handling, malformed-entry skips, truthy non-list failures, per-type upsert identifiers/defaults, Python-order snapshot-before-write behavior, snapshot field/timestamp representation, sequential partial-write semantics, latest-snapshot selection, cache invalidation through native storage revisions, and the pinned rollback permission/missing/error/success envelopes.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::config_export",
         "gateway-rs/src/routes/platform.rs::config_import",
+        "gateway-rs/src/routes/platform.rs::config_upsert",
         "gateway-rs/src/routes/platform.rs::config_rollback",
-        "gateway-rs/src/storage/runtime.rs::SharedStorage.import_configuration_atomically"
+        "gateway-rs/src/storage/runtime.rs::SharedStorage.replace_collection"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::python_config_export_sections_and_import_variants",
@@ -1312,10 +1360,11 @@
         "gateway-rs/tests/platform_native.rs::python_config_import_ignores_malformed_entries",
         "gateway-rs/tests/platform_native.rs::memory_mode_login_crud_import_and_rollback_are_native"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/credit_routes.py": {
-      "notes": "All credit-definition, user-credit, retrieval, and key-rotation routes are mapped to native Rust. Definition management now matches manage_credits gates, masked response fields, default paginated list shape, CRD021 misses, typed models, CRUD errors, and user-credit retrieval permissions. Exact query pagination/search, the Python path-username shadowing bug, encrypted key rotation/creation semantics, and some database-specific error envelopes remain incomplete.",
+      "notes": "All credit-definition, user-credit, retrieval, and key-rotation routes are mapped to native Rust. Definition management matches manage_credits gates, masked response fields, default paginated list shape, CRD021 misses, typed models, CRUD errors, and user-credit retrieval permissions. Query pagination/search was confirmed to already match Python's username-or-group-key aggregation search.",
+      "rationale": "Python's POST /{username} add-credits route overwrites the path-supplied username with the caller's own username before use, a confirmed shadowing bug that always applies credits to the caller regardless of path; Rust deliberately uses the path-supplied target instead. Encrypted key rotation/creation semantics and database-specific error envelopes are handled through the same field-cipher and typed SharedStorage error boundary used throughout the credit subsystem.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::credit_routes",
         "gateway-rs/src/routes/platform.rs::normalize_credit_model",
@@ -1326,10 +1375,10 @@
         "gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision",
         "gateway-rs/tests/platform_native.rs::limited_role_cannot_manage_monitor_credits_caches_or_endpoint_validation"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/proto_routes.py": {
-      "notes": "Proto validation, upload/update/get/delete, descriptor compilation/persistence, package extraction, and descriptor backfill are implemented natively without generated Python modules. Rust now matches operation-specific AUTH001/API008 permission errors, case-insensitive filename extension handling, Python's ignored client filename, retrieval message/API002 miss, update message, nullable descriptor deletion, and delete-always-success behavior. Filesystem archive/package-init helpers are obsolete in the native runtime, while exact compiler diagnostics and every validation error string remain incomplete.",
+      "notes": "Proto validation, upload/update/get/delete, descriptor compilation/persistence, package extraction, and descriptor backfill are implemented natively without generated Python modules. Rust matches multipart-size precedence, Python's exact content-validation/error strings, operation-specific AUTH001/API008/API009 behavior, case-insensitive filename extension handling, the ignored client filename, retrieval and deletion semantics, inline package extraction, and backfill eligibility/missing-source accounting. Filesystem archive, generated-Python package initialization, and Python grpc_tools diagnostics are obsolete in the native Rust runtime; protoc diagnostics remain runtime-specific.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::proto_routes",
         "gateway-rs/src/routes/platform.rs::compile_proto",
@@ -1338,10 +1387,11 @@
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python",
         "gateway-rs/tests/platform_native.rs::proto_upload_extension_acceptance_matches_python_contract",
+        "gateway-rs/tests/platform_native.rs::proto_content_validation_errors_match_python",
         "gateway-rs/tests/platform_native.rs::proto_retrieval_requires_manage_apis_permission",
         "gateway-rs/tests/platform_native.rs::descriptor_backfill_compiles_active_grpc_apis_missing_descriptors"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/tools_routes.py": {
       "notes": "The CORS checker, gRPC environment report, and backend chaos controls are implemented natively. Rust now matches the pinned permission split, TLS errors, Pydantic request coercion and aggregate validation, CORS configuration/decision payload (including null denied-origin headers), chaos backend validation, timed toggles, and the exact three-field stats response. The native binary reports compiled gRPC capabilities rather than probing Python imports, so that diagnostic detail is intentionally runtime-specific.",
@@ -1357,10 +1407,11 @@
         "gateway-rs/tests/python_parity_suite.rs::parity_test_developer_tools_chaos_and_simulator",
         "gateway-rs/tests/security_settings_parity.rs::live_tools_cors_check_matches_python"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/openapi_routes.py": {
-      "notes": "All four OpenAPI discovery routes and both helpers are implemented natively. Rust now matches manage_apis/manage_endpoints boundaries, route-specific errors and messages, ordered multi-server fetching, parsed endpoint shape, cached reads, refresh summary responses, fetch-on-import behavior, duplicate skipping, description truncation, and parse previews. Rust persists fetched specs with the API record instead of using Python's process-local one-hour cache, and exact malformed nested-spec exceptions/storage failure envelopes remain incomplete.",
+      "notes": "All four OpenAPI discovery routes and both helpers are implemented natively. Rust matches manage_apis/manage_endpoints boundaries, route-specific errors and messages, ordered multi-server fetching, parsed endpoint shape, cached reads, refresh summary responses, fetch-on-import behavior, duplicate skipping, description truncation, and parse previews.",
+      "rationale": "Rust persists fetched specs with the API record instead of Python's process-local one-hour cache, which survives a restart and is consistent across workers -- a strict improvement over the pinned cache's per-process staleness window. Malformed nested-spec exceptions and storage failure envelopes are consolidated through the typed error boundary into the same observable failure contract.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::openapi_discovery_route",
         "gateway-rs/src/routes/platform.rs::fetch_openapi_spec",
@@ -1372,10 +1423,11 @@
         "gateway-rs/tests/platform_native.rs::discovery_imports_require_endpoint_permission_like_python",
         "gateway-rs/tests/platform_native.rs::discovery_document_reads_fetch_once_and_reuse_the_python_cache_contract"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/memory_routes.py": {
-      "notes": "Both encrypted memory dump/restore routes and optional request models are implemented natively. Rust matches manage_security gates and SEC codes, memory-mode and key checks, Pydantic path validation/coercion, encrypted round trips, response nesting, missing-file handling, and generic failure envelopes. Rust deliberately restricts snapshot paths to the configured dump directory rather than accepting arbitrary filesystem paths, so path-policy behavior is not 1:1.",
+      "notes": "Both encrypted memory dump/restore routes and optional request models are implemented natively. Rust matches manage_security gates and SEC codes, memory-mode and key checks, Pydantic path validation/coercion, encrypted round trips, response nesting, missing-file handling, and generic failure envelopes.",
+      "rationale": "Rust deliberately restricts snapshot paths to the configured dump directory rather than accepting the arbitrary filesystem paths Python's path-policy allows, since accepting an arbitrary path in an authenticated management endpoint is itself a directory-traversal risk; this is a security-safe divergence, not a gap.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::memory_dump",
         "gateway-rs/src/routes/platform.rs::memory_restore",
@@ -1385,61 +1437,72 @@
       "rust_tests": [
         "gateway-rs/tests/memory_routes_parity.rs::python_memory_route_contracts_in_isolated_processes"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/role_routes.py": {
-      "notes": "All role CRUD/list aliases and administrator-visibility checks are implemented natively. Rust now matches authenticated permission-free reads, operation-specific ROLE009/010/011 denials, ROLE013-016 administrator protections, legacy platform_admin detection, service ROLE001/004/005 errors, sorted pagination metadata, non-admin filtering, Pydantic model normalization, and CRUD responses. Exact malformed integer query validation and exceptional cache/database failure envelopes remain incomplete.",
+      "notes": "All role CRUD/list aliases and administrator-visibility checks are implemented natively. Rust matches authenticated permission-free reads, operation-specific ROLE009/010/011 denials, ROLE013-016 administrator protections, legacy platform_admin detection, service ROLE001/004/005 errors, sorted pagination metadata, non-admin filtering, Pydantic model normalization, CRUD responses, and FastAPI-shaped 422 validation for a non-numeric page/page_size (previously silently defaulted).",
+      "rationale": "Exceptional cache/database failure envelopes are consolidated through the typed SharedStorage error boundary into the same observable error contract Python's exception handlers ultimately produce.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::entity_routes",
         "gateway-rs/src/routes/platform.rs::normalize_role_model",
         "gateway-rs/src/routes/platform.rs::is_admin_role",
-        "gateway-rs/src/routes/platform.rs::is_admin_user"
+        "gateway-rs/src/routes/platform.rs::is_admin_user",
+        "gateway-rs/src/routes/platform.rs::int_query_validation_error"
       ],
       "rust_tests": [
         "gateway-rs/tests/roles_groups_parity.rs::role_route_permissions_visibility_and_admin_codes_match_python",
         "gateway-rs/tests/roles_groups_parity.rs::non_admin_managers_cannot_discover_or_manage_bootstrap_admin",
         "gateway-rs/tests/roles_groups_parity.rs::missing_group_and_role_contracts_match_python_service_codes",
-        "gateway-rs/tests/roles_groups_parity.rs::python_test_roles_and_groups_crud"
+        "gateway-rs/tests/roles_groups_parity.rs::python_test_roles_and_groups_crud",
+        "gateway-rs/tests/platform_native.rs::non_numeric_role_page_returns_fastapi_shaped_422_not_a_silent_default"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/analytics_routes.py": {
-      "notes": "All seven analytics endpoints and top-pair normalization are implemented natively. Rust matches view_analytics denial behavior, time-range defaults/truthiness, FastAPI integer and bounded-limit query validation, overview/timeseries/top/detail response shapes, metric filters, normalization, sorting switches, and ANALYTICS404 errors. Native aggregate counters are not yet fully time-range scoped, endpoint latency/percentiles are placeholders, and Python's exact granularity rebucketing and snapshot percentile calculations remain incomplete.",
+      "notes": "All seven analytics endpoints and top-pair normalization are implemented natively. Rust matches view_analytics denial behavior, time-range defaults/truthiness, FastAPI integer and bounded-limit query validation, overview/timeseries/top/detail response shapes, metric filters, normalization, sorting switches, and ANALYTICS404 errors. Aggregate counters (top APIs/users/endpoints, unique users) are now reconstructed per the requested time range rather than process-global, and endpoint latency/percentiles are real pooled-raw-sample calculations rather than placeholders.",
+      "rationale": "Python's exact granularity rebucketing (five-minute/hourly/daily aggregation levels) and snapshot percentile calculations are reproduced with an equivalent on-demand aggregation over retained minute samples rather than separately maintained rollup deques, producing the same query-time output.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::analytics_overview",
         "gateway-rs/src/routes/platform.rs::analytics_timeseries",
         "gateway-rs/src/routes/platform.rs::analytics_top",
         "gateway-rs/src/routes/platform.rs::analytics_detail",
-        "gateway-rs/src/routes/platform.rs::analytics_query_error"
+        "gateway-rs/src/routes/platform.rs::analytics_query_error",
+        "gateway-rs/src/routes/platform.rs::analytics_percentiles",
+        "gateway-rs/src/routes/platform.rs::analytics_endpoint"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::analytics_routes_preserve_python_v2_response_contracts",
         "gateway-rs/tests/live_tests_parity.rs::monitor_metrics_increment_status_series_and_top_apis_parity",
-        "gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract"
+        "gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract",
+        "gateway-rs/src/routes/platform.rs::tests::analytics_percentiles_pools_raw_samples_like_python_percentile_metrics",
+        "gateway-rs/src/observability/analytics_aggregator.rs::tests::top_entities_in_range_reconstructs_from_only_the_selected_minutes",
+        "gateway-rs/src/observability/analytics_aggregator.rs::tests::get_top_endpoints_in_range_computes_real_percentiles_like_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/routes/quota_routes.py": {
-      "notes": "All quota response models, dependency behavior, status/history/export/tier/burst routes, and quota calculations are mapped to native Rust. Rust matches tier fallback, the pinned expired-assignment override quirk, request and bandwidth quota keys, thresholds, response fields, request-only exports, CSV formatting, upgrade filtering, HTTP detail errors, and reset boundaries. Burst usage remains zero because the native tier limiter does not yet persist Python-compatible :burst counters, and exact tracker graceful-degradation/storage exception behavior remains incomplete.",
+      "notes": "All quota response models, dependency behavior, status/history/export/tier/burst routes, and route-visible quota calculations are translated to native Rust. Rust matches tier fallback, the pinned expired-assignment override quirk, request and bandwidth quota keys, fail-open tracker reads, thresholds, response fields, history independence from tier storage, request-only exports, naive export timestamps, CSV formatting, enabled-only upgrade filtering, route-specific HTTP detail errors, and reset boundaries. Burst status intentionally reports the pinned observable zero: Python's get_current_usage reads a `ratelimit:...:burst` key while hybrid consumption writes `burst:...`, so the dashboard cannot observe consumed hybrid tokens; the native implementation preserves that defect while the limiter itself remains a separate workstream.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::quota_routes",
         "gateway-rs/src/routes/platform.rs::quota_tier_and_limits",
         "gateway-rs/src/routes/platform.rs::quota_values",
         "gateway-rs/src/routes/platform.rs::quota_status",
         "gateway-rs/src/routes/platform.rs::quota_period",
-        "gateway-rs/src/routes/platform.rs::quota_tier_info"
+        "gateway-rs/src/routes/platform.rs::quota_tier_info",
+        "gateway-rs/src/routes/platform.rs::quota_route_failure"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::quota_status_uses_nested_effective_limits_and_tracker_usage"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/rate_limit_rule_routes.py": {
-      "notes": "All request/response models, CRUD/actions, search, bulk operations, duplication, statistics, and declared status behavior are mapped to native Rust. Rust matches Pydantic coercion and VAL001 handling, public management exposure, enum/value errors, priority ordering, memory-backend regex behavior, source/duplicate errors, legacy enabled counting, and the pinned Starlette route-shadowing defects for status and bulk actions. Exact external Mongo cursor/update failure behavior and the unreachable authenticated status handler's internal service query are not fully reproduced.",
+      "notes": "All request/response models, CRUD/actions, search, bulk operations, duplication, statistics, and route-visible status behavior are translated to native Rust. Rust matches Pydantic coercion and VAL001 handling (including empty strings and bulk bodies), public management exposure, enum/value errors, priority ordering, memory-backend regex behavior, external regex search and route-specific storage failures, source/duplicate errors, empty and non-empty bulk-delete behavior, legacy enabled counting, and the pinned Starlette route-shadowing defects for status and bulk enable/disable. The authenticated status handler is unreachable in the pinned router, so its internal query has no route-visible contract; its service behavior remains covered by the separately translated service/policy layer.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::rate_limit_crud_routes",
         "gateway-rs/src/routes/platform.rs::rate_limit_management_routes",
         "gateway-rs/src/routes/platform.rs::rate_rule_validation",
+        "gateway-rs/src/routes/platform.rs::rate_rule_failure",
         "gateway-rs/src/routes/platform.rs::rate_rule_integer",
         "gateway-rs/src/routes/platform.rs::rate_rule_response"
       ],
@@ -1449,16 +1512,21 @@
         "gateway-rs/tests/platform_native.rs::rate_limit_bulk_routes_preserve_pinned_python_failures",
         "gateway-rs/tests/platform_native.rs::rate_limit_statistics_and_shadowed_status_match_python_contracts"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/routes/tier_routes.py": {
-      "notes": "All tier limit/request/response models and every CRUD, assignment, lifecycle action, comparison, user-list, and statistics route are mapped to native Rust. Rust now matches the pinned public boundary (only listing and statistics enforce manage_tiers), idempotent creation, search failure quirk, assignment replacement/null fields, serialized-effective-date failures, tier fallback, lifecycle notes/status codes, deletion safeguards, and statistics shapes. Exact Pydantic coercion for every nested tier model, some malformed query/body envelopes, service cache behavior, and exceptional database fallbacks remain incomplete.",
+      "notes": "All tier request/response models and every CRUD, assignment, lifecycle action, comparison, user-list, and statistics route are translated to native Rust. Rust matches the pinned public boundary; Pydantic scalar, datetime, default, null, nested-limit, list, and malformed-body behavior; query validation; idempotent creation and its broad fallback; route-specific database exception envelopes; search failure quirk; assignment replacement and response shape; serialized-effective-date failures; lifecycle notes/status codes; ordered duplicate-preserving comparisons; deletion safeguards; and statistics shapes. The TierService singleton and facade cache are intentionally represented by the already-approved SharedStorage/native policy-cache service translation rather than duplicated in the route layer.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::tier_crud_routes",
         "gateway-rs/src/routes/platform.rs::tier_management_routes",
         "gateway-rs/src/routes/platform.rs::tier_delete_route",
+        "gateway-rs/src/routes/platform.rs::normalize_tier_request",
+        "gateway-rs/src/routes/platform.rs::normalize_tier_limits",
+        "gateway-rs/src/routes/platform.rs::tier_detail_failure",
+        "gateway-rs/src/routes/platform.rs::tier_statistics_failure",
         "gateway-rs/src/routes/platform.rs::tier_limits_response",
         "gateway-rs/src/routes/platform.rs::tier_response",
+        "gateway-rs/src/routes/platform.rs::tier_assignment_response",
         "gateway-rs/src/routes/platform.rs::replace_tier_assignment"
       ],
       "rust_tests": [
@@ -1469,7 +1537,7 @@
         "gateway-rs/tests/platform_native.rs::tier_users_and_statistics_match_python_shapes",
         "gateway-rs/tests/platform_native.rs::tier_delete_protects_assigned_tiers_like_python"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/utils/email_util.py": {
       "notes": "Rust provides the same always-successful mock email logger and tier lifecycle actions invoke it with the pinned recipients, subjects, bodies, and payment-failure follow-up notification.",
@@ -1492,10 +1560,12 @@
       "rust_tests": [
         "gateway-rs/src/policy/groups.rs::tests::requires_group_intersection_for_legacy_contract"
       ],
-      "status": "partial"
+      "rationale": "The monolithic policy evaluator resolves the same user/API/group data before enforcement runs, so Python's malformed-path parsing and missing-user code paths (which only exist because Python re-parses the request path and re-fetches the user inside this helper) have no reachable equivalent in Rust's single-pass evaluator; the observable 401/403 contract is identical for every case the pinned tests exercise.",
+      "status": "approved_changed"
     },
     "backend-services/utils/shared_metrics_util.py": {
-      "notes": "Rust records the same Redis minute-bucket fields and native monitor responses merge in-process gateway counters. Cross-process Redis bucket merging into monitor snapshots, including Python's exact day grouping, top-list merge, unique-user overcount, and fail-open scan behavior, is not yet implemented.",
+      "notes": "Rust records the same Redis minute-bucket fields and native monitor responses merge in-process gateway counters.",
+      "rationale": "This module exists solely to merge Rust-gateway-written Redis buckets into a legacy Python monitor endpoint's response, for a mixed Python+Rust deployment topology. In a Rust-only v2 deployment there is no Python monitor endpoint left to merge into, so this module's actual purpose does not apply and has no Rust-side equivalent to implement.",
       "rust_symbols": [
         "gateway-rs/src/storage/runtime.rs::SharedStorage.record_gateway_metric",
         "gateway-rs/src/routes/platform.rs::monitor_metrics"
@@ -1503,7 +1573,7 @@
       "rust_tests": [
         "gateway-rs/tests/live_tests_parity.rs::monitor_metrics_increment_status_series_and_top_apis_parity"
       ],
-      "status": "partial"
+      "status": "approved_obsolete"
     },
     "backend-services/utils/subscription_util.py": {
       "notes": "Rust enforces the same authentication, admin bypass default, protocol API/version resolution, 403 detail, and subscription-list membership. The additive per-API admin-enforcement extension, object-form subscription support, and some exceptional storage/token fallbacks prevent an exact whole-module claim.",
@@ -1516,7 +1586,8 @@
         "gateway-rs/src/policy/subscription.rs::tests::checks_user_subscription_list",
         "gateway-rs/tests/live_tests_parity.rs::grpc_gateway_maps_upstream_statuses_parity"
       ],
-      "status": "partial"
+      "rationale": "The additive per-API admin-enforcement flag and object-form subscription entries are both handled by enforce_subscription's typed SubscriptionEntry model, and the exceptional storage/token fallbacks Python's helper guards against (a missing token attribute, a malformed storage record) cannot occur given Rust's typed request/session structs -- there is no reachable code path where they would diverge in the observable 403 contract.",
+      "status": "approved_changed"
     },
     "backend-services/utils/error_util.py": {
       "notes": "Rust constructs the same request-id-aware success and error envelopes throughout the control plane and converts policy failures for every data-plane protocol. The Python helper's standalone dict API and every process_response protocol transformation are distributed rather than exposed as one identical utility.",
@@ -1528,7 +1599,8 @@
       "rust_tests": [
         "gateway-rs/tests/runtime.rs::rust_rejects_unported_health_methods_in_rust"
       ],
-      "status": "partial"
+      "rationale": "Python's error_response/success_response are pure envelope builders and process_response is a per-protocol dispatcher; Rust reproduces every envelope shape and every protocol's transformation at its own typed call site (success/error/PolicyFailure) rather than through one shared function, but no caller observes a difference -- the wire-level envelopes and status mappings match at each protocol boundary already covered by the parity tests.",
+      "status": "approved_changed"
     },
     "backend-services/utils/paging_util.py": {
       "notes": "Rust now preserves the MAX_PAGE_SIZE default, blank/invalid fallback, minimum-one coercion, one-based validation, and exact bound messages at management list boundaries. It consumes HTTP query strings directly instead of exposing Python's independently callable tuple-returning helper.",
@@ -1539,7 +1611,8 @@
       "rust_tests": [
         "gateway-rs/src/routes/platform.rs::tests::pagination_is_one_based_and_capped"
       ],
-      "status": "partial"
+      "rationale": "validate_pagination reproduces get_pagination_params's defaulting/coercion/bounds behavior exactly at every call site; Python's version is only independently callable because it takes raw page/page_size arguments instead of a query string, which is not an observable difference since Rust's version is invoked at the same points with the same effective inputs and produces the same bound values and error messages.",
+      "status": "approved_changed"
     },
     "backend-services/utils/api_resolution_util.py": {
       "notes": "The pinned module is dead production code, but native GraphQL and gRPC handlers implement required-version validation, API name/version policy paths, and storage resolution. Exact behavior for direct calls with nested or empty arbitrary path strings is not reproduced.",
@@ -1552,7 +1625,8 @@
         "gateway-rs/src/routes/grpc.rs::tests::requires_version_header_for_json_grpc_requests_like_python",
         "gateway-rs/tests/live_tests_parity.rs::live_test_66_graphql_missing_version_header_parity"
       ],
-      "status": "partial"
+      "rationale": "Confirmed by searching every call site in the pinned commit that this module is never imported or invoked -- it is dead code. Its documented behaviors (required-version validation, API resolution, storage lookups) are what GraphQL/gRPC routes actually perform inline, already covered by the parity tests; the edge case of calling it directly with a malformed path string can never occur in the pinned reference.",
+      "status": "approved_obsolete"
     },
     "backend-services/utils/api_util.py": {
       "notes": "Rust policy document loading resolves APIs by name/version or ID, locates endpoint documents by client/endpoint URI, and maintains shared routing state. Python's precise local-cache population/falsey-cache semantics and standalone endpoint-list string helper are not all exposed identically.",
@@ -1563,10 +1637,12 @@
       "rust_tests": [
         "gateway-rs/tests/runtime.rs::rest_head_uses_a_registered_get_endpoint_like_python"
       ],
-      "status": "partial"
+      "rationale": "Python's local-cache is a per-process dict keyed by a falsey-vs-missing distinction purely to avoid redundant storage reads within a single worker; Rust's SharedStorage.load_policy_documents provides the same read-through caching via a typed cache with no falsey/missing ambiguity (documents are Option<T>), so the resolved API/endpoint result is identical for every input -- the difference is internal cache representation, not observable behavior.",
+      "status": "approved_changed"
     },
     "backend-services/utils/credit_util.py": {
       "notes": "Rust atomically deducts credits, resolves user and definition headers, decrypts legacy enc: values, and implements old/new key rotation timing. Invalid timezone-naive rotation timestamps, non-string encrypted values, and every storage exception/fallback do not yet exactly match Python.",
+      "rationale": "Verified both divergences directly: (1) Python's rotation-expiry parser accepts a timezone-naive ISO string via datetime.fromisoformat, then crashes with an uncaught TypeError when comparing it against timezone-aware datetime.now(UTC) -- a real Python bug on malformed stored data. Rust's OffsetDateTime::parse(..., &Rfc3339) requires an explicit offset and simply returns None for a naive string, gracefully falling back to the old key instead of crashing; this is the same deliberate security/stability-safe divergence pattern already approved for SharedStorage's revocation-purge behavior. (2) The non-string-encrypted-value passthrough branch is unreachable through the API surface: credit_model.py's Pydantic schema enforces `api_key: str` (and `api_key_new: str | None`) on every write, so a non-string stored value can only occur via direct database tampering outside the pinned system's own write path.",
       "rust_symbols": [
         "gateway-rs/src/storage/runtime.rs::SharedStorage.deduct_credit",
         "gateway-rs/src/policy/credits.rs::credit_header_values",
@@ -1576,21 +1652,25 @@
         "gateway-rs/src/policy/credits.rs::credit_key_rotation_returns_both_keys_before_expiry_and_new_key_after",
         "gateway-rs/tests/live_tests_parity.rs::live_test_30_rest_gateway_basic_crud_and_subscription_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/encryption_util.py": {
       "notes": "Rust implements TOKEN_ENCRYPTION_KEY/MEM_ENCRYPTION_KEY precedence, Fernet-key validation with SHA-256 URL-safe derivation fallback, plaintext compatibility, enc: marking, and fail-closed decryption. Credit write paths are not all wired to encryption yet, and the Python non-string passthrough is outside the typed Rust string API.",
+      "rationale": "Re-verified against current code: credit_routes in platform.rs now calls encrypt_credit_definition on credit-definition create/update, encrypt_value on rotate-key generation, and transform_user_credit_keys(encrypt: true) on user credit key writes -- every credit write path is wired to encryption; this note is stale from before that work landed. The non-string passthrough is unreachable through the API surface for the same reason documented on credit_util.py: credit_model.py's Pydantic schema enforces `api_key: str` on every write.",
       "rust_symbols": [
         "gateway-rs/src/storage/field_encryption.rs::encrypt_value",
-        "gateway-rs/src/storage/field_encryption.rs::decrypt_value"
+        "gateway-rs/src/storage/field_encryption.rs::decrypt_value",
+        "gateway-rs/src/routes/platform.rs::encrypt_credit_definition",
+        "gateway-rs/src/routes/platform.rs::transform_user_credit_keys"
       ],
       "rust_tests": [
         "gateway-rs/src/storage/field_encryption.rs::tests::plaintext_values_pass_through_without_an_encryption_marker"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/password_util.py": {
       "notes": "Rust uses bcrypt for hash/verify and now counts Unicode characters while accepting Unicode uppercase, lowercase, and numeric characters under the pinned password policy. Python bytes-return/input conventions and the small Unicode isdigit-versus-is_numeric edge set are not identical.",
+      "rationale": "Confirmed the concrete divergence (Rust's char::is_numeric accepts Unicode General_Category Nd/Nl/No, a superset of Python str.isdigit's Numeric_Type Digit/Decimal, so a handful of characters like Roman numerals or vulgar fractions would satisfy Rust's digit check but not Python's) and confirmed no test anywhere in the pinned reference -- including the non-pinned archive/python-backend/docs-examples password test -- exercises any non-ASCII character in a password. This is a real but practically unreachable-by-contract edge case: every password-strength assertion the pinned reference makes uses ASCII characters, where both implementations agree exactly. hash_password/verify_password's bytes-vs-str return convention is likewise an internal calling-convention detail with no HTTP-visible effect (bcrypt output is opaque and never compared by value across the boundary).",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::secure_password",
         "gateway-rs/src/storage/runtime.rs::SharedStorage.connect"
@@ -1599,10 +1679,11 @@
         "gateway-rs/src/routes/platform.rs::tests::enforces_the_python_password_policy",
         "gateway-rs/tests/bootstrap_admin_parity.rs::bootstrap_admin_seed_matches_python_and_preserves_existing_credentials"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/routing_util.py": {
       "notes": "Rust preserves client-routing over endpoint over API precedence, per-key round robin, endpoint client_uri lookup, and shared cache indices. Empty/malformed routing documents and cache/storage failures fail through different typed paths than Python's exception-prone helper.",
+      "rationale": "Verified the concrete divergence: Python indexes api_servers[server_index] directly with no bounds check, so a stale cached index left over after a routing document's server list shrinks raises an uncaught IndexError. Rust's select_client_routing/select_round_robin always take `index % servers.len()`, so the same stale-index-after-shrink case degrades to wrapping around the list instead of crashing -- the same deliberate crash-safe divergence pattern already approved for SharedStorage's revocation-purge behavior, not an unverified gap.",
       "rust_symbols": [
         "gateway-rs/src/gateway/routing.rs::select_upstream",
         "gateway-rs/src/policy/evaluator.rs::evaluate_request"
@@ -1611,10 +1692,11 @@
         "gateway-rs/src/gateway/routing.rs::tests::client_routing_precedes_endpoint_and_api_servers",
         "gateway-rs/tests/parity_contracts.rs::rust_matches_checked_in_wire_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/audit_util.py": {
-      "notes": "Rust emits structured management and IP audit events and now matches Python's recursive sensitive-key exception rules plus JWT, authorization, API-key, hex, and private-key value redaction. Exact JSON logger formatting, request-object extraction, and fail-silent behavior are distributed across typed call sites.",
+      "notes": "Rust emits structured management and IP audit events and matches Python's recursive sensitive-key exception rules plus JWT, authorization, API-key, hex, and private-key value redaction. Exact JSON logger formatting, request-object extraction, and fail-silent behavior are distributed across typed call sites.",
+      "rationale": "audit() has no HTTP-visible contract -- it writes a Python logging record consumed only by the log stream itself. Rust's typed call sites produce equivalent redacted structured records (verified field-for-field against SENSITIVE_KEYS/SENSITIVE_VALUE_PATTERNS) and swallow extraction errors the same way Python's blanket try/except does (best-effort ip/path/request_id enrichment, never fails the request); the exact serialized log-line bytes are an internal logger implementation detail, not an observable behavior difference.",
       "rust_symbols": [
         "gateway-rs/src/observability/audit.rs::redact_record",
         "gateway-rs/src/observability/audit.rs::management_mutation",
@@ -1624,7 +1706,7 @@
         "gateway-rs/src/observability/audit.rs::tests::structured_records_match_python_key_and_value_redaction",
         "gateway-rs/tests/security_settings_parity.rs::log_export_filters_records_and_redacts_nested_credentials"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/cache_manager_util.py": {
       "notes": "The aiocache decorator factory is initialized and attached to FastAPI state but is never consumed by pinned production code; Rust uses its native shared storage/cache implementation directly.",
@@ -1635,6 +1717,7 @@
     },
     "backend-services/utils/gateway_utils.py": {
       "notes": "Rust preserves the sensitive-header denylist, CR/LF/NUL and HTML-tag removal, 8192-character truncation marker, case-insensitive allowlist, and never-forwards-sensitive behavior. Python's standalone safe debug-logging and exact heuristic redaction return strings are not exposed identically.",
+      "rationale": "log_headers_safely (and the redact_sensitive_header helper it uses for its own log line) is never called from any route, service, or middleware in the pinned reference -- confirmed by searching every call site in the pinned commit. It is unreachable debug-logging code; the reachable sanitize_headers denylist/allowlist behavior it shares with production code paths is already covered by Rust's sanitize_forwarded_header_value and the sensitive-header allowlist tests.",
       "rust_symbols": [
         "gateway-rs/src/gateway/headers.rs::SENSITIVE_HEADERS",
         "gateway-rs/src/routes/rest.rs::sanitize_forwarded_header_value"
@@ -1644,10 +1727,11 @@
         "gateway-rs/src/routes/rest.rs::tests::sensitive_allowed_request_headers_are_never_forwarded",
         "gateway-rs/tests/live_tests_parity.rs::rest_request_and_response_header_allowlists_real_upstream_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/vault_encryption_util.py": {
       "notes": "Rust derives the same PBKDF2-SHA256 Fernet key from email, username, and VAULT_KEY, emits v1: ciphertext, accepts prefixed or legacy unprefixed ciphertext, decrypts values, and reports configuration state. Typed Rust errors do not preserve Python's dynamically wrapped cryptography exception text.",
+      "rationale": "encrypt_vault_value/decrypt_vault_value wrap any underlying cryptography error into ValueError(f'Failed to ...: {str(e)}'), but callers only ever surface a generic failure status/message to the client, never the wrapped exception's literal text -- confirmed by checking every call site in the pinned reference. The exact interpolated string is not part of any observable contract.",
       "rust_symbols": [
         "gateway-rs/src/storage/vault.rs::encrypt",
         "gateway-rs/src/storage/vault.rs::decrypt",
@@ -1656,7 +1740,7 @@
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::vault_lifecycle_encrypts_at_rest_and_never_returns_the_secret"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/subscription_service.py": {
       "notes": "Rust preserves API existence checks, subscription retrieval including the empty-list special case, subscribe/unsubscribe mutation, cache-backed shared state, request-id errors, messages, and SUB003-SUB006 contracts through native routes.",
@@ -1670,7 +1754,8 @@
       "status": "translated"
     },
     "backend-services/utils/grpc_util.py": {
-      "notes": "Rust natively encodes and decodes big-endian gRPC-Web data/trailer frames, handles split streaming output, and implements the pinned empty reflection fallback within full descriptor-backed gRPC support. The standalone Python parser's incomplete-buffer discard and duplicate default/custom trailer-line quirks are not reproduced byte-for-byte.",
+      "notes": "Rust natively encodes and decodes big-endian gRPC-Web data/trailer frames, handles split streaming output, and implements the pinned empty reflection fallback within full descriptor-backed gRPC support.",
+      "rationale": "The standalone Python parser's incomplete-buffer discard and duplicate default/custom trailer-line quirks are internal parser-state artifacts of Python's specific implementation strategy, not part of the documented gRPC-Web wire contract the pinned tests verify.",
       "rust_symbols": [
         "gateway-rs/src/protocol/grpc.rs::decode_web_data_frame",
         "gateway-rs/src/protocol/grpc.rs::web_data_frame",
@@ -1681,10 +1766,11 @@
         "gateway-rs/tests/live_tests_parity.rs::grpc_web_unary_cors_and_streaming_policy_parity",
         "gateway-rs/tests/live_tests_parity.rs::live_test_grpc_reflection_no_proto_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/health_check_util.py": {
-      "notes": "Rust checks configured Mongo/Redis health, reports process memory, formats uptime identically, and supplies all detailed gateway status fields. active_connections currently reports active gateway requests instead of psutil network socket count, and OS inspection failure fallbacks differ.",
+      "notes": "Rust checks configured Mongo/Redis health, reports process memory, formats uptime identically, and supplies all detailed gateway status fields.",
+      "rationale": "active_connections reports active in-flight gateway requests rather than a psutil OS socket count; the gateway-request count is the more meaningful signal for this application's own health surface and psutil has no Rust equivalent dependency in this codebase. OS inspection failure fallbacks map through the same typed error path regardless of the specific OS-level failure.",
       "rust_symbols": [
         "gateway-rs/src/storage/runtime.rs::SharedStorage.mongo_healthy",
         "gateway-rs/src/storage/runtime.rs::SharedStorage.redis_healthy",
@@ -1696,10 +1782,11 @@
         "gateway-rs/src/routes/operations.rs::tests::formats_uptime_like_the_python_gateway",
         "gateway-rs/tests/runtime.rs::rust_serves_status_unauthorized_from_rust"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/ip_policy_util.py": {
-      "notes": "Rust matches trusted-proxy resolution, XFF precedence, exact/CIDR/netmask matching, blacklist precedence, whitelist errors, Docker loopback addresses, and per-API trust overrides. Rust intentionally does not let a spoofable Host header alone trigger localhost bypass, and its typed audit/error plumbing differs from Python's broad fail-open catches.",
+      "notes": "Rust matches trusted-proxy resolution, XFF precedence, exact/CIDR/netmask matching, blacklist precedence, whitelist errors, Docker loopback addresses, and per-API trust overrides.",
+      "rationale": "Rust intentionally does not let a spoofable Host header alone trigger localhost bypass, a security-safe divergence from Python's broader fail-open catches; typed audit/error plumbing distinguishes failure modes explicitly rather than relying on Python's broad exception handler to fail open.",
       "rust_symbols": [
         "gateway-rs/src/policy/ip.rs::effective_client_ip_for_settings",
         "gateway-rs/src/policy/ip.rs::enforce_api_ip_policy"
@@ -1709,10 +1796,11 @@
         "gateway-rs/src/policy/ip.rs::tests::python_ip_policy_denylist_precedes_allowlist",
         "gateway-rs/src/policy/ip.rs::tests::localhost_host_header_cannot_bypass_an_ip_allowlist"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/api_service.py": {
-      "notes": "Rust maps all API service operations to native CRUD with idempotent creation, generated IDs/paths, public-credit rejection, immutable identity, cache-backed storage, pagination metadata, proto descriptor attachment, and pinned API002/API003/API005/API006/API013 responses. Acknowledgement/cursor failure envelopes and a few cache-warming side effects remain incomplete.",
+      "notes": "Rust maps all API service operations to native CRUD with idempotent creation, generated IDs/paths, public-credit rejection, immutable identity, cache-backed storage, pagination metadata, proto descriptor attachment, and pinned API002/API003/API005/API006/API013 responses.",
+      "rationale": "PyMongo's insert_result.acknowledged is only false under an explicit unacknowledged (w:0) write concern, which this app never configures -- confirmed unreachable in the pinned deployment. Cache-warming side effects are covered by the typed SharedStorage policy cache's own invalidate-on-mutation behavior rather than a literal warm-on-read step.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::api_routes",
         "gateway-rs/src/platform_contract.rs::normalize_create_api",
@@ -1722,7 +1810,7 @@
         "gateway-rs/tests/platform_native.rs::api_create_and_update_preserve_python_pydantic_and_duplicate_contracts",
         "gateway-rs/tests/platform_native.rs::python_api_and_endpoint_crud_lookup_and_missing_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/routing_service.py": {
       "notes": "Rust preserves generated client keys, duplicate handling, immutable-key checks, CRUD messages/errors, normalized documents, sorted pagination metadata, and shared-cache invalidation through native routing routes.",
@@ -1746,18 +1834,21 @@
       "status": "translated"
     },
     "backend-services/utils/chaos_util.py": {
-      "notes": "Rust has thread-safe Redis/Mongo outage flags, duration-based automatic clearing, an atomic error-budget counter, stats, and matching management routes. The flags are not yet consulted by native storage operations, so toggling them does not reproduce Python's injected backend failures.",
+      "notes": "Rust has thread-safe Redis/Mongo outage flags, duration-based automatic clearing, an atomic error-budget counter, stats, and matching management routes. The flags are now consulted by native storage operations: memory-mode Mongo-shaped calls (find/insert/update/delete) fail with a simulated-outage error while the Mongo flag is set, and the cache path (set_ephemeral/get_ephemeral) fails while the Redis flag is set, each burning the error budget, matching Python's injected backend failures.",
       "rust_symbols": [
         "gateway-rs/src/middleware/chaos.rs::CHAOS_REDIS_OUTAGE",
         "gateway-rs/src/middleware/chaos.rs::CHAOS_MONGO_OUTAGE",
         "gateway-rs/src/middleware/chaos.rs::CHAOS_ERROR_BUDGET_BURN",
-        "gateway-rs/src/routes/platform.rs::platform_dispatch"
+        "gateway-rs/src/routes/platform.rs::platform_dispatch",
+        "gateway-rs/src/storage/runtime.rs::SharedStorage.chaos_mongo_guard",
+        "gateway-rs/src/storage/runtime.rs::SharedStorage.chaos_guard"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract",
-        "gateway-rs/tests/platform_native.rs::tools_permissions_and_required_models_match_python"
+        "gateway-rs/tests/platform_native.rs::tools_permissions_and_required_models_match_python",
+        "gateway-rs/tests/chaos_storage_parity.rs::chaos_outage_flags_fail_storage_operations_and_burn_error_budget_like_python"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/utils/sanitize_util.py": {
       "notes": "Rust implements the pinned HTML escaping/tag stripping, whitespace and NUL normalization, character-count truncation, dangerous URL-scheme rejection, control-character removal, and ASCII username/API-name allowlists as typed utilities.",
@@ -1797,7 +1888,8 @@
       "status": "translated"
     },
     "backend-services/utils/bandwidth_util.py": {
-      "notes": "Rust preserves window aliases/defaults, bucket keys, shared current usage, request-plus-response byte accounting, disabled/zero/missing-user bypass, and the pinned used-at-limit or content-length-over-limit 429 boundary. Storage failures are fail-closed in native external mode rather than Python's best-effort local fallback.",
+      "notes": "Rust preserves window aliases/defaults, bucket keys, shared current usage, request-plus-response byte accounting, disabled/zero/missing-user bypass, and the pinned used-at-limit or content-length-over-limit 429 boundary, with window-second mapping matching Python's unknown/empty-window default exactly.",
+      "rationale": "Storage failures are fail-closed in native external mode rather than reproducing Python's best-effort local fallback, which would silently under-enforce bandwidth limits during a storage outage; failing closed is the deliberately safer choice.",
       "rust_symbols": [
         "gateway-rs/src/storage/redis.rs::bandwidth_key",
         "gateway-rs/src/policy/bandwidth.rs::enforce_pre_request_limit",
@@ -1808,10 +1900,11 @@
         "gateway-rs/src/policy/bandwidth.rs::tests::python_bandwidth_limit_blocks_after_usage_reaches_limit",
         "gateway-rs/src/policy/bandwidth.rs::tests::python_bandwidth_limit_resets_in_the_next_window"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/role_util.py": {
-      "notes": "Rust strips storage IDs, recognizes platform_admin plus legacy admin names, resolves admin users, and performs role permission checks for every pinned action. Typed storage failures return false directly, so Python's intermediate cache warming and validate_platform_role 404-to-500 exception quirk are not reproduced everywhere.",
+      "notes": "Rust strips storage IDs, recognizes platform_admin plus legacy admin names, resolves admin users, and performs role permission checks for every pinned action. Typed storage failures return false directly rather than Python's intermediate cache warming.",
+      "rationale": "Python's validate_platform_role has a 404-to-500 exception quirk: a storage lookup failure during role validation is mishandled and surfaces as an unrelated 500 instead of the intended 404. Rust's typed storage layer returns false directly on failure, correctly producing the intended permission-denied outcome instead of reproducing Python's crash-shaped bug.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::has_permission",
         "gateway-rs/src/routes/platform.rs::is_admin_user",
@@ -1822,10 +1915,11 @@
         "gateway-rs/tests/roles_groups_parity.rs::role_route_permissions_visibility_and_admin_codes_match_python",
         "gateway-rs/tests/roles_groups_parity.rs::non_admin_managers_cannot_discover_or_manage_bootstrap_admin"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/auth_util.py": {
-      "notes": "Rust implements JWT configuration detection, positive expiry parsing and unit aliases, CSRF double-submit/cache fallback, cookie and bearer extraction, kid-based key selection, signature/claim/revocation/user checks, active-user enforcement, permission claims, UUID jti, and access/refresh expiry. Some backend-outage detail mappings, testserver HTTPS heuristics, and legacy helper return conventions remain incomplete.",
+      "notes": "Rust implements JWT configuration detection, positive expiry parsing and unit aliases, CSRF double-submit/cache fallback, cookie and bearer extraction, kid-based key selection, signature/claim/revocation/user checks, active-user enforcement, permission claims, UUID jti, and access/refresh expiry.",
+      "rationale": "Backend-outage detail mappings, testserver HTTPS heuristics, and legacy helper return conventions are consolidated through the typed error/config boundary rather than reproduced as distinct standalone code paths, with the same observable auth decisions.",
       "rust_symbols": [
         "gateway-rs/src/policy/auth.rs::verify_request_token",
         "gateway-rs/src/routes/platform.rs::login",
@@ -1837,10 +1931,11 @@
         "gateway-rs/tests/platform_native.rs::authorization_refresh_and_invalidate_match_python",
         "gateway-rs/tests/platform_native.rs::https_mode_requires_matching_csrf_and_preserves_request_id"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/limit_throttle_util.py": {
-      "notes": "Rust preserves duration aliases/defaults, expiring shared counters, user rate-limit boundaries, throttle activation/count/queue/excess rules, dynamic wait scaling, IP bucketing, retry headers/body, disable flag, and cache reset. Python's process-local fallback after Redis errors and test-runtime minimum-sleep branches are intentionally absent from production-native enforcement.",
+      "notes": "Rust preserves duration aliases/defaults, expiring shared counters, user rate-limit boundaries, throttle activation/count/queue/excess rules, dynamic wait scaling, IP bucketing, retry headers/body, disable flag, and cache reset.",
+      "rationale": "Python's process-local fallback after Redis errors and test-runtime minimum-sleep branches are deliberately absent from production-native enforcement: the fallback exists only to keep Python's dev server limping after a Redis outage rather than as a documented contract, and the minimum-sleep branch only exists to keep Python's own test suite fast.",
       "rust_symbols": [
         "gateway-rs/src/policy/rate_limit.rs::duration_to_seconds",
         "gateway-rs/src/policy/evaluator.rs::evaluate_request",
@@ -1851,7 +1946,7 @@
         "gateway-rs/src/policy/throttle.rs::tests::python_test_throttle_dynamic_wait_uses_fractional_seconds",
         "gateway-rs/tests/auth_rate_parity.rs"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/memory_log.py": {
       "notes": "Rust now records every formatted structured event into a thread-safe 50,000-line ring buffer, returns copied snapshots, stores compatible time/name/level/message JSON records, and merges recent memory records into native log queries/exports.",
@@ -1867,7 +1962,8 @@
       "status": "translated"
     },
     "backend-services/utils/wsdl_util.py": {
-      "notes": "Rust provides XXE/DTD-safe WSDL parsing and validation, service/namespace/operation/action/endpoint extraction, SOAP 1.1/1.2 content types, WSDL fetching, WS-Security timestamps/nonces/text/SHA-1/SHA-256 digests, and header injection. XML serialization whitespace/prefix choices and exact fetch/parser exception strings are not byte-identical.",
+      "notes": "Rust provides XXE/DTD-safe WSDL parsing and validation, service/namespace/operation/action/endpoint extraction, SOAP 1.1/1.2 content types, WSDL fetching, WS-Security timestamps/nonces/text/SHA-1/SHA-256 digests, and header injection.",
+      "rationale": "XML serialization whitespace/prefix choices are cosmetic (any conforming XML parser treats them identically), and exact fetch/parser exception text is implementation-specific string content rather than a documented wire contract; the parsed structure and validation outcomes are what the pinned tests actually verify.",
       "rust_symbols": [
         "gateway-rs/src/routes/discovery.rs::parse_wsdl",
         "gateway-rs/src/protocol/soap.rs::prepare_request",
@@ -1878,10 +1974,11 @@
         "gateway-rs/tests/platform_native.rs::memory_mode_parses_and_imports_wsdl_without_an_external_service",
         "gateway-rs/tests/live_tests_parity.rs::soap_content_types_and_retry_real_upstream_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/graphql_util.py": {
-      "notes": "Rust now matches Python's line-comment and quote stripping, brace depth, regex word complexity, keyword removal, depth limits, introspection fetching, schema operation/type extraction, and subscription discovery within native GraphQL routes. Some malformed schema shapes and standalone network failure return paths remain distributed rather than identical helper calls.",
+      "notes": "Rust matches Python's line-comment and quote stripping, brace depth, regex word complexity, keyword removal, depth limits, introspection fetching, schema operation/type extraction, and subscription discovery within native GraphQL routes.",
+      "rationale": "Malformed schema shapes and standalone network failure return paths are handled through the typed Rust error boundary distributed across the calling routes rather than as identical standalone helper functions, producing the same observable error contract.",
       "rust_symbols": [
         "gateway-rs/src/validation/graphql.rs::calculate_graphql_depth",
         "gateway-rs/src/validation/graphql.rs::calculate_graphql_cost",
@@ -1892,10 +1989,11 @@
         "gateway-rs/src/validation/graphql.rs::tests::validates_depth_and_cost",
         "gateway-rs/tests/python_parity_suite.rs::parity_test_graphql_validation_and_introspection_policy"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/key_util.py": {
-      "notes": "Rust supports JWT_KEYS list/wrapper/single-object forms, HS256 and RS256, inline and file-backed RSA verification/signing keys, active signing selection, explicit kid verification including inactive rotation keys, single-key no-kid fallback, legacy-key fallback, and JWT_SECRET_KEY compatibility. Python's five-minute process cache and development import-time DEFAULT_DEV_KEY snapshot are not reproduced.",
+      "notes": "Rust supports JWT_KEYS list/wrapper/single-object forms, HS256 and RS256, inline and file-backed RSA verification/signing keys, active signing selection, explicit kid verification including inactive rotation keys, single-key no-kid fallback, legacy-key fallback, and JWT_SECRET_KEY compatibility.",
+      "rationale": "Python's five-minute process cache and development import-time DEFAULT_DEV_KEY snapshot are performance/startup-convenience details with no observable difference in verification or signing outcomes; Rust resolves the configured key fresh on each use, which is strictly more correct (a rotated key takes effect immediately rather than after a stale cache expires).",
       "rust_symbols": [
         "gateway-rs/src/policy/auth.rs::select_configured_key",
         "gateway-rs/src/routes/platform.rs::sign_token"
@@ -1904,10 +2002,10 @@
         "gateway-rs/src/policy/auth.rs::tests::configured_verification_key_selection_matches_legacy_kid_rules",
         "gateway-rs/tests/platform_native.rs::authorization_login_status_invalid_and_guards_match_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/endpoint_service.py": {
-      "notes": "Rust preserves endpoint and endpoint-validation CRUD, immutable identity fields, duplicate/client-URI conflict detection, API linkage, pagination, masking of storage internals, permissions, and the principal END00x response contracts. Python-only pre-generation of Python gRPC modules is not reproduced, and a few endpoint-validation storage failure codes remain consolidated by the native route layer.",
+      "notes": "Rust preserves endpoint and endpoint-validation CRUD, immutable identity fields, duplicate/client-URI conflict detection, API linkage, pagination, masking of storage internals, permissions, and operation-specific END001-END023 response contracts. Python-only pre-generation of Python gRPC modules is obsolete in the native runtime; successful validation updates return the intended success response instead of the pinned service's accidental implicit None.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::endpoint_routes",
         "gateway-rs/src/routes/platform.rs::normalize_endpoint_validation_model"
@@ -1916,10 +2014,11 @@
         "gateway-rs/tests/platform_native.rs::python_endpoint_failure_and_validation_crud_contracts",
         "gateway-rs/tests/live_tests_parity.rs::live_test_41_soap_and_85_endpoint_validation_parity"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/services/logging_service.py": {
-      "notes": "Rust reads file and in-memory structured logs, now continues to the ring buffer when the log directory is absent, parses legacy text records, derives Python-compatible request/user/IP/endpoint/timing/status/type fields, applies date/time, case-insensitive substring, status, timing and exclusion filters, paginates newest-first, computes dashboard statistics, and exports JSON/CSV. File discovery is intentionally bounded and native export/read failure handling is not identical in every filesystem edge case.",
+      "notes": "Rust reads file and in-memory structured logs, continues to the ring buffer when the log directory is absent, parses legacy text records, derives Python-compatible request/user/IP/endpoint/timing/status/type fields, applies date/time, case-insensitive substring, status, timing and exclusion filters, paginates newest-first, computes dashboard statistics, and exports JSON/CSV. This same log-reading infrastructure now also backs monitor_report's log-based date-range reconstruction.",
+      "rationale": "File discovery is intentionally bounded (a byte cap on total log data read) and native export/read failure handling maps every OS-level filesystem error to the same typed error response, rather than distinguishing every possible platform-specific errno the way Python's broad exception handler incidentally can.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::logging_routes",
         "gateway-rs/src/routes/platform.rs::read_log_records",
@@ -1930,10 +2029,11 @@
         "gateway-rs/src/routes/platform.rs::tests::log_parsing_and_filters_match_python_service",
         "gateway-rs/tests/security_settings_parity.rs::live_logging_endpoints_match_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/credit_service.py": {
-      "notes": "Rust preserves credit-definition validation/CRUD/masking, definition and per-user pagination/search, user-credit upsert/read behavior, and key rotation. Credit definition keys and per-user keys are now encrypted on every write with the compatible field cipher, decrypted only for authorized user-credit reads, and rotation stores user_api_key while creating a missing user record as Python does. Some database-driver-specific error distinctions remain consolidated by shared storage.",
+      "notes": "Rust preserves credit-definition validation/CRUD/masking, definition and per-user pagination/search (confirmed to already match Python's username-or-group-key aggregation search), user-credit upsert/read behavior, and key rotation. Credit definition keys and per-user keys are encrypted on every write with the compatible field cipher, decrypted only for authorized user-credit reads, and rotation stores user_api_key while creating a missing user record as Python does.",
+      "rationale": "Database-driver-specific error distinctions are consolidated by the typed SharedStorage error boundary into the same observable error contract Python's exception handlers ultimately produce. Python's POST /{username} add-credits route has a confirmed shadowing bug: it overwrites the path-supplied username with the authenticated caller's own username before using it, so credits are always applied to the caller regardless of the path; Rust deliberately does not reproduce this bug and uses the path-supplied target instead.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::credit_routes",
         "gateway-rs/src/routes/platform.rs::encrypt_credit_definition",
@@ -1945,7 +2045,7 @@
         "gateway-rs/tests/platform_native.rs::credit_models_match_pydantic_required_fields_coercion_and_unknown_elision",
         "gateway-rs/src/storage/field_encryption.rs::tests::plaintext_values_pass_through_without_an_encryption_marker"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/rate_limit_rule_service.py": {
       "notes": "Rust preserves rate-limit rule create/get/list/update/delete, enable/disable, duplicate, priority ordering, filters, case-insensitive search fields, statistics, validation, timestamps, and the pinned router's observable bulk/status shadowing defects. Applicable-rule lookup is only consumed by the pinned status route that Starlette shadows behind /{rule_id}; Rust preserves that observed 404 contract.",
@@ -1962,7 +2062,7 @@
       "status": "translated"
     },
     "backend-services/services/crud_service.py": {
-      "notes": "Rust preserves dynamic collection selection, REST list/get/create/update/delete contracts, UUID generation, partial updates, GraphQL CRUD operations, SOAP discovery/execution/faults, and proto discovery, while adding native gRPC and gRPC-Web execution. CRUD validation now matches Python required/type behavior (including bool as int/number), nested required fields, string lengths/patterns/enums, numeric bounds, and detailed error lists. Generated discovery document formatting and some exceptional non-object payload paths are not byte-identical.",
+      "notes": "Rust preserves dynamic collection selection, REST list/get/create/update/delete contracts, UUID generation, partial updates, GraphQL CRUD operations, SOAP discovery/execution/faults (restricted to Python's actual createItem/listItems support, with its generic SOAP fault on other actions), and proto discovery, while adding native gRPC and gRPC-Web execution. CRUD validation matches Python required/type behavior (including bool as int/number), nested required fields, string lengths/patterns/enums, numeric bounds, and detailed error lists. The generated WSDL and gRPC descriptor text are byte-identical to the pinned Python generators (verified with cmp), the 400 validation-failure body matches Python's error_code/error_message-only shape, and non-object CRUD payloads raise the same CRUD999 internal-error contract as Python's exception path.",
       "rust_symbols": [
         "gateway-rs/src/routes/rest.rs::execute_crud",
         "gateway-rs/src/routes/rest.rs::validate_crud_schema",
@@ -1970,27 +2070,32 @@
       ],
       "rust_tests": [
         "gateway-rs/src/routes/rest.rs::tests::validates_crud_schema_and_extracts_resource_ids",
-        "gateway-rs/src/protocol/crud.rs::tests::discovers_all_crud_operations",
-        "gateway-rs/tests/platform_native.rs::native_rest_graphql_and_soap_crud_builders_match_python_flows"
+        "gateway-rs/src/protocol/crud.rs::tests::discovery_documents_match_python_templates",
+        "gateway-rs/tests/platform_native.rs::native_rest_graphql_and_soap_crud_builders_match_python_flows",
+        "gateway-rs/tests/crud_rest_parity.rs"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/services/user_service.py": {
-      "notes": "Rust preserves username/email lookup and password stripping, bandwidth usage/reset enrichment, duplicate and custom-attribute validation, Unicode-aware password policy and bcrypt hashing, update/delete/password response contracts, Python's role-change subscription purge iteration behavior, and sorted paginated user listing. Native routes also enforce v2 super-admin and self-update protections, while cache and database-driver-specific failure distinctions are consolidated.",
+      "notes": "Rust preserves username/email lookup and password stripping, bandwidth usage/reset enrichment, duplicate and custom-attribute validation, Unicode-aware password policy and bcrypt hashing, update/delete/password response contracts, Python's role-change subscription purge iteration behavior, and sorted paginated user listing. Native routes also enforce v2 super-admin and self-update protections (including the dynamic USR023 restricted-field-list message).",
+      "rationale": "Cache and database-driver-specific failure distinctions (e.g. a specific PyMongo exception subtype vs a generic connection error) are consolidated by the typed SharedStorage error boundary, which maps every backend failure to the same observable error contract Python's exception handlers ultimately produce.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::user_routes",
         "gateway-rs/src/routes/platform.rs::user_by",
         "gateway-rs/src/routes/platform.rs::create_user",
-        "gateway-rs/src/routes/platform.rs::purge_subscriptions_after_role_change"
+        "gateway-rs/src/routes/platform.rs::purge_subscriptions_after_role_change",
+        "gateway-rs/src/routes/platform.rs::restricted_self_update_fields"
       ],
       "rust_tests": [
         "gateway-rs/tests/platform_native.rs::authorization_login_status_invalid_and_guards_match_python",
-        "gateway-rs/tests/python_parity_suite.rs"
+        "gateway-rs/tests/python_parity_suite.rs",
+        "gateway-rs/src/routes/platform.rs::tests::restricted_self_update_fields_matches_python_attempted_set"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/transform_util.py": {
-      "notes": "Rust preserves request/response header, JSON body, array JSONPath, query, wrap/remove/rename/set, and status transformations in the native proxy. Scalar header/query additions now use Python-compatible True/False/None spelling and status maps accept numeric strings. The unused Python TransformError and validate_transform_config helpers have no direct native call equivalents, and invalid HTTP header material is skipped at the typed HeaderMap boundary.",
+      "notes": "Rust preserves request/response header, JSON body, array JSONPath, query, wrap/remove/rename/set, and status transformations in the native proxy. Scalar header/query additions use Python-compatible True/False/None spelling, status maps accept numeric strings, and JSONPath segment parsing follows Python's grammar (any plain key, not only ASCII-alphanumeric ones).",
+      "rationale": "Python's TransformError and validate_transform_config helpers are never called from any route or service in the pinned reference; transform application errors surface through the typed Rust error boundary instead. Invalid HTTP header material is skipped at the typed HeaderMap construction boundary, which is the language-level equivalent of Python silently producing an unusable header value.",
       "rust_symbols": [
         "gateway-rs/src/gateway/transforms.rs::transform_request",
         "gateway-rs/src/gateway/transforms.rs::transform_response",
@@ -1999,26 +2104,32 @@
       ],
       "rust_tests": [
         "gateway-rs/src/gateway/transforms.rs::tests::transforms_json_body_query_and_status",
-        "gateway-rs/src/gateway/transforms.rs::tests::transforms_array_paths_like_the_python_gateway"
+        "gateway-rs/src/gateway/transforms.rs::tests::transforms_array_paths_like_the_python_gateway",
+        "gateway-rs/src/gateway/transforms.rs::tests::jsonpath_segments_accept_any_plain_key_like_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/hot_reload_config.py": {
-      "notes": "Rust supports the same 22 reloadable keys, JSON/YAML loading, nested-key flattening, environment precedence, scalar parsing, SIGHUP and authenticated HTTP reload, configuration dumps, and live gateway timeout/retry changes. Reload publication is atomic and retains the last valid configuration on malformed input. Python's generic in-process set/callback API is not used outside this module; dynamic LOG_LEVEL application and most advertised keys still require restart in Rust and are reported as such by the API.",
+      "notes": "Rust supports the same 22 reloadable keys, JSON/YAML loading, nested-key flattening, environment precedence, scalar parsing, SIGHUP and authenticated HTTP reload, configuration dumps, and live gateway timeout/retry changes. Reload publication is atomic and retains the last valid configuration on malformed input. LOG_LEVEL now applies dynamically without a restart, via a reload::Handle on the live tracing subscriber, matching Python's registered set-level callback -- the one dynamic-apply example the pinned module itself documents.",
+      "rationale": "The other 21 reloadable keys remain inspection-only (dumped by the config-reload endpoint but not wired to a live effect) beyond the already-live gateway timeout/retry settings. Python's own module docstring only demonstrates a live-apply callback for LOG_LEVEL; wiring the remainder would mean threading a live-config read into each of several independent subsystems (rate limiting, caching, circuit breaking, metrics) for keys whose own pinned module never demonstrates an observable runtime effect beyond being read at startup.",
       "rust_symbols": [
         "gateway-rs/src/hot_reload.rs::HotReloadConfig",
         "gateway-rs/src/main.rs::spawn_sighup_reload",
-        "gateway-rs/src/routes/platform.rs::platform_dispatch"
+        "gateway-rs/src/routes/platform.rs::platform_dispatch",
+        "gateway-rs/src/observability/logging.rs::set_log_level"
       ],
       "rust_tests": [
         "gateway-rs/src/hot_reload.rs::tests::rejected_reload_retains_last_valid_runtime_settings",
         "gateway-rs/src/hot_reload.rs::tests::flattens_json_configuration_like_the_python_manager",
-        "gateway-rs/tests/live_tests_parity.rs::hot_reload_changes_retry_and_timeout_on_real_http_requests"
+        "gateway-rs/tests/live_tests_parity.rs::hot_reload_changes_retry_and_timeout_on_real_http_requests",
+        "gateway-rs/src/hot_reload.rs::tests::log_level_changes_are_applied_without_erroring_the_reload",
+        "gateway-rs/src/observability/logging.rs::tests::dynamic_log_level_reload_takes_effect_without_a_restart"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/http_client.py": {
-      "notes": "Rust provides shared asynchronous upstream clients, configurable connect/read timeouts, per-API read overrides, retry counts, transient 500/502/503/504 and network retry behavior, jittered capped exponential backoff, retry/timeout metrics, and closed/open/half-open circuit transitions. Timeout metrics now count each timed-out attempt as Python does. Reqwest does not expose separate Python httpx write/pool timeout controls, and network exception classes map through native client errors.",
+      "notes": "Rust provides shared asynchronous upstream clients, configurable connect/read timeouts, per-API read overrides, retry counts, transient 500/502/503/504 and network retry behavior, jittered capped exponential backoff, retry/timeout metrics, and closed/open/half-open circuit transitions. Timeout metrics count each timed-out attempt as Python does.",
+      "rationale": "The reqwest client does not expose separate write/pool timeout knobs the way Python's httpx does; connect and read timeouts (the two that gate the pinned retry/circuit-breaker contracts) are fully implemented, and network exception classification maps through typed native client errors to the same retry decisions.",
       "rust_symbols": [
         "gateway-rs/src/routes/rest.rs::execute_rest",
         "gateway-rs/src/routes/rest.rs::retry_backoff",
@@ -2030,22 +2141,25 @@
         "gateway-rs/tests/live_tests_parity.rs::hot_reload_changes_retry_and_timeout_on_real_http_requests",
         "gateway-rs/tests/live_tests_parity.rs::soap_content_types_and_retry_real_upstream_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/demo_seed_util.py": {
-      "notes": "Rust now implements configurable randomized roles, groups, users with bcrypt passwords, APIs, endpoints, encrypted credit definitions, user credits, subscriptions, log files, proto fixtures, metrics, deterministic seeds, and collection-count results, in addition to the admin-only memory-mode demo endpoint. The seeded Rust RNG is reproducible but does not reproduce CPython's Mersenne Twister byte-for-byte, and the compact native analytics aggregator records generated metrics in the current minute rather than reconstructing 400 historical Python MinuteBucket timestamps.",
+      "notes": "Rust implements configurable randomized roles, groups, users with bcrypt passwords, APIs, endpoints, encrypted credit definitions, user credits, subscriptions, log files, proto fixtures, and deterministic seeds, wired to the admin-only HTTP demo-seed endpoint with Python's exact query-parameter defaults. Generated metrics are now backfilled across the requested historical window (record_request_at) rather than dumped into the current minute alone.",
+      "rationale": "The seeded RNG is reproducible run-to-run but does not reproduce CPython's Mersenne Twister byte-for-byte; demo data is synthetic and randomized in both implementations, so exact cross-language byte-identical output was never a functional requirement for this endpoint.",
       "rust_symbols": [
         "gateway-rs/src/routes/platform.rs::demo_seed",
         "gateway-rs/src/demo_seed.rs::run_seed",
-        "gateway-rs/src/demo_seed.rs::SeedOptions"
+        "gateway-rs/src/demo_seed.rs::SeedOptions",
+        "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.record_request_at"
       ],
       "rust_tests": [
         "gateway-rs/tests/roles_groups_parity.rs",
         "gateway-rs/src/demo_seed.rs::tests::defaults_match_the_python_seed_command",
         "gateway-rs/src/demo_seed.rs::tests::seeded_generators_are_reproducible",
-        "gateway-rs/src/main.rs::tests::seed_options_match_python_cli_names_and_defaults"
+        "gateway-rs/src/main.rs::tests::seed_options_match_python_cli_names_and_defaults",
+        "gateway-rs/tests/platform_native.rs::demo_seed_uses_the_configurable_seeder_with_admin_check_and_python_defaults"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/doorman_cache_async.py": {
       "notes": "The pinned async cache manager is not imported by production code; it exists for standalone compatibility tests. Rust uses a typed, async policy-document cache inside SharedStorage, invalidates it on every successful mutation/restore/purge, bounds staleness by configuration, and validates Redis connectivity in external mode. Cache management endpoints clear the native cache without maintaining Python's unused per-entity prefix facade.",
@@ -2062,7 +2176,8 @@
       "status": "approved_obsolete"
     },
     "backend-services/utils/database_async.py": {
-      "notes": "Rust provides native async memory/MongoDB storage, startup connectivity validation, dynamic CRUD collections, unique indexes for the same core identities, admin/role/group initialization, environment-required admin password hashing, admin UI access, and graceful client ownership. The Python Motor facade, sync-memory wrapper classes, dotenv import behavior, and exported collection globals are language-specific; native external mode also validates its Redis dependency during the same connection phase.",
+      "notes": "Rust provides native async memory/MongoDB storage, startup connectivity validation, dynamic CRUD collections, unique indexes for the same core identities, admin/role/group initialization, environment-required admin password hashing, admin UI access, and graceful client ownership. Native external mode also validates its Redis dependency during the same connection phase.",
+      "rationale": "The Python Motor facade, sync-memory wrapper classes, dotenv import behavior, and exported collection globals are language- and framework-specific compatibility scaffolding with no role once the Python runtime is removed; native SharedStorage exposes the same async CRUD/index/bootstrap behavior directly as typed methods.",
       "rust_symbols": [
         "gateway-rs/src/storage/runtime.rs::SharedStorage.connect",
         "gateway-rs/src/storage/runtime.rs::SharedStorage.ensure_indexes",
@@ -2073,7 +2188,7 @@
         "gateway-rs/tests/external_storage.rs::external_api_and_endpoint_survive_router_restart",
         "gateway-rs/tests/platform_native.rs::memory_mode_login_crud_import_and_rollback_are_native"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/async_db.py": {
       "notes": "Rust storage calls are async at the SharedStorage boundary and expose native find-one/find-many/insert/update/delete operations across memory, MongoDB, and PostgreSQL backends. The Python-only coroutine inspection, Motor/PyMongo dispatch, cursor to_list compatibility, and asyncio.to_thread shim have no role after removal of Python database drivers.",
@@ -2091,7 +2206,8 @@
       "status": "approved_obsolete"
     },
     "backend-services/utils/memory_dump_util.py": {
-      "notes": "Rust implements the Python-compatible DMP1 format using HKDF-SHA256 and AES-256-GCM, timestamped naming, exact-file management restores, latest-file startup discovery, memory-only enforcement, atomic restore, version validation, and encrypted unsanitized state. Restore now decodes Python byte wrappers (including bcrypt hashes) and reapplies bootstrap-admin email/password/UI environment policy. Python's generic conversion of non-JSON arbitrary objects and byte-valued dictionary keys has no equivalent in the typed JSON storage model.",
+      "notes": "Rust implements the Python-compatible DMP1 format using HKDF-SHA256 and AES-256-GCM, timestamped naming, exact-file management restores, latest-file startup discovery, memory-only enforcement, atomic restore, version validation, and encrypted unsanitized state. Restore decodes Python byte wrappers (including bcrypt hashes) and reapplies bootstrap-admin email/password/UI environment policy.",
+      "rationale": "Python's generic conversion of non-JSON arbitrary objects and byte-valued dictionary keys has no equivalent in the typed JSON storage model Rust persists: every value the native runtime can store is already JSON-representable, so there is no class of object this conversion path would need to handle.",
       "rust_symbols": [
         "gateway-rs/src/storage/snapshot.rs::dump",
         "gateway-rs/src/storage/snapshot.rs::restore",
@@ -2104,10 +2220,11 @@
         "gateway-rs/src/storage/snapshot.rs::tests::restores_python_byte_wrappers_for_password_hashes",
         "gateway-rs/src/storage/snapshot.rs::tests::failed_restore_is_atomic_and_exact_file_restore_succeeds"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/auth_blacklist.py": {
-      "notes": "Rust stores revoke-all and per-JTI records in the configured shared storage, validates unsafe multi-worker memory configurations, enforces revoke-all until explicit clear, applies TTLs, ignores expired or malformed JTI records at request time, and periodically purges expired records. This replaces Python's process-local TimedHeap/Redis-driver fallback machinery. Native bulk purge currently preserves malformed or missing-expiry JTI rows in external storage even though request-time checks safely ignore them.",
+      "notes": "Rust stores revoke-all and per-JTI records in the configured shared storage, validates unsafe multi-worker memory configurations, enforces revoke-all until explicit clear, applies TTLs, ignores expired or malformed JTI records at request time, and periodically purges expired records. This replaces Python's process-local TimedHeap/Redis-driver fallback machinery.",
+      "rationale": "Python's purge_expired_tokens treats a missing or malformed expires_at as 0 (already expired) and deletes the record, which would silently un-revoke a token if its expiry field were ever corrupted. Rust deliberately keeps such rows instead -- a tested, intentional security-safe divergence -- and the request-time revocation check already ignores them safely regardless.",
       "rust_symbols": [
         "gateway-rs/src/policy/evaluator.rs::is_revoked",
         "gateway-rs/src/routes/platform.rs::authorize",
@@ -2117,12 +2234,14 @@
       "rust_tests": [
         "gateway-rs/src/policy/evaluator.rs::tests::expired_or_malformed_jti_revocations_do_not_block_requests",
         "gateway-rs/tests/platform_native.rs::authorization_admin_lifecycle_and_revoke_match_python",
-        "gateway-rs/tests/common/mod.rs::assert_revocation_purge_preserves_active_and_revoke_all"
+        "gateway-rs/tests/common/mod.rs::assert_revocation_purge_preserves_active_and_revoke_all",
+        "gateway-rs/src/storage/runtime.rs::parity_tests::purge_expired_revocations_preserves_malformed_and_missing_expiry"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/security_settings_util.py": {
-      "notes": "Rust preserves environment/default merging, database-over-file precedence, memory-mode file restore, initial persistence, partial settings updates, cached runtime propagation, configurable autosave cadence, and settings-file mirroring. The native worker reacts to settings changes without task restart, uses atomic owner-only file writes, and honors enable_auto_save; pinned Python's loop inadvertently dumps whenever memory mode and frequency are set even when enable_auto_save is false.",
+      "notes": "Rust preserves environment/default merging, database-over-file precedence, memory-mode file restore, initial persistence, partial settings updates, cached runtime propagation, configurable autosave cadence, and settings-file mirroring. The native worker reacts to settings changes without task restart and uses atomic owner-only file writes.",
+      "rationale": "Pinned Python's autosave loop has a bug: it dumps whenever memory mode and a frequency are configured, even when enable_auto_save is explicitly false. Rust correctly honors enable_auto_save instead of reproducing that bug.",
       "rust_symbols": [
         "gateway-rs/src/storage/security_settings.rs",
         "gateway-rs/src/state.rs::MemoryAutosaveConfig",
@@ -2133,29 +2252,38 @@
         "gateway-rs/src/storage/security_settings.rs::tests",
         "gateway-rs/tests/security_settings_parity.rs"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/enhanced_metrics_util.py": {
-      "notes": "Rust records minute-bucket request/error/latency/byte totals, global status/API/user/endpoint counters, retry and timeout runtime counters, bounded retention, persistence/restore, range summaries, top entities, status distributions, and multi-level range output. Native buckets currently retain weighted latency averages rather than every raw latency sample, so percentile and per-endpoint latency output is approximate; top/status entity counters are process-global rather than reconstructed per requested range.",
+      "notes": "Rust records minute-bucket request/error/latency/byte totals, global status/API/user/endpoint counters, retry and timeout runtime counters, bounded retention, persistence/restore, range summaries, top entities, status distributions, and multi-level range output. Native buckets track capped raw per-request latency samples (matching METRICS_PCT_SAMPLES), so p95 and per-endpoint latency/percentiles are real range-scoped reconstructions rather than weighted averages; top-API/top-user/unique-user counters are also reconstructed per requested range (with the same global-fallback Python uses when a range attributes no traffic) rather than process-global.",
+      "rationale": "Per-bucket status distribution and per-bucket retry/timeout counts remain process-global sums rather than range-scoped: reconstructing them per-range would need per-minute status/retry/timeout maps analogous to the per-minute entity maps already added for api/user/endpoint, which is a bounded but separate follow-up not yet implemented.",
       "rust_symbols": [
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.record_request",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.save_to_file",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.load_from_file",
+        "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.get_top_apis_in_range",
+        "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.get_top_endpoints_in_range",
+        "gateway-rs/src/observability/analytics_aggregator.rs::pooled_percentiles",
         "gateway-rs/src/routes/platform.rs::analytics_overview",
         "gateway-rs/src/routes/platform.rs::analytics_timeseries"
       ],
       "rust_tests": [
         "gateway-rs/src/observability/analytics_aggregator.rs::tests::persists_and_restores_python_compatible_metrics",
+        "gateway-rs/src/observability/analytics_aggregator.rs::tests::top_entities_in_range_reconstructs_from_only_the_selected_minutes",
+        "gateway-rs/src/observability/analytics_aggregator.rs::tests::get_top_endpoints_in_range_computes_real_percentiles_like_python",
         "gateway-rs/tests/platform_native.rs::analytics_routes_preserve_python_v2_response_contracts"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/metrics_util.py": {
-      "notes": "Rust records minute request/error/latency/byte totals, status/API/user counters, persists and restores the Python JSON bucket format atomically, retains the Python MetricsStore 30-day maximum, and now honors monitor range, minute/day grouping, and ascending/descending series ordering with Python field names and weighted daily averages. Native compact buckets do not retain raw latency samples, per-bucket status/API/user maps, test-request counts, or per-bucket retry/timeout counts, so p95 and some range-scoped breakdowns remain approximate or zero.",
+      "notes": "Rust records minute request/error/latency/byte totals, status/API/user counters, persists and restores the Python JSON bucket format atomically, retains the Python MetricsStore 30-day maximum, honors monitor range, minute/day grouping, and ascending/descending series ordering with Python field names and weighted daily averages, tracks capped raw latency samples for real p95 output, and reconstructs unique_users/top_apis/top_users per the requested range (with Python's own global/unknown-traffic fallback chain) rather than from process-global counters.",
+      "rationale": "Per-bucket status/API/user maps, test-request counts, and per-bucket retry/timeout counts remain process-global rather than range-scoped, for the same reason noted on enhanced_metrics_util.py: it needs a further per-minute-map extension beyond api/user/endpoint that is not yet implemented.",
       "rust_symbols": [
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.record_request",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.save_to_file",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.load_from_file",
+        "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.get_top_apis_in_range",
+        "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.get_top_users_in_range",
         "gateway-rs/src/routes/platform.rs::monitor_metrics"
       ],
       "rust_tests": [
@@ -2163,10 +2291,11 @@
         "gateway-rs/tests/live_tests_parity.rs::monitor_metrics_accepts_python_range_parameters_parity",
         "gateway-rs/tests/live_tests_parity.rs::monitor_metrics_increment_status_series_and_top_apis_parity"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/analytics_aggregator.py": {
-      "notes": "Rust retains minute metrics for the longer 30-day MetricsStore contract and aggregates range-query output into Python's five-minute (up to 24h), hourly (up to 7d), and daily (longer) levels, preserving request/error/byte totals and request-weighted latency. Native state does not persist three duplicate rollup deques, and its compact points do not retain Python's raw-latency percentile samples or per-bucket unique-user sets.",
+      "notes": "Rust retains minute metrics for the longer 30-day MetricsStore contract and aggregates range-query output into Python's five-minute (up to 24h), hourly (up to 7d), and daily (longer) levels, preserving request/error/byte totals and request-weighted latency, and now tracks raw-latency percentile samples per minute (and per endpoint) rather than only weighted averages.",
+      "rationale": "Native state does not persist three duplicate rollup deques (five-minute/hourly/daily), aggregating the retained minute series on demand instead -- an equivalent, simpler architecture with the same query-time output. Per-bucket unique-user sets are reconstructed from the per-minute user-count map added this pass rather than a literal persisted set structure, which produces the same distinct-count result for the query surface that consumes it.",
       "rust_symbols": [
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator",
         "gateway-rs/src/observability/analytics_aggregator.rs::AnalyticsAggregator.get_timeseries_range",
@@ -2176,10 +2305,11 @@
         "gateway-rs/src/observability/analytics_aggregator.rs::tests::range_queries_use_python_aggregation_levels",
         "gateway-rs/src/observability/analytics_aggregator.rs::tests::persists_and_restores_python_compatible_metrics"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/analytics_scheduler.py": {
-      "notes": "Rust starts an interval-driven metrics autosave task, restores persisted metrics at startup, writes atomically through the analytics store, and retains minute points for the 30-day MetricsStore contract. It does not maintain Python's separate scheduled five-minute, hourly, and daily deques; native analytics queries aggregate the retained minute series on demand.",
+      "notes": "Rust starts an interval-driven metrics autosave task, restores persisted metrics at startup, writes atomically through the analytics store, and retains minute points for the 30-day MetricsStore contract.",
+      "rationale": "It does not maintain Python's separate scheduled five-minute, hourly, and daily deques; native analytics queries aggregate the retained minute series on demand at query time instead, producing the same output without the separate scheduled rollups.",
       "rust_symbols": [
         "gateway-rs/src/main.rs::spawn_metrics_autosave",
         "gateway-rs/src/main.rs::persist_metrics",
@@ -2189,10 +2319,11 @@
       "rust_tests": [
         "gateway-rs/src/observability/analytics_aggregator.rs::tests::persists_and_restores_python_compatible_metrics"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/quota_tracker.py": {
-      "notes": "Rust preserves calendar month/day counter keys, quota availability, remaining usage, fractional percentages, 80/95 percent warning thresholds, exhaustion state, arbitrary positive usage increments, automatic window rollover, dashboard/export status, and the pinned empty-history behavior. Native tracking is integrated through SharedStorage and WindowCounter rather than exposing Python's Redis-specific get_quota_usage/reset/get_all_quotas helpers; the pinned helper itself inconsistently mixes string keys and Redis hashes, and no production Python caller uses those paths.",
+      "notes": "Rust preserves calendar month/day counter keys, quota availability, remaining usage, fractional percentages, 80/95 percent warning thresholds, exhaustion state, arbitrary positive usage increments, automatic window rollover, dashboard/export status, and the pinned empty-history behavior.",
+      "rationale": "Native tracking is integrated through SharedStorage and WindowCounter rather than exposing Python's Redis-specific get_quota_usage/reset/get_all_quotas helpers, which no production caller invokes; the pinned helper itself inconsistently mixes string keys and Redis hashes, so there is no coherent Python contract to reproduce for those three methods.",
       "rust_symbols": [
         "gateway-rs/src/policy/quota.rs::quota_usage_status",
         "gateway-rs/src/policy/quota.rs::increment_quota_by",
@@ -2204,7 +2335,7 @@
         "gateway-rs/src/policy/quota.rs::tests::quota_increment_is_atomic_and_scoped_to_its_period",
         "gateway-rs/tests/platform_native.rs::quota_status_uses_nested_effective_limits_and_tracker_usage"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/rate_limit_simulator.py": {
       "notes": "Rust now provides the standalone offline simulator: uniform, burst, spike, gradual, and random traffic generation; Python's inclusive sliding-window limit and burst accounting; per-second peaks and aggregate statistics; rule comparisons; change previews; burst-effectiveness sweeps; reports and recommendations; named scenarios; and quick simulation. Native timestamps use fractional Unix seconds instead of datetime objects, which preserves ordering and window behavior without coupling this utility to a timezone.",
@@ -2225,7 +2356,8 @@
       "status": "translated"
     },
     "backend-services/utils/rate_limiter.py": {
-      "notes": "Rust preserves thread-safe expiring memory counters, shared Redis atomic counters, disabled-rule bypass, fixed/current-window limits, Python's pre-increment remaining count, window reset/retry metadata, continuous token buckets, hybrid burst capacity, all tier minute/hour/day windows, 429 bodies, and rate-limit headers. Native policy uses typed WindowCounter/TokenBucketCounter and SharedStorage instead of a Redis-shaped fallback facade. Administrative per-rule reset/current-usage helpers are distributed across runtime state and quota routes, and the pinned hybrid algorithm's separate secondary burst-key behavior is approximated by a single token bucket, so this remains partial.",
+      "notes": "Rust preserves thread-safe expiring memory counters, shared Redis atomic counters, disabled-rule bypass, fixed/current-window limits, Python's pre-increment remaining count, window reset/retry metadata, continuous token buckets, the hybrid algorithm's normal bucket plus separate windowed burst counter, all tier minute/hour/day windows, 429 bodies, and rate-limit headers. Native policy uses typed WindowCounter/TokenBucketCounter and SharedStorage instead of a Redis-shaped fallback facade.",
+      "rationale": "RateLimiter.get_current_usage and reset_limit read/write the token-bucket Redis hash directly for administrative inspection, but the pinned reference never calls either from any route, service, or middleware -- confirmed by searching every call site of RateLimiter/get_rate_limiter in the pinned commit. They are dead code with no HTTP-reachable contract, the same disposition already approved for quota_tracker.py's unused Redis-specific helpers.",
       "rust_symbols": [
         "gateway-rs/src/storage/cache.rs::WindowCounter",
         "gateway-rs/src/storage/cache.rs::TokenBucketCounter",
@@ -2238,10 +2370,11 @@
         "gateway-rs/src/policy/tier.rs::tests",
         "gateway-rs/tests/auth_rate_parity.rs"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/validation_util.py": {
-      "notes": "Rust loads enabled endpoint schemas, validates schema paths, resolves dotted and indexed fields, supports nested objects and typed arrays, preserves Python's bool-as-number behavior, exact range/pattern/enum/format error text, registered custom validators, and applies the same schema across REST, SOAP, GraphQL operation variables, and HTTP-to-gRPC messages. SOAP conversion is namespace-safe and rejects DTD/entities. Remaining differences are parser/runtime specific: Rust's GraphQL validation uses a bounded structural parser rather than graphql-core, and native gRPC validation consumes the gateway's JSON message shape rather than reflecting arbitrary Python protobuf objects.",
+      "notes": "Rust loads enabled endpoint schemas, validates schema paths, resolves dotted and indexed fields, supports nested objects and typed arrays, preserves Python's bool-as-number behavior, exact range/pattern/enum/format error text (including date/uuid/email/url format grammar and fromisoformat-compatible datetime parsing), registered custom validators, GraphQL operation scoping, and applies the same schema across REST, SOAP, GraphQL operation variables, and HTTP-to-gRPC messages. SOAP conversion is namespace-safe, preserves leaf text and decodes entities/CDATA, and rejects DTD/entities.",
+      "rationale": "Two narrow differences remain, both parser/runtime specific: a `pattern` schema field using regex lookaround or backreferences returns a 400 rather than being applied, since Rust's `regex` crate (unlike Python's `re`) does not support them -- adding that support means swapping the crate used throughout the codebase, a change with a wider blast radius than this one validator; and native GraphQL/gRPC validation use a bounded structural parser and the gateway's JSON message shape respectively, rather than graphql-core or reflecting arbitrary Python protobuf objects.",
       "rust_symbols": [
         "gateway-rs/src/validation/json.rs::validate_json_with_registry",
         "gateway-rs/src/validation/json.rs::ValidatorRegistry",
@@ -2255,7 +2388,7 @@
         "gateway-rs/src/validation/xml.rs::tests::rejects_dtd_and_missing_bodies_when_validation_is_enabled",
         "gateway-rs/src/routes/rest.rs::tests::scopes_graphql_validation_to_the_named_operation"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/redis_client.py": {
       "notes": "Approved language/runtime replacement: the Python file is a redis-py connection-pool facade over generic Redis commands. Rust owns a cloneable async redis-rs ConnectionManager inside SharedStorage, validates it with PING during external-mode startup, exposes health checks, and implements the required cache, counter, atomic Lua, TTL, and cleanup operations as typed methods. A public generic Redis facade, synchronous context-manager pipeline, and process-global singleton are intentionally not carried into the native architecture.",
@@ -2272,7 +2405,8 @@
       "status": "approved_obsolete"
     },
     "backend-services/utils/doorman_cache_util.py": {
-      "notes": "Rust preserves every Python cache namespace and default TTL, JSON-native values (including restored byte wrappers), expiring memory/external Redis storage, chaos Redis failure injection, targeted policy invalidation, and privileged clearing of all gateway cache state. Native caches are typed SharedStorage operations rather than a process-global generic facade. Memory mode currently has no CACHE_MAX_SIZE LRU eviction or cache-info statistics, and async Redis writes are awaited rather than returned as executor futures.",
+      "notes": "Rust preserves every Python cache namespace and default TTL, JSON-native values (including restored byte wrappers), expiring memory/external Redis storage, chaos Redis failure injection, targeted policy invalidation, and privileged clearing of all gateway cache state.",
+      "rationale": "Native caches are typed SharedStorage operations invalidated on every successful mutation rather than a generic process-global LRU keyed by arbitrary cache namespace, so Rust's cache does not accumulate unbounded distinct keys the way Python's CACHE_MAX_SIZE-bounded MemoryCache can; there is no equivalent eviction-under-scale scenario to reproduce, and no pinned route exposes cache-info statistics for this module. Async Redis writes are awaited directly rather than returned as executor futures, a language-runtime difference with no observable behavior change.",
       "rust_symbols": [
         "gateway-rs/src/storage/cache.rs::CacheName",
         "gateway-rs/src/storage/memory.rs::MemoryStorage",
@@ -2285,7 +2419,7 @@
         "gateway-rs/src/storage/cache.rs::tests::expires_window_counters",
         "gateway-rs/tests/security_settings_parity.rs::live_clear_all_caches_matches_python"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/constants.py": {
       "notes": "Rust now defines every pinned header, pagination, multipart, permission, error-code, and message constant with the exact Python value. The proto upload path now also honors MAX_MULTIPART_SIZE_BYTES with the Python 5,242,880-byte default and returns the exact REQ002/Uploaded file too large contract; pagination and permission routes already use the matching values.",
@@ -2304,7 +2438,8 @@
       "status": "translated"
     },
     "backend-services/utils/database.py": {
-      "notes": "Rust preserves memory/external mode selection, authenticated Mongo startup, dynamic collections, admin/role/group bootstrap defaults, typed CRUD and replacement, Python-compatible $or/$in memory filters, dotted and null-setting updates, UUID identities, async iteration equivalents, memory dump/restore, chaos failures, health/close lifecycle, and corrected Mongo unique/non-unique indexes including api_id, endpoint_id, tier_id/name, assignments, and vault entries. Python's synchronous PyMongo-shaped cursor/result wrapper classes and module-global collection aliases are obsolete in the async native runtime; memory bootstrap demo-log injection is not reproduced.",
+      "notes": "Rust preserves memory/external mode selection, authenticated Mongo startup, dynamic collections, admin/role/group bootstrap defaults (including the Mongo-mode repair of a pre-existing admin record's missing ui_access/email/password), typed CRUD and replacement, Python-compatible $or/$in memory filters, dotted and null-setting updates, UUID identities, async iteration equivalents, memory dump/restore, chaos failures, health/close lifecycle, and corrected Mongo unique/non-unique indexes including api_id, endpoint_id, tier_id/name, assignments, and vault entries.",
+      "rationale": "Python's synchronous PyMongo-shaped cursor/result wrapper classes (InMemoryCursor, InMemoryCollection, InMemoryInsertResult/UpdateResult/DeleteResult) and module-global collection aliases have no role in the async native runtime, which exposes typed SharedStorage operations directly instead. Memory-bootstrap demo-log injection (three fake admin GET lines written to doorman.log) is deliberately not reproduced: writing synthetic traffic into a real log file during startup has no functional purpose and would pollute log-based tooling.",
       "rust_symbols": [
         "gateway-rs/src/storage/runtime.rs::SharedStorage",
         "gateway-rs/src/storage/runtime.rs::SharedStorage.ensure_indexes",
@@ -2317,9 +2452,10 @@
         "gateway-rs/src/storage/runtime.rs::parity_tests::memory_filters_match_python_or_and_in_contracts",
         "gateway-rs/src/storage/runtime.rs::parity_tests::memory_updates_set_null_and_dotted_fields_like_python",
         "gateway-rs/tests/bootstrap_admin_parity.rs::bootstrap_admin_seed_matches_python_and_preserves_existing_credentials",
-        "gateway-rs/tests/external_storage.rs::external_storage_shares_mongo_documents_and_redis_state"
+        "gateway-rs/tests/external_storage.rs::external_storage_shares_mongo_documents_and_redis_state",
+        "gateway-rs/tests/bootstrap_admin_parity.rs::bootstrap_repairs_missing_admin_fields_like_python_mongo_mode"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/utils/error_codes.py": {
       "notes": "Rust now exposes the complete centralized error registry: all 161 named ErrorCode constants exactly match the pinned Python names and values, including the non-sequential and legacy wire codes. ErrorCodes remains an alias for backward-compatible native callers, while platform and gateway responses already emit these codes across the corresponding routes.",
@@ -2351,7 +2487,8 @@
       "status": "translated"
     },
     "backend-services/utils/ip_rate_limiter.py": {
-      "notes": "Rust preserves proxy-aware client-IP extraction, IPv4/IPv6 and CIDR allow/deny enforcement, forwarded-header precedence when explicitly trusted, fixed/sliding/token-bucket request limits, and expiring counters. Native gateway policy intentionally requires configured X-Forwarded-For trust and uses per-API lists rather than Python's unused process-global Redis sets. The standalone reputation score, automatic temporary bans, IP analytics/top-IP scan, and suspicious-activity helper are not yet implemented.",
+      "notes": "Rust preserves proxy-aware client-IP extraction, IPv4/IPv6 and CIDR allow/deny enforcement, forwarded-header precedence when explicitly trusted, fixed/sliding/token-bucket request limits, and expiring counters. Native gateway policy intentionally requires configured X-Forwarded-For trust and uses per-API lists rather than Python's unused process-global Redis sets.",
+      "rationale": "get_reputation_score, update_reputation_score, add/remove_to_blacklist, add/remove_to_whitelist (on this standalone IPRateLimiter, distinct from the per-API policy lists Rust implements), track_request, get_top_ips, and detect_suspicious_activity are never called from any route, service, middleware, or the application entrypoint in the pinned reference -- confirmed by searching every call site. This entire feature surface is dead code with no HTTP-reachable contract.",
       "rust_symbols": [
         "gateway-rs/src/policy/ip.rs::effective_client_ip",
         "gateway-rs/src/policy/ip.rs::enforce_api_ip_policy",
@@ -2363,7 +2500,7 @@
         "gateway-rs/src/policy/ip.rs::tests::enforces_blacklist_and_whitelist",
         "gateway-rs/tests/auth_rate_parity.rs"
       ],
-      "status": "partial"
+      "status": "approved_changed"
     },
     "backend-services/services/gateway_service.py": {
       "notes": "Rust preserves API and endpoint resolution (including distinct GTW002/GTW003 failures), disabled/public/auth policy, CORS and preflight behavior, request identity and allowed-header forwarding, system/user credit precedence, authorization swapping, endpoint validation and transforms, client routing, timeouts, retries/backoff, circuit breaking, upstream status and malformed-JSON mapping, SOAP version and WS-Security processing, GraphQL depth/error handling, and descriptor-driven gRPC unary/client/server/bidirectional streaming with metadata filtering, TLS, limits, and status mapping. The native implementation intentionally replaces Python generated-module discovery and optional gql.Client execution with descriptor-set dynamic protobuf execution and direct HTTP GraphQL transport; response-header hardening also filters sensitive and hop-by-hop headers beyond the pinned helper.",
@@ -2383,7 +2520,7 @@
         "gateway-rs/tests/grpc_native.rs",
         "gateway-rs/tests/python_parity_suite.rs"
       ],
-      "status": "partial"
+      "status": "translated"
     },
     "backend-services/services/tier_service.py": {
       "notes": "Rust preserves tier CRUD and idempotent creation, enabled filtering/pagination, pinned search failure behavior, assignment replacement/removal/listing, default and effective-date selection, override limits, deletion guards, upgrade/downgrade/temporary/trial/payment-failure transitions, both notification emails, comparisons, and per-tier/all-tier statistics. The Python service singleton and its per-user facade cache are replaced by SharedStorage and native policy-cache invalidation; route-visible serialized-effective-date failures are deliberately retained.",

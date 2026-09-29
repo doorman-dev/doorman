@@ -38,13 +38,15 @@ sha2 = "0.10"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.48", features = ["full"] }
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["catch-panic", "compression-gzip", "trace", "sensitive-headers"] }
-tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 uuid = { version = "1.18", features = ["v4"] }
+x509-parser = "0.18"
 bcrypt = "0.19.3"
 aes-gcm = "0.11.0"
 hkdf = "0.12.4"
