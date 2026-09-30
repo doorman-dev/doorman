@@ -195,9 +195,22 @@ pub async fn execute_web_gateway(
             return web_trailer_response(text_mode, tonic::Code::Unavailable, "Invalid upstream");
         }
     };
-    let channel = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
+    let channel = match state
+        .grpc_channel(
+            &endpoint,
+            decision.upstream_tls_profile_id.as_deref(),
+            decision.request_timeout_ms,
+        )
+        .await
+    {
         Ok(channel) => channel,
-        Err(_) => return web_trailer_response(text_mode, tonic::Code::Unavailable, "Upstream unavailable"),
+        Err(_) => {
+            return web_trailer_response(
+                text_mode,
+                tonic::Code::Unavailable,
+                "Upstream unavailable",
+            );
+        }
     };
     let path = match PathAndQuery::try_from(format!(
         "/{}/{}",
@@ -415,7 +428,14 @@ async fn execute(
         .max(env_u32("GRPC_MAX_RETRIES", 0))
         .saturating_add(1);
     for attempt in 0..attempts {
-        let result = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
+        let result = match state
+            .grpc_channel(
+                &endpoint,
+                decision.upstream_tls_profile_id.as_deref(),
+                decision.request_timeout_ms,
+            )
+            .await
+        {
             Ok(channel) => {
                 invoke(
                     channel,
@@ -442,7 +462,14 @@ async fn execute(
             Err(primary_error) => {
                 // The Python gateway makes one final compatibility attempt without the
                 // protobuf package. Some legacy gRPC services register that path.
-                let fallback = match state.grpc_channel(&endpoint, decision.upstream_tls_profile_id.as_deref(), decision.request_timeout_ms).await {
+                let fallback = match state
+                    .grpc_channel(
+                        &endpoint,
+                        decision.upstream_tls_profile_id.as_deref(),
+                        decision.request_timeout_ms,
+                    )
+                    .await
+                {
                     Ok(channel) => {
                         invoke(
                             channel,

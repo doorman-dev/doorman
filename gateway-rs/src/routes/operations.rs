@@ -160,23 +160,31 @@ async fn require_manage_gateway(
     headers: &HeaderMap,
     operation: GatewayOperation,
 ) -> Result<String, Response> {
-    let claims = verify_request_token(headers, &state.config.shared_storage)
-        .map_err(|_| policy_error(StatusCode::UNAUTHORIZED, "GTW401", "Unauthorized"))?;
+    // The pinned status route wraps an auth failure as GTW401, while the
+    // cache-clearing route lets FastAPI render `{"detail": "Unauthorized"}`.
+    let unauthorized = || match operation {
+        GatewayOperation::Status => {
+            policy_error(StatusCode::UNAUTHORIZED, "GTW401", "Unauthorized")
+        }
+        GatewayOperation::ClearCaches => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"detail": "Unauthorized"})),
+        )
+            .into_response(),
+    };
+    let claims =
+        verify_request_token(headers, &state.config.shared_storage).map_err(|_| unauthorized())?;
     let username = claims.sub.as_deref().unwrap_or_default();
     let documents = load_documents(state).await?;
     if is_revoked(&documents.revocations, username, claims.jti.as_deref()) {
-        return Err(policy_error(
-            StatusCode::UNAUTHORIZED,
-            "GTW401",
-            "Unauthorized",
-        ));
+        return Err(unauthorized());
     }
     let user = documents
         .users
         .iter()
         .find(|user| string_field(user, "username") == Some(username))
         .filter(|user| bool_field_default(user, "active", true))
-        .ok_or_else(|| policy_error(StatusCode::UNAUTHORIZED, "GTW401", "Unauthorized"))?;
+        .ok_or_else(unauthorized)?;
     let role_name = string_field(user, "role").unwrap_or_default();
     let allowed = documents.roles.iter().any(|role| {
         string_field(role, "role_name") == Some(role_name)

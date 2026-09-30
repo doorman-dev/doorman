@@ -135,7 +135,7 @@ async fn parity_test_user_onboarding_and_auth_flows() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/platform/users")
+                .uri("/platform/user")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -158,7 +158,7 @@ async fn parity_test_user_onboarding_and_auth_flows() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/platform/users")
+                .uri("/platform/user")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(

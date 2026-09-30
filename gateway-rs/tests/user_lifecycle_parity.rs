@@ -159,7 +159,7 @@ async fn self_service_updates_cannot_escalate_privileges() {
     .await;
     assert_eq!(status, StatusCode::OK, "{users}");
     assert!(
-        users["response"]["users"]
+        users["users"]
             .as_array()
             .unwrap()
             .iter()
@@ -308,7 +308,7 @@ async fn admin_can_read_list_update_and_delete_administrator_resources() {
     .await;
     assert_eq!(status, StatusCode::OK, "{users}");
     assert!(
-        users["response"]["users"]
+        users["users"]
             .as_array()
             .unwrap()
             .iter()

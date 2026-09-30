@@ -444,8 +444,8 @@ async fn least_privilege_role_cannot_create_apis_or_read_logs() {
     );
     for (path, code) in [
         ("/platform/logging/logs", "LOG001"),
-        ("/platform/logging/logs/files", "LOG001"),
-        ("/platform/logging/logs/statistics", "LOG001"),
+        ("/platform/logging/logs/files", "LOG005"),
+        ("/platform/logging/logs/statistics", "LOG002"),
         ("/platform/logging/logs/export", "LOG003"),
         ("/platform/logging/logs/download", "LOG004"),
     ] {
@@ -583,7 +583,7 @@ async fn non_admin_managers_cannot_discover_or_manage_bootstrap_admin() {
     .await;
     assert_eq!(users.status(), StatusCode::OK);
     assert!(
-        json_body(users).await["response"]["users"]
+        json_body(users).await["users"]
             .as_array()
             .unwrap()
             .iter()
@@ -908,8 +908,15 @@ async fn subscription_target_requires_the_python_group_access_gate() {
         })),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json_body(response).await["error_code"], "SUB007");
+    // Verified against the pinned server: group_required raises a 401 that the
+    // route renders as GEN001 (its SUB007 branch is unreachable).
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_eq!(body["error_code"], "GEN001");
+    assert_eq!(
+        body["error_message"],
+        "You do not have the correct group for this"
+    );
 }
 
 #[tokio::test]
@@ -1003,12 +1010,14 @@ async fn missing_group_and_role_contracts_match_python_service_codes() {
     let app = app().await;
     let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
     for (method, path, code) in [
-        (Method::GET, "/platform/group/not-a-group", "GRP002"),
+        (Method::GET, "/platform/group/not-a-group", "GRP003"),
         (Method::GET, "/platform/role/not-a-role", "ROLE004"),
-        (Method::DELETE, "/platform/group/not-a-group", "GRP002"),
+        (Method::DELETE, "/platform/group/not-a-group", "GRP003"),
         (Method::DELETE, "/platform/role/not-a-role", "ROLE004"),
     ] {
-        let expected = if method == Method::DELETE && path.contains("/role/") {
+        // Verified against the pinned server: group_service/role_service return
+        // 400 for a missing target on delete and 404 on read.
+        let expected = if method == Method::DELETE {
             StatusCode::BAD_REQUEST
         } else {
             StatusCode::NOT_FOUND
@@ -1078,8 +1087,8 @@ async fn role_route_permissions_visibility_and_admin_codes_match_python() {
     assert_eq!(listed.status(), StatusCode::OK);
     let listed = json_body(listed).await;
     assert!(listed["roles"].is_array());
-    assert_eq!(listed["page"], 1);
-    assert_eq!(listed["page_size"], 10);
+    // Non-admin callers get only the filtered roles (no page metadata).
+    assert!(listed.get("page").is_none());
     assert!(
         listed["roles"]
             .as_array()

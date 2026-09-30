@@ -9,11 +9,13 @@ use std::{
 
 use reqwest::{Client, redirect::Policy};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_rustls::rustls::ServerConfig;
-use sha2::{Digest, Sha256};
-use tonic::transport::{Certificate as GrpcCertificate, Channel, ClientTlsConfig, Endpoint, Identity as GrpcIdentity};
+use tonic::transport::{
+    Certificate as GrpcCertificate, Channel, ClientTlsConfig, Endpoint, Identity as GrpcIdentity,
+};
 
 use crate::{
     config::Config,
@@ -23,7 +25,12 @@ use crate::{
         models::PolicyDocuments,
         runtime::{SharedStorage, StorageError},
     },
-    tls::{TlsReloadHandle, profiles::{TlsProfileError, TlsProfiles}, secrets::TlsSecretError, server_config_from_pem_with_roots},
+    tls::{
+        TlsReloadHandle,
+        profiles::{TlsProfileError, TlsProfiles},
+        secrets::TlsSecretError,
+        server_config_from_pem_with_roots,
+    },
     validation::json::ValidatorRegistry,
 };
 
@@ -41,6 +48,9 @@ pub enum StateError {
     TlsSecret(#[from] TlsSecretError),
 }
 
+/// Cache key for pooled upstream gRPC channels.
+type GrpcChannelKey = (u64, String, String, u64);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -50,7 +60,7 @@ pub struct AppState {
     tls_listener_hash: Arc<Mutex<Option<[u8; 32]>>>,
     tls_listener_from_admin: Arc<AtomicBool>,
     tls_reload_lock: Arc<tokio::sync::Mutex<()>>,
-    grpc_channels: Arc<Mutex<HashMap<(u64, String, String, u64), Channel>>>,
+    grpc_channels: Arc<Mutex<HashMap<GrpcChannelKey, Channel>>>,
     pub policy_documents: Option<Arc<Mutex<PolicyDocuments>>>,
     pub storage: Option<Arc<SharedStorage>>,
     pub runtime: Arc<GatewayRuntime>,
@@ -193,15 +203,48 @@ impl GatewayRuntime {
     }
 }
 
+/// Upstream client settings from the pinned httpx pool environment
+/// (`GatewayService._build_limits`/`get_http_client`): HTTP_MAX_KEEPALIVE
+/// (default 50) bounds idle pooled connections, HTTP_KEEPALIVE_EXPIRY
+/// (default 30s) expires them, ENABLE_HTTPX_CLIENT_CACHE=false disables
+/// connection reuse, and HTTP/2 is only negotiated when HTTP_ENABLE_HTTP2 is
+/// exactly `true` (httpx defaults to HTTP/1.1). Unparseable values fall back to
+/// the defaults like Python's try/except parsing.
+fn upstream_client_builder(connect_timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    }
+    let pooled = std::env::var("ENABLE_HTTPX_CLIENT_CACHE")
+        .map(|value| value.to_lowercase() != "false")
+        .unwrap_or(true);
+    let max_keepalive = if pooled {
+        env_or("HTTP_MAX_KEEPALIVE", 50usize)
+    } else {
+        0
+    };
+    let keepalive_expiry: f64 = env_or("HTTP_KEEPALIVE_EXPIRY", 30.0);
+    let mut builder = Client::builder()
+        .user_agent("doorman-gateway/2.0.0 (compatible; httpx/0.27)")
+        .connect_timeout(connect_timeout)
+        .redirect(Policy::none())
+        .pool_max_idle_per_host(max_keepalive)
+        .tcp_keepalive(std::time::Duration::from_secs(60));
+    if keepalive_expiry.is_finite() && keepalive_expiry > 0.0 {
+        builder = builder.pool_idle_timeout(std::time::Duration::from_secs_f64(keepalive_expiry));
+    }
+    if std::env::var("HTTP_ENABLE_HTTP2").map(|value| value.to_lowercase()) != Ok("true".to_owned())
+    {
+        builder = builder.http1_only();
+    }
+    builder
+}
+
 impl AppState {
     pub fn new(config: Config) -> Result<Self, reqwest::Error> {
-        let proxy_client = Client::builder()
-            .user_agent("doorman-gateway/2.0.0 (compatible; httpx/0.27)")
-            .connect_timeout(config.connect_timeout)
-            .redirect(Policy::none())
-            .pool_max_idle_per_host(32)
-            .tcp_keepalive(std::time::Duration::from_secs(60))
-            .build()?;
+        let proxy_client = upstream_client_builder(config.connect_timeout).build()?;
         Ok(Self {
             config,
             proxy_client,
@@ -226,7 +269,9 @@ impl AppState {
 
     pub async fn from_config(config: Config) -> Result<Self, StateError> {
         let mut state = Self::new(config)?;
-        state.publish_tls_profiles(TlsProfiles::load_file(state.config.tls_profiles_file.as_deref())?)?;
+        state.publish_tls_profiles(TlsProfiles::load_file(
+            state.config.tls_profiles_file.as_deref(),
+        )?)?;
         let storage = SharedStorage::connect(&state.config.shared_storage).await?;
         storage.initialize_core().await?;
         state.storage = Some(Arc::new(storage));
@@ -234,7 +279,10 @@ impl AppState {
     }
 
     pub fn tls_snapshot(&self) -> Arc<TlsSnapshot> {
-        self.tls_snapshot.read().expect("TLS snapshot lock poisoned").clone()
+        self.tls_snapshot
+            .read()
+            .expect("TLS snapshot lock poisoned")
+            .clone()
     }
 
     pub fn publish_tls_profiles(&self, profiles: TlsProfiles) -> Result<(), StateError> {
@@ -245,12 +293,7 @@ impl AppState {
         let expiries = profiles.certificate_expiries();
         let mut http_clients = HashMap::new();
         for (id, profile) in &profiles.upstreams {
-            let mut builder = Client::builder()
-                .user_agent("doorman-gateway/2.0.0 (compatible; httpx/0.27)")
-                .connect_timeout(self.config.connect_timeout)
-                .redirect(Policy::none())
-                .pool_max_idle_per_host(32)
-                .tcp_keepalive(std::time::Duration::from_secs(60));
+            let mut builder = upstream_client_builder(self.config.connect_timeout);
             if !profile.ca_pem.is_empty() {
                 for cert in reqwest::Certificate::from_pem_bundle(&profile.ca_pem)? {
                     builder = builder.add_root_certificate(cert);
@@ -265,28 +308,51 @@ impl AppState {
             http_clients.insert(id.clone(), builder.build()?);
         }
         let revision = self.tls_snapshot().revision.saturating_add(1);
-        let snapshot = Arc::new(TlsSnapshot { revision, profiles: Arc::new(profiles), fingerprint, http_clients });
-        *self.tls_snapshot.write().expect("TLS snapshot lock poisoned") = snapshot;
-        self.grpc_channels.lock().expect("gRPC cache lock poisoned").clear();
-        let mut active_expiries = self.runtime.tls_certificate_expiries.lock().expect("TLS expiry lock poisoned");
+        let snapshot = Arc::new(TlsSnapshot {
+            revision,
+            profiles: Arc::new(profiles),
+            fingerprint,
+            http_clients,
+        });
+        *self
+            .tls_snapshot
+            .write()
+            .expect("TLS snapshot lock poisoned") = snapshot;
+        self.grpc_channels
+            .lock()
+            .expect("gRPC cache lock poisoned")
+            .clear();
+        let mut active_expiries = self
+            .runtime
+            .tls_certificate_expiries
+            .lock()
+            .expect("TLS expiry lock poisoned");
         active_expiries.retain(|name, _| name == "listener");
         active_expiries.extend(expiries);
-        self.runtime.tls_reload_success_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.runtime
+            .tls_reload_success_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     pub fn set_tls_listener_handle(&self, handle: TlsReloadHandle) {
-        *self.tls_listener_handle.lock().expect("TLS listener handle lock poisoned") = Some(handle);
+        *self
+            .tls_listener_handle
+            .lock()
+            .expect("TLS listener handle lock poisoned") = Some(handle);
     }
 
     pub fn tls_listener_from_admin(&self) -> bool {
-        self.tls_listener_from_admin.load(std::sync::atomic::Ordering::Relaxed)
+        self.tls_listener_from_admin
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn reload_tls_from_storage(&self) -> Result<Option<ServerConfig>, StateError> {
         let result = self.reload_tls_from_storage_inner().await;
         if result.is_err() {
-            self.runtime.tls_reload_failure_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.runtime
+                .tls_reload_failure_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         result
     }
@@ -295,17 +361,33 @@ impl AppState {
         let _guard = self.tls_reload_lock.lock().await;
         let mut profiles = TlsProfiles::load_file(self.config.tls_profiles_file.as_deref())?;
         let documents = match &self.storage {
-            Some(storage) => storage.find_many("tls_profiles", &serde_json::json!({})).await?,
+            Some(storage) => {
+                storage
+                    .find_many("tls_profiles", &serde_json::json!({}))
+                    .await?
+            }
             None => Vec::new(),
         };
         profiles.merge_admin_documents(&documents)?;
-        let listener = if self.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native {
-            let admin_listener = documents.iter().find(|document| document.get("kind").and_then(Value::as_str) == Some("listener"));
+        let listener = if self.config.downstream_tls_mode
+            == crate::config::DownstreamTlsMode::Native
+        {
+            let admin_listener = documents
+                .iter()
+                .find(|document| document.get("kind").and_then(Value::as_str) == Some("listener"));
             let roots = profiles.combined_client_roots();
             let admin_material = admin_listener.map(|document| -> Result<_, StateError> {
-                let id = document.get("id").and_then(Value::as_str).unwrap_or("listener");
-                let cert = document.get("cert_pem").and_then(Value::as_str).ok_or(TlsProfileError::Invalid("listener certificate missing".to_owned()))?;
-                let key = document.get("key_pem").and_then(Value::as_str).ok_or(TlsProfileError::Invalid("listener key missing".to_owned()))?;
+                let id = document
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("listener");
+                let cert = document.get("cert_pem").and_then(Value::as_str).ok_or(
+                    TlsProfileError::Invalid("listener certificate missing".to_owned()),
+                )?;
+                let key = document
+                    .get("key_pem")
+                    .and_then(Value::as_str)
+                    .ok_or(TlsProfileError::Invalid("listener key missing".to_owned()))?;
                 let cert = crate::tls::secrets::open(id, "cert_pem", cert)?;
                 let key = crate::tls::secrets::open(id, "key_pem", key)?;
                 let config = server_config_from_pem_with_roots(&cert, &key, Some(roots.clone()))?;
@@ -315,14 +397,34 @@ impl AppState {
                 Some(Ok(material)) => material,
                 Some(Err(error)) => {
                     tracing::warn!(%error, "admin TLS listener certificate rejected; using mounted certificate");
-                    let cert = std::fs::read(self.config.downstream_tls_cert_file.as_deref().expect("validated TLS certificate path"))?;
-                    let key = std::fs::read(self.config.downstream_tls_key_file.as_deref().expect("validated TLS key path"))?;
+                    let cert = std::fs::read(
+                        self.config
+                            .downstream_tls_cert_file
+                            .as_deref()
+                            .expect("validated TLS certificate path"),
+                    )?;
+                    let key = std::fs::read(
+                        self.config
+                            .downstream_tls_key_file
+                            .as_deref()
+                            .expect("validated TLS key path"),
+                    )?;
                     let config = server_config_from_pem_with_roots(&cert, &key, Some(roots))?;
                     (cert, key, config, false)
                 }
                 None => {
-                    let cert = std::fs::read(self.config.downstream_tls_cert_file.as_deref().expect("validated TLS certificate path"))?;
-                    let key = std::fs::read(self.config.downstream_tls_key_file.as_deref().expect("validated TLS key path"))?;
+                    let cert = std::fs::read(
+                        self.config
+                            .downstream_tls_cert_file
+                            .as_deref()
+                            .expect("validated TLS certificate path"),
+                    )?;
+                    let key = std::fs::read(
+                        self.config
+                            .downstream_tls_key_file
+                            .as_deref()
+                            .expect("validated TLS key path"),
+                    )?;
                     let config = server_config_from_pem_with_roots(&cert, &key, Some(roots))?;
                     (cert, key, config, false)
                 }
@@ -339,16 +441,31 @@ impl AppState {
         };
         self.publish_tls_profiles(profiles)?;
         if let Some((config, hash, expiry, from_admin)) = &listener {
-            let mut active = self.tls_listener_hash.lock().expect("TLS listener hash lock poisoned");
+            let mut active = self
+                .tls_listener_hash
+                .lock()
+                .expect("TLS listener hash lock poisoned");
             if active.as_ref() != Some(hash) {
-                if let Some(handle) = self.tls_listener_handle.lock().expect("TLS listener handle lock poisoned").as_ref() {
+                if let Some(handle) = self
+                    .tls_listener_handle
+                    .lock()
+                    .expect("TLS listener handle lock poisoned")
+                    .as_ref()
+                {
                     handle.publish(config.clone());
                 }
                 *active = Some(*hash);
-                self.runtime.tls_reload_success_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.runtime
+                    .tls_reload_success_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.runtime.tls_certificate_expiries.lock().expect("TLS expiry lock poisoned").insert("listener".to_owned(), *expiry);
-            self.tls_listener_from_admin.store(*from_admin, std::sync::atomic::Ordering::Relaxed);
+            self.runtime
+                .tls_certificate_expiries
+                .lock()
+                .expect("TLS expiry lock poisoned")
+                .insert("listener".to_owned(), *expiry);
+            self.tls_listener_from_admin
+                .store(*from_admin, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(listener.map(|(config, _, _, _)| config))
     }
@@ -367,15 +484,31 @@ impl AppState {
         timeout_ms: u64,
     ) -> Result<Channel, String> {
         let snapshot = self.tls_snapshot();
-        let key = (snapshot.revision, endpoint.to_owned(), profile_id.unwrap_or_default().to_owned(), timeout_ms);
-        if let Some(channel) = self.grpc_channels.lock().map_err(|_| "gRPC channel cache unavailable")?.get(&key).cloned() {
+        let key = (
+            snapshot.revision,
+            endpoint.to_owned(),
+            profile_id.unwrap_or_default().to_owned(),
+            timeout_ms,
+        );
+        if let Some(channel) = self
+            .grpc_channels
+            .lock()
+            .map_err(|_| "gRPC channel cache unavailable")?
+            .get(&key)
+            .cloned()
+        {
             return Ok(channel);
         }
-        let mut target = Endpoint::from_shared(endpoint.to_owned()).map_err(|error| error.to_string())?
+        let mut target = Endpoint::from_shared(endpoint.to_owned())
+            .map_err(|error| error.to_string())?
             .connect_timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
             .timeout(std::time::Duration::from_millis(timeout_ms.max(1)));
         if let Some(id) = profile_id {
-            let profile = snapshot.profiles.upstreams.get(id).ok_or("gRPC TLS profile is unavailable")?;
+            let profile = snapshot
+                .profiles
+                .upstreams
+                .get(id)
+                .ok_or("gRPC TLS profile is unavailable")?;
             let mut tls = ClientTlsConfig::new();
             if !profile.ca_pem.is_empty() {
                 tls = tls.ca_certificate(GrpcCertificate::from_pem(profile.ca_pem.clone()));
@@ -389,7 +522,10 @@ impl AppState {
             target = target.tls_config(tls).map_err(|error| error.to_string())?;
         }
         let channel = target.connect().await.map_err(|error| error.to_string())?;
-        let mut cache = self.grpc_channels.lock().map_err(|_| "gRPC channel cache unavailable")?;
+        let mut cache = self
+            .grpc_channels
+            .lock()
+            .map_err(|_| "gRPC channel cache unavailable")?;
         if cache.len() >= 128 {
             if let Some(oldest) = cache.keys().next().cloned() {
                 cache.remove(&oldest);

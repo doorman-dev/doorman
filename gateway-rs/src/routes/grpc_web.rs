@@ -26,6 +26,20 @@ pub async fn grpc_web_policy_then_execute(
     ) {
         return Ok(http::StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
+    // The pinned proxy rejects a non-gRPC-Web body before resolving the API.
+    if request.method() == http::Method::POST
+        && !request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/grpc-web"))
+    {
+        // Starlette's bare Response sets no media type.
+        return Ok(Response::builder()
+            .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+            .body(axum::body::Body::from("Invalid Content-Type"))
+            .expect("static 415 response"));
+    }
     let version = request
         .headers()
         .get("x-api-version")
@@ -39,7 +53,31 @@ pub async fn grpc_web_policy_then_execute(
     request
         .extensions_mut()
         .insert(GrpcWebTarget { service, method });
-    rest_policy_then_proxy(State(state), request).await
+    let response = rest_policy_then_proxy(State(state), request).await?;
+    if response.status() != http::StatusCode::NOT_FOUND {
+        return Ok(response);
+    }
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let missing_api = serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|value| {
+        value.get("error_code").and_then(serde_json::Value::as_str) == Some("GTW001")
+    });
+    if !missing_api {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(body)));
+    }
+    // Python answers an unknown API in-band: HTTP 200 carrying grpc-status 12.
+    let mut response = crate::protocol::grpc::web_trailer_response(
+        false,
+        tonic::Code::Unimplemented,
+        "API not found",
+    );
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc-web"),
+    );
+    Ok(response)
 }
 
 use axum::response::IntoResponse;

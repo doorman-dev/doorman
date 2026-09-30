@@ -357,8 +357,11 @@ async fn execute_soap(
     }
     // Python's CRUD SOAP handler implements only createItem and listItems;
     // getItem is "not supported yet" and everything else is unknown.
-    let operation = Regex::new(r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(createItem|listItems)\b")
-        .expect("static SOAP operation regex")
+    static OPERATION: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(createItem|listItems)\b")
+            .expect("static SOAP operation regex")
+    });
+    let operation = OPERATION
         .captures(xml)
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str())
@@ -501,9 +504,26 @@ fn storage_collection<'a>(
     Ok((storage, collection))
 }
 
+/// Patterns here are built from a small fixed set of operation and element
+/// names; compile each once instead of per request.
+fn cached_regex(pattern: String) -> Option<Regex> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
+        std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    if let Some(regex) = cache.get(&pattern) {
+        return Some(regex.clone());
+    }
+    let regex = Regex::new(&pattern).ok()?;
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(pattern, regex.clone());
+    Some(regex)
+}
+
 fn has_operation(query: &str, operation: &str) -> bool {
-    Regex::new(&format!(r"\b{}\b", regex::escape(operation)))
-        .is_ok_and(|regex| regex.is_match(query))
+    cached_regex(format!(r"\b{}\b", regex::escape(operation)))
+        .is_some_and(|regex| regex.is_match(query))
 }
 
 fn variable_string<'a>(
@@ -530,7 +550,7 @@ fn variable_object(
 }
 
 fn xml_element(xml: &str, name: &str) -> Result<String, StorageError> {
-    Regex::new(&format!(
+    cached_regex(format!(
         r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?{0}\b[^>]*>(.*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?{0}\s*>",
         regex::escape(name)
     ))

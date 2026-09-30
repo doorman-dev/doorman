@@ -216,9 +216,11 @@ impl Config {
         {
             "proxy" => DownstreamTlsMode::Proxy,
             "native" => DownstreamTlsMode::Native,
-            _ => return Err(ConfigError::InvalidConfiguration(
-                "DOWNSTREAM_TLS_MODE must be proxy or native".to_owned(),
-            )),
+            _ => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "DOWNSTREAM_TLS_MODE must be proxy or native".to_owned(),
+                ));
+            }
         };
         let downstream_tls_cert_file = env_non_empty("DOWNSTREAM_TLS_CERT_FILE").map(PathBuf::from);
         let downstream_tls_key_file = env_non_empty("DOWNSTREAM_TLS_KEY_FILE").map(PathBuf::from);
@@ -227,7 +229,8 @@ impl Config {
             && (downstream_tls_cert_file.is_none() || downstream_tls_key_file.is_none())
         {
             return Err(ConfigError::InvalidConfiguration(
-                "native TLS requires DOWNSTREAM_TLS_CERT_FILE and DOWNSTREAM_TLS_KEY_FILE".to_owned(),
+                "native TLS requires DOWNSTREAM_TLS_CERT_FILE and DOWNSTREAM_TLS_KEY_FILE"
+                    .to_owned(),
             ));
         }
 
@@ -304,6 +307,15 @@ impl Config {
 }
 
 fn validate_runtime_environment(storage: &SharedStorageConfig) -> Result<(), ConfigError> {
+    // The pinned gateway parses HTTP_READ_TIMEOUT with float() at import, so an
+    // unparseable value stops startup rather than silently using a default.
+    if let Ok(value) = env::var("HTTP_READ_TIMEOUT")
+        && value.trim().parse::<f64>().is_err()
+    {
+        return Err(ConfigError::InvalidConfiguration(
+            "HTTP_READ_TIMEOUT must be a number of seconds".to_owned(),
+        ));
+    }
     let admin_password = env::var("DOORMAN_ADMIN_PASSWORD")
         .map_err(|_| ConfigError::MissingEnv("DOORMAN_ADMIN_PASSWORD"))?;
     if admin_password.len() < 16 {
@@ -617,7 +629,10 @@ mod tests {
             ("MEM_OR_EXTERNAL", "MEM"),
             ("THREADS", "1"),
             ("DOORMAN_ADMIN_PASSWORD", "NativeTlsPassword123!"),
-            ("JWT_SECRET_KEY", "native-tls-signing-key-at-least-32-characters"),
+            (
+                "JWT_SECRET_KEY",
+                "native-tls-signing-key-at-least-32-characters",
+            ),
             ("DOWNSTREAM_TLS_MODE", "native"),
             ("DOWNSTREAM_TLS_CERT_FILE", ""),
             ("DOWNSTREAM_TLS_KEY_FILE", ""),

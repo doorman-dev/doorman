@@ -124,6 +124,32 @@ impl Drop for ProtoCompileDirectory {
     }
 }
 
+/// Percent-decode a request path as UTF-8, leaving invalid escapes intact.
+fn percent_decode_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) = (
+                bytes
+                    .get(index + 1)
+                    .and_then(|byte| (*byte as char).to_digit(16)),
+                bytes
+                    .get(index + 2)
+                    .and_then(|byte| (*byte as char).to_digit(16)),
+            )
+        {
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_owned())
+}
+
 pub async fn platform_dispatch(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -137,7 +163,11 @@ pub async fn platform_dispatch(
     let headers = request.headers().clone();
     let request_id = request_id_from(&headers);
     let query = parse_query(uri.query());
-    let path = uri.path().strip_prefix("/platform").unwrap_or(uri.path());
+    // Starlette routes on the percent-decoded path (e.g. `%40` in an email).
+    let decoded_path = percent_decode_path(uri.path());
+    let path = decoded_path
+        .strip_prefix("/platform")
+        .unwrap_or(decoded_path.as_str());
     if path != "/security/settings"
         && let Some(response) = platform_ip_filter(&state, &headers, direct_addr, &request_id).await
     {
@@ -155,21 +185,78 @@ pub async fn platform_dispatch(
             );
         }
     };
+    // Body-size middleware runs first; then Starlette resolves the route before
+    // any handler runs: an unknown path is
+    // a bare 404 and a known path with another method is a 405 naming the
+    // first registered route's method.
+    match python_route_match(path, &method) {
+        RouteMatch::Found => {}
+        RouteMatch::NotFound => {
+            // Starlette's redirect_slashes: when the path with its trailing
+            // slash toggled resolves (for any method), answer 307 to it.
+            let toggled = match uri.path().strip_suffix('/') {
+                Some(stripped) => stripped.to_owned(),
+                None => format!("{}/", uri.path()),
+            };
+            let toggled_decoded = percent_decode_path(&toggled);
+            let toggled_path = toggled_decoded
+                .strip_prefix("/platform")
+                .unwrap_or(toggled_decoded.as_str());
+            if !matches!(
+                python_route_match(toggled_path, &method),
+                RouteMatch::NotFound
+            ) {
+                // A relative Location stays correct behind TLS termination.
+                let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+                if let Ok(value) = HeaderValue::from_str(&format!("{toggled}{query}")) {
+                    response.headers_mut().insert(header::LOCATION, value);
+                }
+                return response;
+            }
+            return json_response(
+                StatusCode::NOT_FOUND,
+                json!({"detail": "Not Found"}),
+                &request_id,
+            );
+        }
+        RouteMatch::MethodNotAllowed(allow) => {
+            let mut response = json_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                json!({"detail": "Method Not Allowed"}),
+                &request_id,
+            );
+            if let Ok(value) = HeaderValue::from_str(&allow) {
+                response.headers_mut().insert(header::ALLOW, value);
+            }
+            return response;
+        }
+    }
+    if rejects_non_json_body(path, &method, &headers, &body) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
     let parsed_payload = if body.is_empty() {
         Ok(Value::Object(Map::new()))
     } else {
         serde_json::from_slice(&body)
     };
-    if matches!(path, "/authorization" | "/authorization/register")
+    // Python rate-limits login/registration by IP before parsing the body, so
+    // the invalid-payload response is deferred until after that check.
+    let invalid_auth_payload = matches!(path, "/authorization" | "/authorization/register")
         && method == Method::POST
-        && parsed_payload.is_err()
-    {
-        return error(
+        && (parsed_payload.is_err() || body.is_empty());
+    let invalid_auth_response = || {
+        error(
             StatusCode::BAD_REQUEST,
             "AUTH004",
             "Invalid JSON payload",
             &request_id,
-        );
+        )
     };
     // FastAPI validates a typed JSON body before entering the route handler.
     // The shared entity routes model those typed Python endpoints, so malformed
@@ -178,7 +265,7 @@ pub async fn platform_dispatch(
     // and WSDL uploads retain their content-specific parsing behavior.
     if parsed_payload.is_err()
         && content_type_is_json(&headers)
-        && is_typed_json_mutation(path, &method)
+        && declares_json_body(path, &method)
     {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -188,6 +275,18 @@ pub async fn platform_dispatch(
         );
     }
     let mut payload = parsed_payload.unwrap_or(Value::Null);
+    // FastAPI validates the declared body model before the handler runs.
+    if !body.is_empty()
+        && content_type_is_json(&headers)
+        && body_fails_declared_model(path, &method, &payload)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
     // SubscribeModel requires all three fields.  Keep this lightweight
     // compatibility check at dispatch time until the remaining typed model is
     // ported, so a missing field reaches FastAPI's global validation envelope
@@ -225,6 +324,30 @@ pub async fn platform_dispatch(
             &request_id,
         );
     }
+    // Endpoint validation models are FastAPI body parameters, so an invalid
+    // body is rejected before the handler authenticates the caller.
+    let validation_create = method == Method::POST
+        && matches!(
+            path,
+            "/endpoint/validation" | "/endpoint/endpoint/validation"
+        );
+    let validation_update = method == Method::PUT
+        && ["/endpoint/validation/", "/endpoint/endpoint/validation/"]
+            .iter()
+            .any(|prefix| {
+                path.strip_prefix(prefix)
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            });
+    if (validation_create || validation_update)
+        && normalize_endpoint_validation_model(&mut payload.clone(), validation_create).is_err()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
     // A request with no body at all is a 422 for every route whose Python
     // counterpart declares a required typed body parameter, regardless of
     // Content-Type (see requires_nonempty_json_body).
@@ -238,7 +361,10 @@ pub async fn platform_dispatch(
     }
     // Python's body: dict[str, Any] parameter has no default, so a request
     // with no body at all is a 422 even though an explicit `{}` is valid.
-    if path == "/config/import" && method == Method::POST && (body.is_empty() || !payload.is_object()) {
+    if path == "/config/import"
+        && method == Method::POST
+        && (body.is_empty() || !payload.is_object())
+    {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "VAL001",
@@ -247,20 +373,24 @@ pub async fn platform_dispatch(
         );
     }
 
-    if path == "/authorization" && method == Method::POST {
-        if let Some(response) = auth_account_rate_limit(
-            &state,
-            &payload,
-            "LOGIN_ACCOUNT_RATE_LIMIT",
-            10,
-            "LOGIN_ACCOUNT_RATE_WINDOW",
-            900,
-            &request_id,
-        )
-        .await
-        {
-            return response;
+    // FastAPI validates `limit: int = Query(ge=1, le=1000)` and
+    // `offset: int = Query(ge=0)` before the handler authenticates.
+    if path == "/logging/logs" && method == Method::GET {
+        let out_of_range = |field: &str, min: i64, max: i64| {
+            query
+                .get(field)
+                .is_some_and(|value| !value.parse::<i64>().is_ok_and(|n| (min..=max).contains(&n)))
+        };
+        if out_of_range("limit", 1, 1_000) || out_of_range("offset", 0, i64::MAX) {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VAL001",
+                "Validation Error",
+                &request_id,
+            );
         }
+    }
+    if path == "/authorization" && method == Method::POST {
         if let Some(response) = auth_ip_rate_limit(
             &state,
             &headers,
@@ -269,6 +399,22 @@ pub async fn platform_dispatch(
             5,
             "LOGIN_IP_RATE_WINDOW",
             300,
+            &request_id,
+        )
+        .await
+        {
+            return response;
+        }
+        if invalid_auth_payload {
+            return invalid_auth_response();
+        }
+        if let Some(response) = auth_account_rate_limit(
+            &state,
+            &payload,
+            "LOGIN_ACCOUNT_RATE_LIMIT",
+            10,
+            "LOGIN_ACCOUNT_RATE_WINDOW",
+            900,
             &request_id,
         )
         .await
@@ -292,6 +438,9 @@ pub async fn platform_dispatch(
         {
             return response;
         }
+        if invalid_auth_payload {
+            return invalid_auth_response();
+        }
         if let Some(response) = auth_account_rate_limit(
             &state,
             &payload,
@@ -311,7 +460,7 @@ pub async fn platform_dispatch(
         return success(StatusCode::OK, json!({"status": "alive"}), &request_id);
     }
     if path == "/monitor/readiness" && method == Method::GET {
-        let privileged = match authorize(&state, &headers, path, &request_id).await {
+        let privileged = match authorize(&state, &headers, &method, path, &request_id).await {
             Ok(claims) => {
                 let username = claims.sub.as_deref().unwrap_or_default();
                 has_permission(&state, username, "manage_gateway").await
@@ -321,42 +470,11 @@ pub async fn platform_dispatch(
         return readiness(&state, privileged, &request_id).await;
     }
 
-    // The pinned rate-limit-rule router has no authentication dependency for
-    // its management endpoints. Its status endpoint is the lone exception
-    // (it depends on the authenticated subject). Dispatch the public slice
-    // before the platform-wide authorization gate, retaining the reference's
-    // intentionally permissive surface.
-    if path == "/rate-limits" || path == "/rate-limits/" || path.starts_with("/rate-limits/") {
-        if let Some(response) = dispatch_core_entities(
-            &state,
-            path,
-            &method,
-            payload.clone(),
-            &query,
-            "",
-            &request_id,
-        )
-        .await
-        {
-            return response;
-        }
-    }
-    if tier_route_is_public(path, &method)
-        && let Some(response) = dispatch_core_entities(
-            &state,
-            path,
-            &method,
-            payload.clone(),
-            &query,
-            "",
-            &request_id,
-        )
-        .await
-    {
-        return response;
-    }
-
-    let claims = match authorize(&state, &headers, path, &request_id).await {
+    // The pinned tier and rate-limit-rule routers have no authentication at
+    // all, so anyone could create, delete or assign tiers and limits.  The
+    // candidate requires an authenticated caller with the management
+    // permission instead (approved divergence MIG-123).
+    let claims = match authorize(&state, &headers, &method, path, &request_id).await {
         Ok(claims) => claims,
         Err(response) => return response,
     };
@@ -366,7 +484,12 @@ pub async fn platform_dispatch(
         let response = if has_permission(&state, &username, "manage_security").await {
             crate::routes::tls_admin::dispatch(&state, path, &method, payload, &request_id).await
         } else {
-            error(StatusCode::FORBIDDEN, "TLSA001", "manage_security is required", &request_id)
+            error(
+                StatusCode::FORBIDDEN,
+                "TLSA001",
+                "manage_security is required",
+                &request_id,
+            )
         };
         audit_management_request(&username, &method, path, &response);
         return with_platform_activity_context(response, &username, path);
@@ -433,13 +556,8 @@ pub async fn platform_dispatch(
         (Method::POST, "/memory/restore") => {
             memory_restore(&state, payload, &username, &request_id).await
         }
-        (Method::GET, "/dashboard") => {
-            if !has_permission(&state, &username, "view_analytics").await {
-                analytics_denied(&request_id)
-            } else {
-                dashboard(&state, &request_id).await
-            }
-        }
+        // The pinned dashboard only requires authentication.
+        (Method::GET, "/dashboard") => dashboard(&state, &request_id).await,
         (Method::GET, "/monitor/metrics") => {
             if !has_permission(&state, &username, "manage_gateway").await {
                 error(
@@ -620,28 +738,21 @@ pub async fn platform_dispatch(
             }
         }
         (Method::GET, "/config/reloadable-keys") => {
-            if !has_permission(&state, &username, "manage_gateway").await {
-                http_detail(
-                    StatusCode::FORBIDDEN,
-                    "Insufficient permissions: manage_gateway required",
-                    &request_id,
-                )
-            } else {
-                success(
-                    StatusCode::OK,
-                    json!({
-                        "reloadable_keys": active_reloadable_keys(),
-                        "total": 3,
-                        "restart_required_keys": restart_required_keys(),
-                        "notes": [
-                            "Environment variables always override config file values",
-                            "GATEWAY_TIMEOUT, RETRY_ENABLED, and RETRY_MAX_ATTEMPTS apply to the next REST, GraphQL, or SOAP request",
-                            "All other listed settings require a controlled restart or rolling deployment"
-                        ]
-                    }),
-                    &request_id,
-                )
-            }
+            // The pinned route only requires authentication (no role check).
+            success(
+                StatusCode::OK,
+                json!({
+                    "reloadable_keys": active_reloadable_keys(),
+                    "total": 3,
+                    "restart_required_keys": restart_required_keys(),
+                    "notes": [
+                        "Environment variables always override config file values",
+                        "GATEWAY_TIMEOUT, RETRY_ENABLED, and RETRY_MAX_ATTEMPTS apply to the next REST, GraphQL, or SOAP request",
+                        "All other listed settings require a controlled restart or rolling deployment"
+                    ]
+                }),
+                &request_id,
+            )
         }
         (Method::POST, "/config/reload") => {
             if !has_permission(&state, &username, "manage_gateway").await {
@@ -932,6 +1043,14 @@ async fn dispatch_core_entities(
     request_id: &str,
 ) -> Option<Response> {
     if path == "/tiers" || path == "/tiers/" || path.starts_with("/tiers/") {
+        if !has_permission(state, username, "manage_tiers").await {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "TIER001",
+                "You do not have permission to manage tiers",
+                request_id,
+            ));
+        }
         let suffix = path.trim_start_matches("/tiers").trim_matches('/');
         let basic = suffix.is_empty()
             || (!suffix.contains('/')
@@ -951,6 +1070,15 @@ async fn dispatch_core_entities(
     }
     if path == "/rate-limits" || path == "/rate-limits/" || path.starts_with("/rate-limits/") {
         let suffix = path.trim_start_matches("/rate-limits").trim_matches('/');
+        // A caller may always read their own limit status.
+        if suffix != "status" && !has_permission(state, username, "manage_rate_limits").await {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "RATE002",
+                "You do not have permission to manage rate limits",
+                request_id,
+            ));
+        }
         let basic =
             suffix.is_empty() || (!suffix.contains('/') && !matches!(suffix, "search" | "status"));
         if basic {
@@ -979,7 +1107,7 @@ async fn dispatch_core_entities(
                 updated: "Group updated successfully",
                 deleted: "Group deleted successfully",
                 duplicate_code: "GRP001",
-                not_found_code: "GRP002",
+                not_found_code: "GRP003",
             },
         ),
         (
@@ -1060,19 +1188,6 @@ async fn dispatch_core_entities(
     None
 }
 
-fn tier_route_is_public(path: &str, method: &Method) -> bool {
-    if !(path == "/tiers" || path == "/tiers/" || path.starts_with("/tiers/")) {
-        return false;
-    }
-    let suffix = path.trim_start_matches("/tiers").trim_matches('/');
-    if method == Method::GET
-        && (suffix.is_empty() || suffix == "statistics/all" || suffix.ends_with("/statistics"))
-    {
-        return false;
-    }
-    true
-}
-
 async fn tier_delete_route(
     state: &AppState,
     tier_id: &str,
@@ -1100,7 +1215,7 @@ async fn tier_delete_route(
         .delete_one("tiers", &json!({"tier_id": tier_id}))
         .await
     {
-        Ok(true) => message(StatusCode::OK, "Tier deleted", request_id),
+        Ok(true) => response_model_envelope("Tier deleted", request_id),
         Ok(false) => http_detail(
             StatusCode::NOT_FOUND,
             &format!("Tier {tier_id} not found"),
@@ -1950,7 +2065,7 @@ async fn tier_management_routes(
                 .delete_one("user_tier_assignments", &json!({"user_id": user_id}))
                 .await
             {
-                Ok(true) => message(StatusCode::OK, "Assignment removed", request_id),
+                Ok(true) => response_model_envelope("Assignment removed", request_id),
                 Ok(false) => http_detail(
                     StatusCode::NOT_FOUND,
                     &format!("No assignment found for user {user_id}"),
@@ -3262,22 +3377,16 @@ async fn entity_routes(
                 request_id,
             );
         }
-        if method == Method::PUT && payload.as_object().is_some_and(|object| object.is_empty()) {
-            let (code, message_text) = match spec.collection {
-                "roles" => ("ROLE007", "No data to update"),
-                "groups" => ("GRP006", "No data to update"),
-                "routings" => ("RTG007", "No data to update"),
-                _ => ("VAL001", "No data to update"),
-            };
-            return error(StatusCode::BAD_REQUEST, code, message_text, request_id);
-        }
     }
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
-        if spec.collection != "roles" && !has_permission(state, username, spec.permission).await {
+        // The pinned get_groups only authenticates; get_routings requires
+        // manage_routings (RTG012).
+        if spec.collection == "routings" && !has_permission(state, username, spec.permission).await
+        {
             return error(
                 StatusCode::FORBIDDEN,
-                spec.permission_code,
-                "Insufficient permissions",
+                "RTG012",
+                "You do not have permission to get routings",
                 request_id,
             );
         }
@@ -3298,7 +3407,7 @@ async fn entity_routes(
             Ok(items) => items.into_iter().map(strip_internal).collect::<Vec<_>>(),
             Err(_) => return unexpected(request_id),
         };
-        if spec.collection == "roles" {
+        if matches!(spec.collection, "roles" | "groups" | "routings") {
             // Python's `get_roles(page: int = ..., page_size: int = ...)` are
             // typed FastAPI query params: a non-numeric value never reaches the
             // handler and instead produces FastAPI's own 422 validation body.
@@ -3309,12 +3418,14 @@ async fn entity_routes(
             {
                 return response;
             }
-            items.sort_by_key(|role| {
-                role.get("role_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned()
-            });
+            if spec.collection == "roles" {
+                items.sort_by_key(|role| {
+                    role.get("role_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+            }
             let page = query
                 .get("page")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -3347,7 +3458,7 @@ async fn entity_routes(
             let total = items.len();
             let start = (page - 1).saturating_mul(page_size);
             items = items.into_iter().skip(start).take(page_size).collect();
-            if !is_admin_user(state, username).await {
+            if spec.collection == "roles" && !is_admin_user(state, username).await {
                 let mut visible = Vec::new();
                 for mut role in items {
                     let role_name = role
@@ -3361,11 +3472,12 @@ async fn entity_routes(
                         .map(|role| role.remove("platform_admin"));
                     visible.push(role);
                 }
-                items = visible;
+                // The pinned route replaces the page with just the filtered roles.
+                return success(StatusCode::OK, json!({"roles": visible}), request_id);
             }
             return success(
                 StatusCode::OK,
-                json!({"roles": items, "page": page, "page_size": page_size,
+                json!({spec.collection: items, "page": page, "page_size": page_size,
                     "has_next": total > start.saturating_add(page_size), "total": total}),
                 request_id,
             );
@@ -3490,15 +3602,13 @@ async fn entity_routes(
     }
     let filter = json!({spec.key: key});
     if method == Method::GET {
-        if spec.collection != "roles" && !has_permission(state, username, spec.permission).await {
+        // The pinned get_group only authenticates; get_routing needs manage_routings.
+        if spec.collection == "routings" && !has_permission(state, username, spec.permission).await
+        {
             return error(
                 StatusCode::FORBIDDEN,
-                if spec.collection == "routings" {
-                    "RTG013"
-                } else {
-                    spec.permission_code
-                },
-                "Insufficient permissions",
+                "RTG013",
+                "You do not have permission to get routings",
                 request_id,
             );
         }
@@ -3529,11 +3639,7 @@ async fn entity_routes(
                     StatusCode::NOT_FOUND
                 },
                 spec.not_found_code,
-                if spec.collection == "roles" {
-                    "Role does not exist"
-                } else {
-                    "Resource not found"
-                },
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -3554,17 +3660,21 @@ async fn entity_routes(
                 } else {
                     "ROLE011"
                 }
+            } else if spec.collection == "groups" {
+                if method == Method::PUT {
+                    "GRP009"
+                } else {
+                    "GRP010"
+                }
             } else {
                 "AUTH006"
             },
-            if spec.collection == "roles" {
-                if method == Method::PUT {
-                    "You do not have permission to update roles"
-                } else {
-                    "You do not have permission to delete roles"
-                }
-            } else {
-                "Insufficient permissions"
+            match (spec.collection, method == Method::PUT) {
+                ("roles", true) => "You do not have permission to update roles",
+                ("roles", false) => "You do not have permission to delete roles",
+                ("groups", true) => "You do not have permission to update groups",
+                ("groups", false) => "You do not have permission to delete groups",
+                _ => "Insufficient permissions",
             },
             request_id,
         );
@@ -3578,7 +3688,7 @@ async fn entity_routes(
         return error(
             StatusCode::BAD_REQUEST,
             spec.not_found_code,
-            "Resource not found",
+            not_found_message(spec.collection),
             request_id,
         );
     }
@@ -3611,6 +3721,16 @@ async fn entity_routes(
                 request_id,
             );
         }
+    }
+    // The service rejects an empty update only after its existence check.
+    if method == Method::PUT && payload.as_object().is_some_and(|object| object.is_empty()) {
+        let (code, message_text) = match spec.collection {
+            "roles" => ("ROLE007", "No data to update"),
+            "groups" => ("GRP006", "No data to update"),
+            "routings" => ("RTG007", "No data to update"),
+            _ => ("VAL001", "No data to update"),
+        };
+        return error(StatusCode::BAD_REQUEST, code, message_text, request_id);
     }
     if method == Method::PUT {
         if spec.collection == "routings" {
@@ -3699,11 +3819,7 @@ async fn entity_routes(
                     StatusCode::NOT_FOUND
                 },
                 spec.not_found_code,
-                if spec.collection == "roles" {
-                    "Role does not exist"
-                } else {
-                    "Resource not found"
-                },
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -3735,11 +3851,7 @@ async fn entity_routes(
                     StatusCode::NOT_FOUND
                 },
                 spec.not_found_code,
-                if spec.collection == "roles" {
-                    "Role does not exist"
-                } else {
-                    "Resource not found"
-                },
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -3751,6 +3863,26 @@ async fn entity_routes(
         "Method not allowed",
         request_id,
     )
+}
+
+/// Mirrors the pinned `sanitize_filename` checks on a proto path segment.
+fn proto_file_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Empty filename provided");
+    }
+    if name.contains("..") {
+        return Some("Path traversal detected: .. not allowed in filename");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some("Absolute paths not allowed in filename");
+    }
+    if name.as_bytes().get(1) == Some(&b':') {
+        return Some("Drive letters not allowed in filename");
+    }
+    if name.chars().count() > 255 {
+        return Some("Filename too long (max 255 characters)");
+    }
+    None
 }
 
 fn merge_proto_metadata(target: &mut Value, source: &Value) {
@@ -3775,13 +3907,27 @@ async fn lock_tls_binding_mutation(
     payload: &Value,
     prefix: &str,
 ) -> Result<Option<crate::storage::runtime::TlsMutationGuard>, ()> {
-    let has_binding = ["client_tls_policy", "upstream_tls_profile", "upstream_tls_profiles"]
-        .iter()
-        .any(|field| payload.get(format!("{prefix}_{field}")).is_some_and(|value| !value.is_null()));
+    let has_binding = [
+        "client_tls_policy",
+        "upstream_tls_profile",
+        "upstream_tls_profiles",
+    ]
+    .iter()
+    .any(|field| {
+        payload
+            .get(format!("{prefix}_{field}"))
+            .is_some_and(|value| !value.is_null())
+    });
     if !has_binding {
         return Ok(None);
     }
-    let guard = state.storage.as_ref().ok_or(())?.tls_mutation_lock().await.map_err(|_| ())?;
+    let guard = state
+        .storage
+        .as_ref()
+        .ok_or(())?
+        .tls_mutation_lock()
+        .await
+        .map_err(|_| ())?;
     state.reload_tls_from_storage().await.map_err(|_| ())?;
     Ok(Some(guard))
 }
@@ -3842,19 +3988,47 @@ async fn api_routes(
         };
         let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
             Ok(guard) => guard,
-            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
         };
-        if let Some(policy) = payload.get("api_client_tls_policy").filter(|value| !value.is_null()) {
+        if let Some(policy) = payload
+            .get("api_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
             if crate::tls::policy::ClientTlsPolicy::validate_value(
                 policy,
                 &state.tls_snapshot().profiles,
                 state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
-            ).is_err() {
-                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
             }
         }
-        if crate::tls::profiles::validate_upstream_bindings(&payload, "api", &state.tls_snapshot().profiles).is_err() {
-            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "api",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "TLS004",
+                "Invalid upstream TLS binding",
+                request_id,
+            );
         }
         let name = payload["api_name"]
             .as_str()
@@ -3964,31 +4138,51 @@ async fn api_routes(
         };
         let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
             Ok(guard) => guard,
-            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
         };
-        if let Some(policy) = payload.get("api_client_tls_policy").filter(|value| !value.is_null()) {
+        if let Some(policy) = payload
+            .get("api_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
             if crate::tls::policy::ClientTlsPolicy::validate_value(
                 policy,
                 &state.tls_snapshot().profiles,
                 state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
-            ).is_err() {
-                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
             }
         }
-        if crate::tls::profiles::validate_upstream_bindings(&payload, "api", &state.tls_snapshot().profiles).is_err() {
-            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "api",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "TLS004",
+                "Invalid upstream TLS binding",
+                request_id,
+            );
         }
         let Some(updates) = payload.as_object() else {
             return unexpected(request_id);
         };
-        if updates.is_empty() {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "API006",
-                "No data to update",
-                request_id,
-            );
-        }
         for key in ["api_name", "api_version", "api_path"] {
             if payload.get(key).is_some() {
                 let expected = if key == "api_name" {
@@ -4020,6 +4214,15 @@ async fn api_routes(
             }
             Err(_) => return unexpected(request_id),
         };
+        // The pinned service checks the rename guard and existence first.
+        if updates.is_empty() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "API006",
+                "No data to update",
+                request_id,
+            );
+        }
         let desired_public = payload
             .get("api_public")
             .and_then(Value::as_bool)
@@ -4069,8 +4272,18 @@ async fn api_routes(
         };
     }
     if method == Method::DELETE {
+        let existing = storage.find_one("apis", &filter).await.ok().flatten();
         return match storage.delete_one("apis", &filter).await {
             Ok(true) => {
+                // The pinned proto file outlives its API; keep the upload so a
+                // re-created API picks it up again.
+                if let Some(existing) = existing
+                    .filter(|api| api.get("api_grpc_proto_source").is_some_and(python_truthy))
+                {
+                    let mut pending = filter.clone();
+                    merge_proto_metadata(&mut pending, &existing);
+                    let _ = storage.insert_one("grpc_proto_uploads", pending).await;
+                }
                 audit::management_mutation(
                     username,
                     "api.delete",
@@ -4136,7 +4349,7 @@ async fn user_routes(
                     .collect();
                 success(
                     StatusCode::OK,
-                    paginate_named(items, query, "users"),
+                    json!({"users": paginate_items(items, query)}),
                     request_id,
                 )
             }
@@ -4491,7 +4704,7 @@ async fn endpoint_routes(
     path: &str,
     method: &Method,
     mut payload: Value,
-    query: &HashMap<String, String>,
+    _query: &HashMap<String, String>,
     username: &str,
     request_id: &str,
 ) -> Response {
@@ -4504,7 +4717,11 @@ async fn endpoint_routes(
         .trim_matches('/');
     let validation_suffix = suffix
         .strip_prefix("endpoint/validation/")
-        .or_else(|| suffix.strip_prefix("validation/"));
+        .or_else(|| suffix.strip_prefix("validation/"))
+        // Deeper paths belong to the endpoint route registered before it.
+        .filter(|endpoint_id| !endpoint_id.contains('/'))
+        // GET /validation/{id} is shadowed by GET /{api_name}/{api_version}.
+        .filter(|_| !(method == Method::GET && suffix.starts_with("validation/")));
     if let Some(endpoint_id) = validation_suffix {
         if method == Method::PUT
             && normalize_endpoint_validation_model(&mut payload, false).is_err()
@@ -4700,19 +4917,47 @@ async fn endpoint_routes(
         }
         let _tls_guard = match lock_tls_binding_mutation(state, &payload, "endpoint").await {
             Ok(guard) => guard,
-            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
         };
-        if let Some(policy) = payload.get("endpoint_client_tls_policy").filter(|value| !value.is_null()) {
+        if let Some(policy) = payload
+            .get("endpoint_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
             if crate::tls::policy::ClientTlsPolicy::validate_value(
                 policy,
                 &state.tls_snapshot().profiles,
                 state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
-            ).is_err() {
-                return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
             }
         }
-        if crate::tls::profiles::validate_upstream_bindings(&payload, "endpoint", &state.tls_snapshot().profiles).is_err() {
-            return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "endpoint",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "TLS004",
+                "Invalid upstream TLS binding",
+                request_id,
+            );
         }
         if !has_permission(state, username, "manage_endpoints").await {
             return error(
@@ -4828,10 +5073,8 @@ async fn endpoint_routes(
         };
     }
     let parts = suffix.split('/').collect::<Vec<_>>();
+    // The pinned listing takes no pagination parameters.
     if method == Method::GET && parts.len() == 2 {
-        if let Err(message_text) = validate_pagination(query) {
-            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
-        }
         return match storage
             .find_many(
                 "endpoints",
@@ -4847,7 +5090,7 @@ async fn endpoint_routes(
             ),
             Ok(items) => success(
                 StatusCode::OK,
-                paginate(items.into_iter().map(strip_internal).collect(), query),
+                json!({"endpoints": items.into_iter().map(strip_internal).collect::<Vec<_>>()}),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -4865,23 +5108,51 @@ async fn endpoint_routes(
         let _tls_guard = if method == Method::PUT {
             match lock_tls_binding_mutation(state, &payload, "endpoint").await {
                 Ok(guard) => guard,
-                Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "TLS004", "TLS profiles are unavailable", request_id),
+                Err(()) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "TLS004",
+                        "TLS profiles are unavailable",
+                        request_id,
+                    );
+                }
             }
         } else {
             None
         };
         if method == Method::PUT {
-            if let Some(policy) = payload.get("endpoint_client_tls_policy").filter(|value| !value.is_null()) {
+            if let Some(policy) = payload
+                .get("endpoint_client_tls_policy")
+                .filter(|value| !value.is_null())
+            {
                 if crate::tls::policy::ClientTlsPolicy::validate_value(
                     policy,
                     &state.tls_snapshot().profiles,
                     state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
-                ).is_err() {
-                    return error(StatusCode::BAD_REQUEST, "TLS003", "Invalid client TLS policy", request_id);
+                )
+                .is_err()
+                {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "TLS003",
+                        "Invalid client TLS policy",
+                        request_id,
+                    );
                 }
             }
-            if crate::tls::profiles::validate_upstream_bindings(&payload, "endpoint", &state.tls_snapshot().profiles).is_err() {
-                return error(StatusCode::BAD_REQUEST, "TLS004", "Invalid upstream TLS binding", request_id);
+            if crate::tls::profiles::validate_upstream_bindings(
+                &payload,
+                "endpoint",
+                &state.tls_snapshot().profiles,
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS004",
+                    "Invalid upstream TLS binding",
+                    request_id,
+                );
             }
         }
         let uri = format!("/{}", parts[3..].join("/"));
@@ -5532,7 +5803,14 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
                 | "endpoint_client_tls_policy"
                 | "endpoint_upstream_tls_profile"
                 | "endpoint_upstream_tls_profiles"
-        ) && (create || !value.is_null() || matches!(field.as_str(), "endpoint_client_tls_policy" | "endpoint_upstream_tls_profile" | "endpoint_upstream_tls_profiles"))
+        ) && (create
+            || !value.is_null()
+            || matches!(
+                field.as_str(),
+                "endpoint_client_tls_policy"
+                    | "endpoint_upstream_tls_profile"
+                    | "endpoint_upstream_tls_profiles"
+            ))
     });
     for (field, configured_minimum, configured_maximum) in [
         ("api_name", 1, 50),
@@ -5581,6 +5859,12 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
         Some(Value::Null) if create => {}
         Some(_) => return Err(()),
         None => {}
+    }
+    if create {
+        // Pydantic's `.dict()` persists unset optional fields as null.
+        for field in ["endpoint_servers", "client_uri"] {
+            object.entry(field).or_insert(Value::Null);
+        }
     }
     Ok(())
 }
@@ -6646,6 +6930,542 @@ fn python_openapi_contract() -> Result<&'static Value, &'static str> {
         .ok_or("Failed to initialize embedded OpenAPI contract")
 }
 
+enum RouteMatch {
+    Found,
+    NotFound,
+    MethodNotAllowed(String),
+}
+
+/// Platform routes FastAPI serves outside the frozen schema
+/// (`include_in_schema=False` and framework docs) plus Rust-native additions.
+const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/platform/docs"),
+    ("GET", "/platform/redoc"),
+    ("GET", "/platform/openapi.json"),
+    ("GET", "/platform/monitor/report"),
+    ("GET", "/platform/logging/logs/download"),
+    ("POST", "/platform/tools/rate-limit-simulator"),
+];
+
+/// `Allow` answered by the pinned server for multi-route platform paths.
+/// Starlette names only the first registered route that matched the path, and
+/// the frozen OpenAPI does not preserve registration order, so these values
+/// were read from the pinned server with TRACE requests.
+const PYTHON_ALLOW: &[(&str, &str)] = &[
+    ("/platform/user", "POST"),
+    ("/platform/user/{username}", "PUT"),
+    ("/platform/api", "POST"),
+    ("/platform/api/{api_name}/{api_version}", "PUT"),
+    (
+        "/platform/endpoint/{endpoint_method}/{api_name}/{api_version}/{endpoint_uri}",
+        "PUT",
+    ),
+    (
+        "/platform/endpoint/endpoint/validation/{endpoint_id}",
+        "PUT",
+    ),
+    ("/platform/endpoint/validation/{endpoint_id}", "GET"),
+    ("/platform/group/{group_name}", "PUT"),
+    ("/platform/role", "POST"),
+    ("/platform/role/{role_name}", "PUT"),
+    ("/platform/routing/{client_key}", "PUT"),
+    ("/platform/proto/{api_name}/{api_version}", "POST"),
+    ("/platform/security/settings", "GET"),
+    ("/platform/credit/{api_credit_group}", "PUT"),
+    ("/platform/credit/{username}", "PUT"),
+    ("/platform/vault", "POST"),
+    ("/platform/vault/{key_name}", "GET"),
+    ("/platform/tiers/", "POST"),
+    ("/platform/tiers/{tier_id}", "GET"),
+    ("/platform/tiers/assignments/{user_id}", "GET"),
+    ("/platform/rate-limits/", "POST"),
+    ("/platform/rate-limits/{rule_id}", "GET"),
+];
+
+/// Route table in registration order: (matcher, methods).
+fn platform_route_table() -> &'static [(Regex, Vec<String>)] {
+    static TABLE: OnceLock<Vec<(Regex, Vec<String>)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table: Vec<(String, Vec<String>)> = Vec::new();
+        if let Ok(contract) = python_openapi_contract()
+            && let Some(paths) = contract.get("paths").and_then(Value::as_object)
+        {
+            for (template, item) in paths {
+                if !template.starts_with("/platform") {
+                    continue;
+                }
+                let mut methods: Vec<String> = item
+                    .as_object()
+                    .map(|item| {
+                        item.keys()
+                            .map(|method| method.to_ascii_uppercase())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Keep the pinned `Allow` method first; partial matches report it.
+                if let Some((_, allow)) = PYTHON_ALLOW.iter().find(|(path, _)| path == template) {
+                    methods.retain(|method| method != allow);
+                    methods.insert(0, (*allow).to_owned());
+                }
+                table.push((template.clone(), methods));
+            }
+        }
+        for (method, template) in UNLISTED_PLATFORM_ROUTES {
+            table.push(((*template).to_owned(), vec![(*method).to_owned()]));
+        }
+        table
+            .into_iter()
+            .filter_map(|(template, methods)| Some((template_regex(&template)?, methods)))
+            .collect()
+    })
+}
+
+/// Compile a Starlette path template: `{name}` is one segment, `{name:path}`
+/// is the remainder of the path.
+fn template_regex(template: &str) -> Option<Regex> {
+    static PARAM: OnceLock<Regex> = OnceLock::new();
+    // FastAPI omits `:path` converters from OpenAPI; the only platform route
+    // using one is the endpoint URI, which may contain slashes.
+    let param = PARAM.get_or_init(|| {
+        Regex::new(r"\{(?:endpoint_uri|[^}:]+(:path))\}|\{[^}:]+\}").expect("route param regex")
+    });
+    let mut pattern = String::from("^");
+    let mut last = 0;
+    for capture in param.captures_iter(template) {
+        let whole = capture.get(0)?;
+        pattern.push_str(&regex::escape(&template[last..whole.start()]));
+        let path_param = capture.get(1).is_some() || whole.as_str() == "{endpoint_uri}";
+        pattern.push_str(if path_param { ".*" } else { "[^/]+" });
+        last = whole.end();
+    }
+    pattern.push_str(&regex::escape(&template[last..]));
+    pattern.push('$');
+    Regex::new(&pattern).ok()
+}
+
+/// The pinned platform routes let FastAPI render an authentication failure as
+/// `{"detail": "Unauthorized"}`, except these, which wrap it in a route error
+/// code. Captured from the pinned server with anonymous requests to every
+/// frozen operation (routes where the pinned server instead crashes with a 500
+/// keep the 401 and are recorded as approved differences).
+const UNAUTHENTICATED_CODES: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/platform/api", "API_AUTH", "Unauthorized"),
+    ("GET", "/platform/api/all", "API_AUTH", "Unauthorized"),
+    (
+        "POST",
+        "/platform/authorization/invalidate",
+        "AUTH005",
+        "Unauthorized",
+    ),
+    (
+        "GET",
+        "/platform/authorization/status",
+        "AUTH005",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/authorization/refresh",
+        "AUTH003",
+        "Unable to validate credentials",
+    ),
+    ("GET", "/platform/user", "GTW998", "Unauthorized"),
+    ("GET", "/platform/user/all", "GTW998", "Unauthorized"),
+    ("GET", "/platform/user/me", "GTW998", "Unauthorized"),
+    (
+        "POST",
+        "/platform/proto/{api_name}/{api_version}",
+        "GTW013",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/subscription/subscribe",
+        "GEN001",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/subscription/unsubscribe",
+        "GEN002",
+        "Unauthorized",
+    ),
+];
+
+fn unauthenticated(method: &Method, path: &str, _message: &str, request_id: &str) -> Response {
+    static CODES: OnceLock<Vec<(&'static str, Regex, &'static str, &'static str)>> =
+        OnceLock::new();
+    let codes = CODES.get_or_init(|| {
+        UNAUTHENTICATED_CODES
+            .iter()
+            .filter_map(|(method, template, code, text)| {
+                Some((*method, template_regex(template)?, *code, *text))
+            })
+            .collect()
+    });
+    let full = format!("/platform{path}");
+    // The backfill route is registered ahead of the proto upload template.
+    if let Some((_, _, code, text)) = codes
+        .iter()
+        .filter(|_| path != "/proto/descriptors/backfill")
+        .find(|(allowed, matcher, _, _)| *allowed == method.as_str() && matcher.is_match(&full))
+    {
+        return error(StatusCode::UNAUTHORIZED, code, text, request_id);
+    }
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        json!({"detail": "Unauthorized"}),
+        request_id,
+    )
+}
+
+/// Frozen operations whose FastAPI signature declares a JSON request model.
+fn json_body_operations() -> &'static [(Regex, String)] {
+    static TABLE: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(contract) = python_openapi_contract() else {
+            return Vec::new();
+        };
+        let Some(paths) = contract.get("paths").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut table = Vec::new();
+        for (template, item) in paths {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            for (method, operation) in item {
+                let json = operation
+                    .pointer("/requestBody/content")
+                    .and_then(Value::as_object)
+                    .is_some_and(|content| content.contains_key("application/json"));
+                if json && let Some(matcher) = template_regex(template) {
+                    table.push((matcher, method.to_ascii_uppercase()));
+                }
+            }
+        }
+        table
+    })
+}
+
+/// Every frozen operation in registration order with its JSON body schema.
+fn operation_body_schemas() -> &'static [(Regex, String, Option<Value>)] {
+    static TABLE: OnceLock<Vec<(Regex, String, Option<Value>)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(contract) = python_openapi_contract() else {
+            return Vec::new();
+        };
+        let Some(paths) = contract.get("paths").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut table = Vec::new();
+        for (template, item) in paths {
+            let (Some(item), Some(matcher)) = (item.as_object(), template_regex(template)) else {
+                continue;
+            };
+            for (method, operation) in item {
+                let schema = operation
+                    .pointer("/requestBody/content/application~1json/schema")
+                    .cloned();
+                table.push((matcher.clone(), method.to_ascii_uppercase(), schema));
+            }
+        }
+        table
+    })
+}
+
+/// FastAPI (pydantic v1) validation of a decoded JSON body against the model
+/// the resolved route declares; `true` when the request must fail with 422.
+fn body_fails_declared_model(path: &str, method: &Method, payload: &Value) -> bool {
+    let full = format!("/platform{path}");
+    let Some((_, _, Some(schema))) = operation_body_schemas()
+        .iter()
+        .find(|(matcher, allowed, _)| allowed == method.as_str() && matcher.is_match(&full))
+    else {
+        return false;
+    };
+    let Ok(contract) = python_openapi_contract() else {
+        return false;
+    };
+    !pydantic_accepts(contract, schema, payload, 0)
+}
+
+fn pydantic_accepts(contract: &Value, schema: &Value, value: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let pointer = reference.trim_start_matches('#');
+        return contract
+            .pointer(pointer)
+            .is_none_or(|resolved| pydantic_accepts(contract, resolved, value, depth + 1));
+    }
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
+        return value.is_null()
+            || options
+                .iter()
+                .any(|option| pydantic_accepts(contract, option, value, depth + 1));
+    }
+    if let Some(options) = schema.get("allOf").and_then(Value::as_array) {
+        return options
+            .iter()
+            .all(|option| pydantic_accepts(contract, option, value, depth + 1));
+    }
+    let kind = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if schema.get("properties").is_some() {
+                "object"
+            } else {
+                ""
+            }
+        });
+    let number = |value: &Value| -> Option<f64> {
+        match value {
+            Value::Number(number) => number.as_f64(),
+            Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
+            Value::String(text) => text.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let within_bounds = |amount: f64| {
+        let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
+        bound("minimum").is_none_or(|limit| amount >= limit)
+            && bound("maximum").is_none_or(|limit| amount <= limit)
+            && bound("exclusiveMinimum").is_none_or(|limit| amount > limit)
+            && bound("exclusiveMaximum").is_none_or(|limit| amount < limit)
+    };
+    match kind {
+        "object" => {
+            // pydantic v1 builds a dict from a list of key/value pairs too.
+            if let Some(pairs) = value.as_array() {
+                return schema.get("properties").is_none()
+                    && pairs
+                        .iter()
+                        .all(|pair| pair.as_array().is_some_and(|pair| pair.len() == 2));
+            }
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for name in required.iter().filter_map(Value::as_str) {
+                if object.get(name).is_none_or(Value::is_null) {
+                    return false;
+                }
+            }
+            if let Some(properties) = properties {
+                for (name, property) in properties {
+                    match object.get(name) {
+                        None | Some(Value::Null) => {}
+                        Some(item) => {
+                            if !pydantic_accepts(contract, property, item, depth + 1) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(additional) = schema.get("additionalProperties").filter(|v| v.is_object()) {
+                let known = properties.map(|map| map.keys().cloned().collect::<Vec<_>>());
+                for (name, item) in object {
+                    if known.as_ref().is_some_and(|known| known.contains(name)) || item.is_null() {
+                        continue;
+                    }
+                    if !pydantic_accepts(contract, additional, item, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        "array" => {
+            let Some(items) = value.as_array() else {
+                return false;
+            };
+            let count = items.len() as f64;
+            if schema
+                .get("minItems")
+                .and_then(Value::as_f64)
+                .is_some_and(|min| count < min)
+                || schema
+                    .get("maxItems")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|max| count > max)
+            {
+                return false;
+            }
+            schema.get("items").is_none_or(|item_schema| {
+                items.iter().all(|item| {
+                    item.is_null() || pydantic_accepts(contract, item_schema, item, depth + 1)
+                })
+            })
+        }
+        "string" => {
+            // pydantic v1 coerces numbers (and bools, an int subclass) to str.
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(flag) => if *flag { "True" } else { "False" }.to_owned(),
+                _ => return false,
+            };
+            let length = text.chars().count() as f64;
+            schema
+                .get("minLength")
+                .and_then(Value::as_f64)
+                .is_none_or(|min| length >= min)
+                && schema
+                    .get("maxLength")
+                    .and_then(Value::as_f64)
+                    .is_none_or(|max| length <= max)
+        }
+        "integer" => match value {
+            Value::String(text) => crate::python_scalar::parse_model_integer(text)
+                .is_some_and(|n| within_bounds(n as f64)),
+            other => number(other).is_some_and(|n| within_bounds(n.trunc())),
+        },
+        "number" => number(value).is_some_and(within_bounds),
+        "boolean" => match value {
+            Value::Bool(_) => true,
+            Value::Number(number) => matches!(number.as_f64(), Some(n) if n == 0.0 || n == 1.0),
+            Value::String(text) => matches!(
+                text.to_ascii_lowercase().as_str(),
+                "0" | "1" | "true" | "false" | "t" | "f" | "yes" | "no" | "y" | "n" | "on" | "off"
+            ),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+/// Whether the frozen operation declares a JSON request model (FastAPI then
+/// rejects an undecodable JSON body with 422 before the handler runs).
+fn declares_json_body(path: &str, method: &Method) -> bool {
+    let full = format!("/platform{path}");
+    json_body_operations()
+        .iter()
+        .any(|(matcher, allowed)| allowed == method.as_str() && matcher.is_match(&full))
+}
+
+/// FastAPI only decodes a declared JSON model from a JSON request; any other
+/// (or absent) Content-Type on a non-empty body fails validation with 422.
+fn rejects_non_json_body(path: &str, method: &Method, headers: &HeaderMap, body: &[u8]) -> bool {
+    if body.is_empty() || content_type_is_json(headers) {
+        return false;
+    }
+    let full = format!("/platform{path}");
+    json_body_operations()
+        .iter()
+        .any(|(matcher, allowed)| allowed == method.as_str() && matcher.is_match(&full))
+}
+
+/// Gateway routes in the pinned registration order, plus the Rust-native
+/// `/api/features` probe and gRPC-Web CORS preflight.
+const GATEWAY_ROUTES: &[(&str, &[&str])] = &[
+    ("/api/status", &["GET"]),
+    ("/api/health", &["GET"]),
+    ("/api/caches", &["DELETE"]),
+    ("/api/caches", &["OPTIONS"]),
+    (
+        "/api/rest/{path:path}",
+        &["PATCH", "DELETE", "GET", "POST", "PUT"],
+    ),
+    ("/api/rest/{path:path}", &["HEAD"]),
+    ("/api/rest/{path:path}", &["OPTIONS"]),
+    ("/api/soap/{path:path}", &["GET", "POST"]),
+    ("/api/grpc/{path:path}", &["GET", "POST"]),
+    ("/api/soap/{path:path}", &["OPTIONS"]),
+    ("/api/graphql/{path:path}", &["POST"]),
+    ("/api/graphql/{path:path}", &["OPTIONS"]),
+    ("/api/grpc/{path:path}", &["OPTIONS"]),
+    ("/api/features", &["GET"]),
+    // CORS preflights bypass this table, so only POST is a registered route.
+    ("/grpc-web/{api_name}/{service}/{method}", &["POST"]),
+];
+
+/// Starlette-style route resolution for the data plane: unknown paths are a
+/// bare 404 and known paths with other methods a 405 naming the first route.
+pub(crate) async fn gateway_route_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    static TABLE: OnceLock<Vec<(Regex, &'static [&'static str])>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        GATEWAY_ROUTES
+            .iter()
+            .filter_map(|(template, methods)| Some((template_regex(template)?, *methods)))
+            .collect()
+    });
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    // CORS preflights are answered by the CORS middleware ahead of routing.
+    if request.method() == Method::OPTIONS
+        && request.headers().contains_key(header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        return next.run(request).await;
+    }
+    let request_id = request_id_from(request.headers());
+    let mut partial = None;
+    for (matcher, methods) in table {
+        if !matcher.is_match(&path) {
+            continue;
+        }
+        if methods.contains(&request.method().as_str()) {
+            return next.run(request).await;
+        }
+        partial = partial.or(Some(*methods));
+    }
+    let Some(methods) = partial else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"detail": "Not Found"}),
+            &request_id,
+        );
+    };
+    let mut response = json_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        json!({"detail": "Method Not Allowed"}),
+        &request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&methods.join(", ")) {
+        response.headers_mut().insert(header::ALLOW, value);
+    }
+    response
+}
+
+fn python_route_match(path: &str, method: &Method) -> RouteMatch {
+    // The TLS administration surface is a Rust-native addition.
+    if path == "/tls" || path.starts_with("/tls/") {
+        return RouteMatch::Found;
+    }
+    let full = format!("/platform{path}");
+    let mut partial: Option<&str> = None;
+    for (matcher, methods) in platform_route_table() {
+        if !matcher.is_match(&full) {
+            continue;
+        }
+        if methods.iter().any(|allowed| allowed == method.as_str()) {
+            return RouteMatch::Found;
+        }
+        partial = partial.or(methods.first().map(String::as_str));
+    }
+    match partial {
+        Some(allow) => RouteMatch::MethodNotAllowed(allow.to_owned()),
+        None => RouteMatch::NotFound,
+    }
+}
+
 fn platform_docs(path: &str, request_id: &str) -> Response {
     let html = if path == "/redoc" {
         r#"<!doctype html><html><head><title>Doorman API</title><script src="https://cdn.jsdelivr.net/npm/redoc@2.5.2/bundles/redoc.standalone.js"></script></head><body><redoc spec-url="/platform/openapi.json"></redoc></body></html>"#
@@ -6663,17 +7483,12 @@ fn platform_docs(path: &str, request_id: &str) -> Response {
 async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
+    method: &Method,
     path: &str,
     request_id: &str,
 ) -> Result<AuthClaims, Response> {
-    let claims = verify_request_token(headers, &state.config.shared_storage).map_err(|_| {
-        error(
-            StatusCode::UNAUTHORIZED,
-            "AUTH003",
-            "Unauthorized",
-            request_id,
-        )
-    })?;
+    let claims = verify_request_token(headers, &state.config.shared_storage)
+        .map_err(|_| unauthenticated(method, path, "Unauthorized", request_id))?;
     let username = claims.sub.as_deref().unwrap_or("");
     let Some(storage) = &state.storage else {
         return Err(unexpected(request_id));
@@ -6698,9 +7513,9 @@ async fn authorize(
         )
         .await
     {
-        return Err(error(
-            StatusCode::UNAUTHORIZED,
-            "AUTH003",
+        return Err(unauthenticated(
+            method,
+            path,
             "Token has been revoked",
             request_id,
         ));
@@ -6715,9 +7530,9 @@ async fn authorize(
             if expired {
                 let _ = storage.delete_one("revocations", &filter).await;
             } else {
-                return Err(error(
-                    StatusCode::UNAUTHORIZED,
-                    "AUTH003",
+                return Err(unauthenticated(
+                    method,
+                    path,
                     "Token has been revoked",
                     request_id,
                 ));
@@ -6729,9 +7544,9 @@ async fn authorize(
         .await
     {
         Ok(Some(user)) if user.get("active").and_then(Value::as_bool) != Some(false) => Ok(claims),
-        Ok(Some(_)) => Err(error(
-            StatusCode::UNAUTHORIZED,
-            "AUTH003",
+        Ok(Some(_)) => Err(unauthenticated(
+            method,
+            path,
             "User is inactive",
             request_id,
         )),
@@ -6992,8 +7807,14 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
                 vec![json!({"error": "storage is unavailable"})],
             )
         };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(i64::MAX);
-    let tls_certificates_valid = state.runtime.tls_certificate_expiries.lock()
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    let tls_certificates_valid = state
+        .runtime
+        .tls_certificate_expiries
+        .lock()
         .map(|expiries| expiries.values().all(|expiry| *expiry > now))
         .unwrap_or(false);
     let ready = mongo_ok && redis_ok && missing_grpc_descriptors == 0 && tls_certificates_valid;
@@ -9278,18 +10099,21 @@ async fn subscription_routes(
                 request_id,
             );
         }
-        let apis = storage
+        let document = storage
             .find_one("subscriptions", &json!({"username": target}))
             .await
             .ok()
-            .flatten()
-            .and_then(|doc| doc.get("apis").cloned())
-            .unwrap_or_else(|| json!([]));
-        return success(
-            StatusCode::OK,
-            json!({"apis": apis, "subscriptions": {"apis": apis}}),
-            request_id,
-        );
+            .flatten();
+        // The pinned service echoes the list under `subscriptions` once a
+        // subscription document exists.
+        let body = match document {
+            Some(doc) => {
+                let apis = doc.get("apis").cloned().unwrap_or_else(|| json!([]));
+                json!({"apis": apis.clone(), "subscriptions": {"apis": apis}})
+            }
+            None => json!({"apis": []}),
+        };
+        return success(StatusCode::OK, body, request_id);
     }
     let operation = if method == Method::POST && path.ends_with("/subscribe") {
         Some(true)
@@ -9336,10 +10160,12 @@ async fn subscription_routes(
         {
             Ok(Some(api)) => api,
             _ => {
+                // group_required raises HTTPException(404, 'API not found'),
+                // which the route re-renders under its generic error code.
                 return error(
                     StatusCode::NOT_FOUND,
-                    if subscribe { "SUB003" } else { "SUB005" },
-                    "API does not exist for the requested name and version",
+                    if subscribe { "GEN001" } else { "GEN002" },
+                    "API not found",
                     request_id,
                 );
             }
@@ -9347,18 +10173,29 @@ async fn subscription_routes(
         // Python's group_required runs before SubscriptionService and evaluates
         // the user named in the request (which can differ from the actor).
         // Preserve that policy gate for both subscribing and unsubscribing.
+        let generic_code = if subscribe { "GEN001" } else { "GEN002" };
         let target_user = match storage
             .find_one("users", &json!({"username": target}))
             .await
         {
             Ok(Some(user)) => user,
-            _ => return unexpected(request_id),
+            Ok(None) => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    generic_code,
+                    "User not found",
+                    request_id,
+                );
+            }
+            Err(_) => return unexpected(request_id),
         };
+        // group_required raises HTTPException(401, ...) rather than returning
+        // False, so the pinned route answers 401 with its generic error code.
         if enforce_group_access(&api_document, &target_user).is_err() {
             return error(
-                StatusCode::FORBIDDEN,
-                if subscribe { "SUB007" } else { "SUB008" },
-                "You do not have the correct group access",
+                StatusCode::UNAUTHORIZED,
+                generic_code,
+                "You do not have the correct group for this",
                 request_id,
             );
         }
@@ -9432,18 +10269,15 @@ async fn subscription_routes(
     )
 }
 
-fn public_credit_definition(mut value: Value) -> Value {
-    let key_present = value
-        .get("api_key")
-        .or_else(|| value.get("api_key_new"))
-        .and_then(Value::as_str)
-        .is_some_and(|key| !key.is_empty());
-    value["api_key_present"] = json!(key_present);
-    if let Some(value) = value.as_object_mut() {
-        value.remove("api_key");
-        value.remove("api_key_new");
-    }
-    strip_internal(value)
+/// The pinned service projects exactly these four fields, with
+/// `api_key_present = bool(doc.get('api_key'))`.
+fn public_credit_definition(value: Value) -> Value {
+    json!({
+        "api_credit_group": value.get("api_credit_group").cloned().unwrap_or(Value::Null),
+        "api_key_header": value.get("api_key_header").cloned().unwrap_or(Value::Null),
+        "api_key_present": value.get("api_key").is_some_and(python_truthy_json),
+        "credit_tiers": value.get("credit_tiers").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn encrypt_credit_definition(value: &mut Value) {
@@ -10598,12 +11432,33 @@ async fn api_discovery_routes(
         .await;
     }
     if kind == "grpc" && action == "services" && method == Method::GET {
-        use base64::Engine as _;
-        let Some(raw) = api.get("api_grpc_descriptor_set").and_then(Value::as_str) else {
-            return success(StatusCode::OK, json!({"services": []}), request_id);
-        };
-        let services = base64::engine::general_purpose::STANDARD.decode(raw).ok().and_then(|bytes| prost_reflect::DescriptorPool::decode(bytes.as_slice()).ok()).map(|pool| pool.services().map(|service| json!({"name": service.name(), "full_name": service.full_name(), "methods": service.methods().map(|method_value| method_value.name().to_owned()).collect::<Vec<_>>() })).collect::<Vec<_>>()).unwrap_or_default();
-        return success(StatusCode::OK, json!({"services": services}), request_id);
+        // The pinned route reports the configured allow-list rather than
+        // querying reflection.
+        if api
+            .get("api_servers")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                "GRPC001",
+                "No upstream servers configured",
+                request_id,
+            );
+        }
+        return success(
+            StatusCode::OK,
+            json!({
+                "services": api
+                    .get("api_grpc_allowed_services")
+                    .filter(|value| python_truthy_json(value))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "reflection_enabled": api.get("api_grpc_reflection_url").is_some_and(python_truthy_json),
+                "note": "Auto-discovery via reflection not fully implemented in this demo route",
+            }),
+            request_id,
+        );
     }
     if kind == "graphql" {
         let field = "api_graphql_schema";
@@ -10655,31 +11510,13 @@ async fn api_discovery_routes(
                     return error(StatusCode::BAD_REQUEST, "API003", &message_text, request_id);
                 }
             };
-            let query = json!({"query": "query IntrospectionQuery { __schema { types { name kind } queryType { name } mutationType { name } subscriptionType { name } } }"});
-            let schema = match state.proxy_client.post(target).json(&query).send().await {
-                Ok(response) => match response.json::<Value>().await {
-                    Ok(response) => response
-                        .get("data")
-                        .and_then(|data| data.get("__schema"))
-                        .cloned()
-                        .unwrap_or(response),
-                    Err(_) => {
-                        return error(
-                            StatusCode::BAD_GATEWAY,
-                            "GQL002",
-                            "Invalid GraphQL schema response",
-                            request_id,
-                        );
-                    }
-                },
-                Err(_) => {
-                    return error(
-                        StatusCode::BAD_GATEWAY,
-                        "GQL001",
-                        "Unable to fetch GraphQL schema",
-                        request_id,
-                    );
-                }
+            let Some(schema) = fetch_introspection_schema(state, target).await else {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "GQL002",
+                    "Failed to fetch schema from upstream",
+                    request_id,
+                );
             };
             let _ = storage
                 .update_one("apis", &filter, &json!({field: schema.clone()}))
@@ -10710,29 +11547,45 @@ async fn api_discovery_routes(
                     return error(StatusCode::BAD_REQUEST, "API003", &message_text, request_id);
                 }
             };
-            let query = json!({"query": "query IntrospectionQuery { __schema { types { name kind } queryType { name } mutationType { name } } }"});
-            return match state.proxy_client.post(target).json(&query).send().await {
-                Ok(response) => match response.json::<Value>().await {
-                    Ok(schema) => {
-                        let _ = storage
-                            .update_one("apis", &filter, &json!({field: schema.clone()}))
-                            .await;
-                        success(StatusCode::OK, schema, request_id)
-                    }
-                    Err(_) => error(
-                        StatusCode::BAD_GATEWAY,
-                        "GQL002",
-                        "Invalid GraphQL schema response",
-                        request_id,
-                    ),
-                },
-                Err(_) => error(
+            let Some(schema) = fetch_introspection_schema(state, target).await else {
+                return error(
                     StatusCode::BAD_GATEWAY,
-                    "GQL001",
-                    "Unable to fetch GraphQL schema",
+                    "GQL002",
+                    "Failed to fetch schema",
                     request_id,
-                ),
+                );
             };
+            let _ = storage
+                .update_one("apis", &filter, &json!({field: schema.clone()}))
+                .await;
+            let types_count = schema
+                .get("types")
+                .and_then(Value::as_array)
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter(|item| {
+                            !item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .starts_with("__")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let has_subscriptions = schema
+                .get("subscriptionType")
+                .is_some_and(|item| item.get("name").is_some_and(|name| !name.is_null()));
+            return success(
+                StatusCode::OK,
+                json!({
+                    "message": "Schema refreshed successfully",
+                    "types_count": types_count,
+                    "has_subscriptions": has_subscriptions,
+                }),
+                request_id,
+            );
         }
     }
     let (field, configured_url) = if kind == "openapi" {
@@ -10751,6 +11604,19 @@ async fn api_discovery_routes(
         if let Some(value) = api.get(field).filter(|value| !value.is_null()) {
             return discovery_document_response(kind, value.clone(), true, request_id);
         }
+        // The pinned route checks the configured URL before the servers.
+        let Some(path) = api
+            .get(configured_url)
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "WSDL001",
+                "No WSDL URL configured for this API",
+                request_id,
+            );
+        };
         let Some(server) = api
             .get("api_servers")
             .and_then(Value::as_array)
@@ -10759,16 +11625,8 @@ async fn api_discovery_routes(
         else {
             return error(
                 StatusCode::NOT_FOUND,
-                "API003",
-                &format!("{} document not found", kind.to_ascii_uppercase()),
-                request_id,
-            );
-        };
-        let Some(path) = api.get(configured_url).and_then(Value::as_str) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "API003",
-                &format!("{} document not found", kind.to_ascii_uppercase()),
+                "WSDL002",
+                "No upstream servers configured",
                 request_id,
             );
         };
@@ -10816,6 +11674,20 @@ async fn api_discovery_routes(
         return discovery_document_response(kind, document, false, request_id);
     }
     if method == Method::POST && action == "refresh" {
+        let Some(path) = api
+            .get(configured_url)
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "WSDL001",
+                "No WSDL URL configured",
+                request_id,
+            );
+        };
+        // Without a server the pinned route fetches the bare relative URL,
+        // which fails as an upstream error.
         let Some(server) = api
             .get("api_servers")
             .and_then(Value::as_array)
@@ -10823,25 +11695,9 @@ async fn api_discovery_routes(
             .and_then(Value::as_str)
         else {
             return error(
-                StatusCode::BAD_REQUEST,
-                "API003",
-                "API server is not configured",
-                request_id,
-            );
-        };
-        let Some(path) = api.get(configured_url).and_then(Value::as_str) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                if kind == "openapi" {
-                    "OPENAPI001"
-                } else {
-                    "WSDL001"
-                },
-                if kind == "openapi" {
-                    "OpenAPI URL is not configured"
-                } else {
-                    "WSDL URL is not configured"
-                },
+                StatusCode::BAD_GATEWAY,
+                "WSDL003",
+                "Failed to fetch WSDL",
                 request_id,
             );
         };
@@ -11250,6 +12106,31 @@ async fn openapi_discovery_route(
     )
 }
 
+/// Mirror of the pinned `fetch_introspection_schema`: only a 200 response with
+/// no GraphQL errors and a `data.__schema` object yields a schema.
+async fn fetch_introspection_schema(state: &AppState, target: String) -> Option<Value> {
+    const INTROSPECTION_QUERY: &str = include_str!("graphql_introspection.graphql");
+    let response = state
+        .proxy_client
+        .post(target)
+        .header(header::ACCEPT, "application/json")
+        .json(&json!({"query": INTROSPECTION_QUERY}))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    let value = response.json::<Value>().await.ok()?;
+    if value.get("errors").is_some_and(python_truthy_json) {
+        return None;
+    }
+    value
+        .pointer("/data/__schema")
+        .filter(|schema| schema.is_object() && !schema.as_object().is_some_and(Map::is_empty))
+        .cloned()
+}
+
 fn graphql_schema_response(schema: Value, cached: bool, request_id: &str) -> Response {
     let query = schema
         .get("queryType")
@@ -11469,6 +12350,16 @@ async fn proto_routes(
     if parts.len() != 2 {
         return error(StatusCode::NOT_FOUND, "API003", "API not found", request_id);
     }
+    // The pinned handlers derive a proto file name from the path and reject
+    // unusable names with 400 GTW013.
+    if let Some(reason) = parts.iter().find_map(|part| proto_file_name_error(part)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "GTW013",
+            &format!("Path validation error: {reason}"),
+            request_id,
+        );
+    }
     let filter = json!({"api_name": parts[0], "api_version": parts[1]});
     if method == Method::GET {
         let proto_record = storage
@@ -11495,10 +12386,8 @@ async fn proto_routes(
         {
             Some(source) if !source.is_empty() => success(
                 StatusCode::OK,
-                json!({
-                    "message": "Proto file retrieved successfully",
-                    "content": source
-                }),
+                // respond_rest drops `message` when a response body is present.
+                json!({"content": source}),
                 request_id,
             ),
             None => error(
@@ -11542,12 +12431,33 @@ async fn proto_routes(
         );
     }
     if method == Method::POST || method == Method::PUT {
-        let max_proto_size = env::var("MAX_PROTO_SIZE_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1024 * 1024);
+        let max_proto_size = match env::var("MAX_PROTO_SIZE_BYTES") {
+            Err(_) => 1024 * 1024,
+            Ok(value) => match value.trim().parse::<i64>() {
+                Ok(size) => usize::try_from(size).unwrap_or(0),
+                // The pinned route rejects every upload when the limit is unusable.
+                Err(_) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        crate::constants::ErrorCodes::REQUEST_FILE_TYPE,
+                        "Invalid proto file: MAX_PROTO_SIZE_BYTES is not an integer",
+                        request_id,
+                    );
+                }
+            },
+        };
         let content = match extract_proto_source(headers, body) {
             Ok(content) => content,
+            // The pinned route declares an UploadFile form field, so FastAPI
+            // rejects any non-multipart request before the handler runs.
+            Err(error_value) if error_value == NOT_MULTIPART => {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "VAL001",
+                    "Validation Error",
+                    request_id,
+                );
+            }
             Err(error_value) => {
                 return error(
                     StatusCode::BAD_REQUEST,
@@ -11660,13 +12570,15 @@ async fn proto_routes(
     )
 }
 
+const NOT_MULTIPART: &str = "Request is not multipart/form-data";
+
 fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !content_type.starts_with("multipart/form-data") {
-        return Ok(body.to_vec());
+        return Err(NOT_MULTIPART.to_owned());
     }
     let boundary = content_type
         .split("boundary=")
@@ -11829,6 +12741,11 @@ async fn logging_routes(
         let (code, message_text) = match path {
             "/logging/logs/export" => ("LOG003", "You do not have permission to export logs"),
             "/logging/logs/download" => ("LOG004", "You do not have permission to download logs"),
+            "/logging/logs/files" => ("LOG005", "You do not have permission to view log files"),
+            "/logging/logs/statistics" => (
+                "LOG002",
+                "You do not have permission to view log statistics",
+            ),
             _ => ("LOG001", "You do not have permission to view logs"),
         };
         return error(StatusCode::FORBIDDEN, code, message_text, request_id);
@@ -11846,8 +12763,9 @@ async fn logging_routes(
                     Ok(entry) => entry,
                     Err(_) => return unexpected(request_id),
                 };
-                if entry.path().is_file() {
-                    files.push(entry.file_name().to_string_lossy().into_owned());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.path().is_file() && is_log_file_name(&name) {
+                    files.push(name);
                 }
             }
         }
@@ -11973,6 +12891,13 @@ fn log_export(
     ))
 }
 
+/// The pinned LoggingService only reads `doorman.log*` and
+/// `doorman-trail.log*`; other files in the directory (such as the persisted
+/// metrics documents) are not logs.
+fn is_log_file_name(name: &str) -> bool {
+    name.starts_with("doorman.log") || name.starts_with("doorman-trail.log")
+}
+
 fn read_log_records(
     directory: &std::path::Path,
     query: &HashMap<String, String>,
@@ -11988,7 +12913,7 @@ fn read_log_records(
         for entry in entries {
             let entry = entry.map_err(|_| LogExportError::Read)?;
             let file_type = entry.file_type().map_err(|_| LogExportError::Read)?;
-            if !file_type.is_file() {
+            if !file_type.is_file() || !is_log_file_name(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             let metadata = entry.metadata().map_err(|_| LogExportError::Read)?;
@@ -12186,11 +13111,23 @@ fn parse_log_record(line: &str) -> Option<Value> {
     Some(Value::Object(values))
 }
 
+/// Compile each log-parsing pattern once; log queries parse up to thousands of
+/// records, and compiling per record made them take tens of seconds.
+fn cached_regex(pattern: &'static str) -> Option<Regex> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<&'static str, Regex>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    if let Some(regex) = cache.get(pattern) {
+        return Some(regex.clone());
+    }
+    let regex = Regex::new(pattern).ok()?;
+    cache.insert(pattern, regex.clone());
+    Some(regex)
+}
+
 fn extract_log_fields(message: &str) -> Map<String, Value> {
     let mut values = Map::new();
-    let capture = |pattern: &str, group: usize| {
-        Regex::new(pattern)
-            .ok()?
+    let capture = |pattern: &'static str, group: usize| {
+        cached_regex(pattern)?
             .captures(message)?
             .get(group)
             .map(|value| value.as_str().to_owned())
@@ -12213,7 +13150,7 @@ fn extract_log_fields(message: &str) -> Map<String, Value> {
         }
         values.insert("ip_address".to_owned(), json!(value));
     }
-    if let Ok(pattern) = Regex::new(r"Endpoint: (\w+) (.+)")
+    if let Some(pattern) = cached_regex(r"Endpoint: (\w+) (.+)")
         && let Some(captures) = pattern.captures(message)
     {
         values.insert("method".to_owned(), json!(&captures[1]));
@@ -12483,13 +13420,16 @@ async fn discovery_parse(
         };
     }
 
-    let content = payload
-        .get("content")
-        .or_else(|| payload.get("wsdl"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| payload.as_str().map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(raw_body).into_owned());
+    // The pinned route parses the raw request body as the WSDL document.
+    let content = String::from_utf8_lossy(raw_body).into_owned();
+    if let Err(message) = crate::routes::discovery::validate_wsdl(&content) {
+        let message = if content.trim().is_empty() {
+            message
+        } else {
+            format!("Invalid WSDL: {message}")
+        };
+        return error(StatusCode::BAD_REQUEST, "WSDL004", &message, request_id);
+    }
     match crate::routes::discovery::parse_wsdl(&content) {
         Ok(parsed) => success(
             StatusCode::OK,
@@ -12626,12 +13566,12 @@ fn restricted_self_update_fields(payload: &Value) -> Vec<String> {
 fn bootstrap_admin_update_fields_are_safe(payload: &Value) -> bool {
     matches!(
         payload.as_object(),
-        Some(fields) if fields.keys().all(|field| {
+        // Null values are not updates; bandwidth_limit_enabled is not operational.
+        Some(fields) if fields.iter().filter(|(_, value)| !value.is_null()).all(|(field, _)| {
             matches!(
                 field.as_str(),
                 "bandwidth_limit_bytes"
                     | "bandwidth_limit_window"
-                    | "bandwidth_limit_enabled"
                     | "rate_limit_duration"
                     | "rate_limit_duration_type"
                     | "rate_limit_enabled"
@@ -12661,27 +13601,46 @@ fn password_policy() -> &'static str {
 }
 
 fn cookie_secure(headers: &HeaderMap) -> bool {
-    env::var("COOKIE_SECURE")
+    let https_only = env_bool("HTTPS_ONLY", false);
+    let inferred_secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"));
+    let secure = env::var("COOKIE_SECURE")
         .ok()
         .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|| {
-            env_bool("HTTPS_ONLY", false)
-                || headers
-                    .get("x-forwarded-proto")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("https"))
-        })
+        .unwrap_or(https_only || inferred_secure);
+    // Plain-HTTP local hosts never get Secure cookies unless HTTPS_ONLY is set,
+    // so local runs stay usable (pinned behaviour).
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .rsplit_once(':')
+                .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+                .map_or(value, |(name, _)| name)
+                .to_ascii_lowercase()
+        });
+    if !inferred_secure
+        && !https_only
+        && host
+            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "testserver"))
+    {
+        return false;
+    }
+    secure
 }
 
 fn cookie_same_site(secure: bool) -> &'static str {
-    match env::var("COOKIE_SAMESITE")
-        .unwrap_or_else(|_| "strict".to_owned())
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let raw = env::var("COOKIE_SAMESITE").unwrap_or_default();
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "" | "strict" => "Strict",
         "none" if secure => "None",
-        "lax" | "none" => "Lax",
-        _ => "Strict",
+        // Unknown values and None without Secure fall back to Lax.
+        _ => "Lax",
     }
 }
 
@@ -12944,36 +13903,6 @@ fn content_type_is_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn is_typed_json_mutation(path: &str, method: &Method) -> bool {
-    if !matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-        return false;
-    }
-    [
-        "/api",
-        "/apis",
-        "/endpoint",
-        "/endpoints",
-        "/credit",
-        "/config/import",
-        "/group",
-        "/memory/dump",
-        "/memory/restore",
-        "/role",
-        "/routing",
-        "/security/settings",
-        "/tiers",
-        "/tools/chaos/toggle",
-        "/tools/cors/check",
-        "/rate-limits",
-        "/subscription",
-        "/user",
-        "/users",
-        "/vault",
-    ]
-    .iter()
-    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
-}
-
 /// Routes whose Python counterpart declares a required (non-Optional) typed
 /// Pydantic body parameter, so FastAPI's global RequestValidationError
 /// handler returns 422 VAL001 for a request with no body at all -- before
@@ -12981,14 +13910,25 @@ fn is_typed_json_mutation(path: &str, method: &Method) -> bool {
 /// Content-Type. Confirmed against the pinned reference for every listed
 /// route; routes with an `Optional`/defaulted body (memory dump/restore,
 /// security settings) are deliberately excluded.
+/// Python's service-layer message for a missing entity; collections without a
+/// dedicated service message use the generic one.
+fn not_found_message(collection: &str) -> &'static str {
+    match collection {
+        "roles" => "Role does not exist",
+        "groups" => "Group does not exist",
+        "routings" => "Routing does not exist",
+        _ => "Resource not found",
+    }
+}
+
 fn requires_nonempty_json_body(path: &str, method: &Method) -> bool {
-    match method {
-        &Method::POST => {
+    match *method {
+        Method::POST => {
             path == "/credit/rotate-key"
                 || (path.starts_with("/proto/") && path != "/proto/descriptors/backfill")
                 || (path.starts_with("/rate-limits/") && path.ends_with("/duplicate"))
         }
-        &Method::PUT => {
+        Method::PUT => {
             path.starts_with("/api/")
                 || path.starts_with("/endpoint/")
                 || path.starts_with("/group/")
@@ -13087,6 +14027,25 @@ fn configured_max_page_size() -> usize {
         .and_then(|value| value.parse::<i128>().ok())
         .map(|value| value.max(1) as usize)
         .unwrap_or(200)
+}
+
+/// The page window (default 100 per page) without any envelope.
+fn paginate_items(items: Vec<Value>, query: &HashMap<String, String>) -> Vec<Value> {
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("page_size")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    items
+        .into_iter()
+        .skip((page - 1).saturating_mul(page_size))
+        .take(page_size)
+        .collect()
 }
 
 fn paginate_named(items: Vec<Value>, query: &HashMap<String, String>, name: &str) -> Value {
@@ -13224,10 +14183,33 @@ fn http_detail(status: StatusCode, detail: &str, request_id: &str) -> Response {
     json_response(status, json!({"detail": detail}), request_id)
 }
 
+/// FastAPI's request validation failures all pass through the pinned global
+/// RequestValidationError handler, which renders the VAL001 envelope; the
+/// Pydantic error list is only logged, never returned.
 fn validation_errors(errors: Vec<Value>, request_id: &str) -> Response {
-    json_response(
+    let errors = Value::Array(errors);
+    tracing::debug!(%errors, "request validation failed");
+    error(
         StatusCode::UNPROCESSABLE_ENTITY,
-        json!({"detail": errors}),
+        "VAL001",
+        "Validation Error",
+        request_id,
+    )
+}
+
+/// The pinned tier routes return a bare `ResponseModel`, which FastAPI
+/// serializes in full rather than through the respond_rest envelope.
+fn response_model_envelope(message_text: &str, request_id: &str) -> Response {
+    success(
+        StatusCode::OK,
+        json!({
+            "status_code": 200,
+            "response_headers": null,
+            "response": null,
+            "message": message_text,
+            "error_code": null,
+            "error_message": null,
+        }),
         request_id,
     )
 }
@@ -13326,6 +14308,15 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pinned_log_file_patterns_are_read_as_logs() {
+        assert!(is_log_file_name("doorman.log"));
+        assert!(is_log_file_name("doorman.log.3"));
+        assert!(is_log_file_name("doorman-trail.log"));
+        assert!(!is_log_file_name("metrics.json"));
+        assert!(!is_log_file_name("enhanced_metrics.json"));
+    }
 
     #[test]
     fn parse_report_timestamp_matches_pythons_strptime_cascade() {

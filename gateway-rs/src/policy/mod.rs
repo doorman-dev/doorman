@@ -70,6 +70,9 @@ impl PolicyFailure {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyDecision {
+    /// A service-level failure (API disabled, endpoint missing) to report after
+    /// the tier limits the pinned middleware applies first.
+    pub deferred_failure: Option<PolicyFailure>,
     pub route: Option<String>,
     pub api_id: Option<String>,
     pub api_name: Option<String>,

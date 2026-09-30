@@ -63,8 +63,12 @@ pub fn verify_request_token(
     let algorithm = key.algorithm();
     let mut validation = Validation::new(algorithm);
     validation.validate_exp = true;
+    // python-jose applies no clock leeway; an expired token is rejected at once.
+    validation.leeway = 0;
     validation.set_issuer(&[config.jwt_issuer.as_str()]);
     validation.set_audience(&[config.jwt_audience.as_str()]);
+    // A configured issuer/audience must be present, not merely valid if present.
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
     let data = decode::<AuthClaims>(&token, &key.decoding_key()?, &validation)
         .map_err(|_| unauthorized("Unauthorized"))?;
@@ -233,6 +237,39 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("raw-token"));
         assert_eq!(extract_token(&headers), Some("raw-token".to_owned()));
+    }
+
+    #[test]
+    fn tokens_missing_issuer_or_audience_are_rejected() {
+        let config = SharedStorageConfig {
+            jwt_secret: Some("unit-test-secret".to_owned()),
+            ..SharedStorageConfig::default()
+        };
+        let exp = jsonwebtoken::get_current_timestamp() + 600;
+        let full = serde_json::json!({
+            "sub": "user", "jti": "id", "exp": exp,
+            "iss": config.jwt_issuer, "aud": config.jwt_audience,
+        });
+        let verify = |claims: &serde_json::Value| {
+            let token = jsonwebtoken::encode(
+                &jsonwebtoken::Header::default(),
+                claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"unit-test-secret"),
+            )
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            verify_request_token(&headers, &config)
+        };
+        assert!(verify(&full).is_ok());
+        for claim in ["iss", "aud"] {
+            let mut partial = full.clone();
+            partial.as_object_mut().unwrap().remove(claim);
+            assert!(verify(&partial).is_err(), "token without {claim} accepted");
+        }
     }
 
     #[test]

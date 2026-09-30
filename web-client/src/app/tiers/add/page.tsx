@@ -66,7 +66,7 @@ export default function AddTierPage() {
         }
       }
 
-      await postJson(`${SERVER_URL}/platform/tiers`, payload)
+      await postJson(`${SERVER_URL}/platform/tiers/`, payload)
       router.push('/tiers')
     } catch (err: any) {
       console.error('Failed to create tier:', err)

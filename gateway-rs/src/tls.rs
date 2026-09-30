@@ -1,21 +1,30 @@
 use std::{
-    fs,
-    io,
+    fs, io,
     net::SocketAddr,
     path::Path,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
-use axum::{extract::connect_info::Connected, serve::{IncomingStream, Listener}};
+use axum::{
+    extract::connect_info::Connected,
+    serve::{IncomingStream, Listener},
+};
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsStream, rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier, pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject}}};
+use tokio_rustls::{
+    TlsAcceptor, TlsStream,
+    rustls::{
+        RootCertStore, ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+        server::WebPkiClientVerifier,
+    },
+};
 use x509_parser::parse_x509_certificate;
 
-pub mod profiles;
 pub mod policy;
+pub mod profiles;
 pub mod secrets;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,17 +50,27 @@ pub fn server_config_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Ser
     server_config_from_pem_with_roots(cert_pem, key_pem, None)
 }
 
-pub fn server_config_from_pem_with_roots(cert_pem: &[u8], key_pem: &[u8], roots: Option<RootCertStore>) -> io::Result<ServerConfig> {
+pub fn server_config_from_pem_with_roots(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    roots: Option<RootCertStore>,
+) -> io::Result<ServerConfig> {
     let certs = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(invalid_pem)?;
     if certs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS certificate file is empty"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS certificate file is empty",
+        ));
     }
     let (_, leaf) = parse_x509_certificate(certs[0].as_ref())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TLS certificate is not X.509"))?;
     if !leaf.validity().is_valid() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS certificate is not currently valid"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS certificate is not currently valid",
+        ));
     }
     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(invalid_pem)?;
     let verifier = match roots {
@@ -78,17 +97,20 @@ pub fn certificate_expiry_timestamp(pem: &[u8]) -> io::Result<i64> {
         let expiry = parsed.validity().not_after.timestamp();
         min_expiry = Some(min_expiry.map_or(expiry, |prior: i64| prior.min(expiry)));
     }
-    min_expiry.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PEM contains no certificate"))
+    min_expiry
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PEM contains no certificate"))
 }
 
 fn invalid_pem(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
+type PendingHandshake = BoxFuture<'static, io::Result<(TlsStream<TcpStream>, TlsConnectionInfo)>>;
+
 pub struct TlsListener {
     listener: TcpListener,
     config: Arc<RwLock<Arc<ServerConfig>>>,
-    pending: FuturesUnordered<BoxFuture<'static, io::Result<(TlsStream<TcpStream>, TlsConnectionInfo)>>>,
+    pending: FuturesUnordered<PendingHandshake>,
 }
 
 impl TlsListener {
@@ -125,7 +147,8 @@ pub fn spawn_file_reload(
         let mut active_hash = None;
         loop {
             interval.tick().await;
-            let materials = tokio::try_join!(tokio::fs::read(&cert_file), tokio::fs::read(&key_file));
+            let materials =
+                tokio::try_join!(tokio::fs::read(&cert_file), tokio::fs::read(&key_file));
             let (cert_pem, key_pem) = match materials {
                 Ok(materials) => materials,
                 Err(error) => {
@@ -146,7 +169,9 @@ pub fn spawn_file_reload(
                     active_hash = Some(hash);
                     tracing::info!("TLS listener certificate reloaded");
                 }
-                Err(error) => tracing::warn!(%error, "TLS certificate reload rejected; retaining active certificate"),
+                Err(error) => {
+                    tracing::warn!(%error, "TLS certificate reload rejected; retaining active certificate")
+                }
             }
         }
     })
@@ -192,6 +217,9 @@ impl Listener for TlsListener {
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        Ok(TlsConnectionInfo { peer: self.listener.local_addr()?, peer_certificates: Vec::new() })
+        Ok(TlsConnectionInfo {
+            peer: self.listener.local_addr()?,
+            peer_certificates: Vec::new(),
+        })
     }
 }

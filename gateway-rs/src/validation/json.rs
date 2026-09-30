@@ -99,8 +99,8 @@ fn validate_value(
         let length = text.chars().count() as f64;
         enforce_range(length, rules, "String length", "", "")?;
         if let Some(pattern) = rules.get("pattern").and_then(Value::as_str) {
-            let regex = Regex::new(pattern)
-                .map_err(|_| format!("Invalid validation pattern for {path}"))?;
+            let regex = cached_pattern(pattern)
+                .ok_or_else(|| format!("Invalid validation pattern for {path}"))?;
             if regex.find(text).is_none_or(|found| found.start() != 0) {
                 return Err(format!("String does not match pattern {pattern}"));
             }
@@ -196,16 +196,43 @@ fn enforce_range(
     Ok(())
 }
 
+/// Endpoint validation schemas supply their own patterns; compile each once.
+/// The cache is bounded so arbitrary schema churn cannot grow it without limit.
+pub(crate) fn cached_pattern(pattern: &str) -> Option<Regex> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
+        std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    if let Some(regex) = cache.get(pattern) {
+        return Some(regex.clone());
+    }
+    let regex = Regex::new(pattern).ok()?;
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
+    cache.insert(pattern.to_owned(), regex.clone());
+    Some(regex)
+}
+
 fn validate_format(value: &str, format: &str, path: &str) -> Result<(), String> {
     // Python's `$` also matches before one trailing newline.
     let pattern_value = value.strip_suffix('\n').unwrap_or(value);
     let valid = match format {
-        "email" => Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-            .is_ok_and(|regex| regex.is_match(pattern_value)),
-        "url" => Regex::new(
-            r"^https?://(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*$",
-        )
-        .is_ok_and(|regex| regex.is_match(pattern_value)),
+        "email" => {
+            static EMAIL: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+                Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+                    .expect("email expression is valid")
+            });
+            EMAIL.is_match(pattern_value)
+        }
+        "url" => {
+            static URL: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+                Regex::new(
+                    r"^https?://(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*$",
+                )
+                .expect("url expression is valid")
+            });
+            URL.is_match(pattern_value)
+        }
         "date" => valid_date(value),
         "datetime" => valid_datetime(value),
         "uuid" => valid_uuid(value),

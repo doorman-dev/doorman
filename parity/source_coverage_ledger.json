@@ -858,16 +858,13 @@
       ],
       "domain": "application",
       "id": "backend-services/doorman.py::async_function:ip_filter_middleware",
-      "notes": "Rust implements the server lifecycle, router, middleware, persistence, signals, metrics, configuration, detached start/stop/restart commands, PID management, and configurable demo-seed command.",
-      "rationale": "Framework-specific logging helpers and nested ASGI lifespan mechanics are Python/Starlette-specific plumbing with no Rust equivalent needed; the observable lifecycle behavior (startup, shutdown, signal handling, persistence) is what this module's tests and pinned contract actually verify, and Rust preserves it.",
+      "notes": "Rust enforces the persisted platform IP whitelist/blacklist, trusted-proxy X-Forwarded-For handling, localhost bypass, and the /platform/security/settings exemption before routing.",
+      "rationale": "Approved security divergence: when storage is unavailable Rust cannot evaluate the persisted security policy and fails every platform request closed with 503 SEC012 (including login and token checks). Python's middleware reads cached settings and lets requests proceed, so cached reads such as /platform/user/me still succeed and uncached reads 500 during the same outage. Verified live with the pinned server during a simulated Mongo outage.",
       "rust_symbols": [
-        "gateway-rs/src/main.rs",
-        "gateway-rs/src/app.rs",
-        "gateway-rs/src/config.rs"
+        "gateway-rs/src/routes/platform.rs::platform_ip_filter"
       ],
       "rust_tests": [
-        "gateway-rs/tests/process_lifecycle.rs",
-        "gateway-rs/tests/platform_native.rs::platform_security_headers_csp_hsts_and_request_ids_match_python"
+        "gateway-rs/tests/chaos_platform_fail_closed.rs::storage_outage_fails_platform_requests_closed_and_recovers"
       ],
       "source": {
         "kind": "async_function",
@@ -28880,29 +28877,21 @@
       "decorators": [],
       "domain": "services",
       "id": "backend-services/services/gateway_service.py::field:GatewayService.timeout",
-      "notes": "Rust preserves API and endpoint resolution (including distinct GTW002/GTW003 failures), disabled/public/auth policy, CORS and preflight behavior, request identity and allowed-header forwarding, system/user credit precedence, authorization swapping, endpoint validation and transforms, client routing, timeouts, retries/backoff, circuit breaking, upstream status and malformed-JSON mapping, SOAP version and WS-Security processing, GraphQL depth/error handling, and descriptor-driven gRPC unary/client/server/bidirectional streaming with metadata filtering, TLS, limits, and status mapping. The native implementation intentionally replaces Python generated-module discovery and optional gql.Client execution with descriptor-set dynamic protobuf execution and direct HTTP GraphQL transport; response-header hardening also filters sensitive and hop-by-hop headers beyond the pinned helper.",
+      "notes": "Rust honors HTTP_CONNECT_TIMEOUT and HTTP_READ_TIMEOUT (with per-API api_read_timeout overrides).",
+      "rationale": "HTTP_WRITE_TIMEOUT and HTTP_TIMEOUT (httpx pool-acquire timeout) have no reqwest equivalents; the Rust request is bounded by the connect and read timeouts instead.",
       "rust_symbols": [
-        "gateway-rs/src/policy/evaluator.rs::evaluate_rest_policy",
-        "gateway-rs/src/routes/rest.rs::execute_rest",
-        "gateway-rs/src/protocol/soap.rs",
-        "gateway-rs/src/protocol/grpc.rs",
-        "gateway-rs/src/gateway/resolution.rs",
-        "gateway-rs/src/gateway/retries.rs",
-        "gateway-rs/src/gateway/transforms.rs"
+        "gateway-rs/src/config.rs::python_http_connect_timeout",
+        "gateway-rs/src/policy/evaluator.rs::default_http_read_timeout_ms"
       ],
       "rust_tests": [
-        "gateway-rs/src/policy/evaluator.rs::tests::returns_no_endpoints_for_api_without_registered_endpoints",
-        "gateway-rs/src/routes/rest.rs::tests::rejects_malformed_json_from_rest_upstream_like_python",
-        "gateway-rs/tests/runtime.rs",
-        "gateway-rs/tests/grpc_native.rs",
-        "gateway-rs/tests/python_parity_suite.rs"
+        "gateway-rs/tests/live_tests_parity.rs::live_test_30_credits_and_header_injection_parity"
       ],
       "source": {
         "kind": "field",
         "line": 59,
         "path": "backend-services/services/gateway_service.py"
       },
-      "status": "translated"
+      "status": "approved_changed"
     },
     {
       "decorators": [
@@ -28910,29 +28899,20 @@
       ],
       "domain": "services",
       "id": "backend-services/services/gateway_service.py::method:GatewayService._build_limits",
-      "notes": "Rust preserves API and endpoint resolution (including distinct GTW002/GTW003 failures), disabled/public/auth policy, CORS and preflight behavior, request identity and allowed-header forwarding, system/user credit precedence, authorization swapping, endpoint validation and transforms, client routing, timeouts, retries/backoff, circuit breaking, upstream status and malformed-JSON mapping, SOAP version and WS-Security processing, GraphQL depth/error handling, and descriptor-driven gRPC unary/client/server/bidirectional streaming with metadata filtering, TLS, limits, and status mapping. The native implementation intentionally replaces Python generated-module discovery and optional gql.Client execution with descriptor-set dynamic protobuf execution and direct HTTP GraphQL transport; response-header hardening also filters sensitive and hop-by-hop headers beyond the pinned helper.",
+      "notes": "Rust reads HTTP_MAX_KEEPALIVE (default 50, idle pooled connections) and HTTP_KEEPALIVE_EXPIRY (default 30s) with Python's fall-back-to-default parsing when building every upstream reqwest client.",
+      "rationale": "HTTP_MAX_CONNECTIONS (a global cap across all hosts) has no reqwest equivalent; reqwest bounds idle connections per host rather than total in-flight connections, so the keepalive bound is applied per host and the total cap is not enforced.",
       "rust_symbols": [
-        "gateway-rs/src/policy/evaluator.rs::evaluate_rest_policy",
-        "gateway-rs/src/routes/rest.rs::execute_rest",
-        "gateway-rs/src/protocol/soap.rs",
-        "gateway-rs/src/protocol/grpc.rs",
-        "gateway-rs/src/gateway/resolution.rs",
-        "gateway-rs/src/gateway/retries.rs",
-        "gateway-rs/src/gateway/transforms.rs"
+        "gateway-rs/src/state.rs::upstream_client_builder"
       ],
       "rust_tests": [
-        "gateway-rs/src/policy/evaluator.rs::tests::returns_no_endpoints_for_api_without_registered_endpoints",
-        "gateway-rs/src/routes/rest.rs::tests::rejects_malformed_json_from_rest_upstream_like_python",
-        "gateway-rs/tests/runtime.rs",
-        "gateway-rs/tests/grpc_native.rs",
-        "gateway-rs/tests/python_parity_suite.rs"
+        "gateway-rs/tests/live_tests_parity.rs::live_test_30_credits_and_header_injection_parity"
       ],
       "source": {
         "kind": "method",
         "line": 78,
         "path": "backend-services/services/gateway_service.py"
       },
-      "status": "translated"
+      "status": "approved_changed"
     },
     {
       "decorators": [
@@ -28940,29 +28920,21 @@
       ],
       "domain": "services",
       "id": "backend-services/services/gateway_service.py::method:GatewayService.get_http_client",
-      "notes": "Rust preserves API and endpoint resolution (including distinct GTW002/GTW003 failures), disabled/public/auth policy, CORS and preflight behavior, request identity and allowed-header forwarding, system/user credit precedence, authorization swapping, endpoint validation and transforms, client routing, timeouts, retries/backoff, circuit breaking, upstream status and malformed-JSON mapping, SOAP version and WS-Security processing, GraphQL depth/error handling, and descriptor-driven gRPC unary/client/server/bidirectional streaming with metadata filtering, TLS, limits, and status mapping. The native implementation intentionally replaces Python generated-module discovery and optional gql.Client execution with descriptor-set dynamic protobuf execution and direct HTTP GraphQL transport; response-header hardening also filters sensitive and hop-by-hop headers beyond the pinned helper.",
+      "notes": "Rust builds pooled upstream clients once at startup (and per upstream TLS profile), disables connection reuse when ENABLE_HTTPX_CLIENT_CACHE=false, and only negotiates HTTP/2 when HTTP_ENABLE_HTTP2 is exactly 'true' (HTTP/1.1-only otherwise, matching httpx's default).",
+      "rationale": "DOORMAN_RUN_LIVE's per-request client exists only so Python live tests can monkeypatch httpx.AsyncClient; it has no observable wire behavior to preserve.",
       "rust_symbols": [
-        "gateway-rs/src/policy/evaluator.rs::evaluate_rest_policy",
-        "gateway-rs/src/routes/rest.rs::execute_rest",
-        "gateway-rs/src/protocol/soap.rs",
-        "gateway-rs/src/protocol/grpc.rs",
-        "gateway-rs/src/gateway/resolution.rs",
-        "gateway-rs/src/gateway/retries.rs",
-        "gateway-rs/src/gateway/transforms.rs"
+        "gateway-rs/src/state.rs::upstream_client_builder",
+        "gateway-rs/src/state.rs::AppState::new"
       ],
       "rust_tests": [
-        "gateway-rs/src/policy/evaluator.rs::tests::returns_no_endpoints_for_api_without_registered_endpoints",
-        "gateway-rs/src/routes/rest.rs::tests::rejects_malformed_json_from_rest_upstream_like_python",
-        "gateway-rs/tests/runtime.rs",
-        "gateway-rs/tests/grpc_native.rs",
-        "gateway-rs/tests/python_parity_suite.rs"
+        "gateway-rs/tests/live_tests_parity.rs::live_test_30_credits_and_header_injection_parity"
       ],
       "source": {
         "kind": "method",
         "line": 103,
         "path": "backend-services/services/gateway_service.py"
       },
-      "status": "translated"
+      "status": "approved_changed"
     },
     {
       "decorators": [
@@ -33829,18 +33801,15 @@
       "decorators": [],
       "domain": "utils",
       "id": "backend-services/utils/auth_util.py::async_function:auth_required",
-      "notes": "Rust implements JWT configuration detection, positive expiry parsing and unit aliases, CSRF double-submit/cache fallback, cookie and bearer extraction, kid-based key selection, signature/claim/revocation/user checks, active-user enforcement, permission claims, UUID jti, and access/refresh expiry.",
-      "rationale": "Backend-outage detail mappings, testserver HTTPS heuristics, and legacy helper return conventions are consolidated through the typed error/config boundary rather than reproduced as distinct standalone code paths, with the same observable auth decisions.",
+      "notes": "Rust implements JWT configuration detection, expiry parsing, CSRF double-submit/cache fallback, cookie and bearer extraction, kid-based key selection, signature/claim/revocation/user checks, and active-user enforcement.",
+      "rationale": "Approved security divergence (verified live against the pinned server): with HTTPS_ONLY=true Python only enforces CSRF when the effective connection is HTTPS (request scheme or X-Forwarded-Proto) and exempts every /platform/authorization* path; Rust enforces the double-submit check for every authenticated platform request regardless of the reported transport and exempts only login, registration, and /platform/user/admin. The bundled web client always sends X-CSRF-Token, so it is unaffected; plain-HTTP API clients relying on Python's skip must send the header. Backend-outage detail mappings and the testserver HTTPS heuristic are consolidated through the typed error/config boundary.",
       "rust_symbols": [
-        "gateway-rs/src/policy/auth.rs::verify_request_token",
-        "gateway-rs/src/routes/platform.rs::login",
-        "gateway-rs/src/routes/platform.rs::auth_expiry_seconds",
-        "gateway-rs/src/routes/platform.rs::refresh_expiry_seconds",
-        "gateway-rs/src/routes/operations.rs::require_manage_gateway"
+        "gateway-rs/src/routes/platform.rs::authorize",
+        "gateway-rs/src/routes/platform.rs::csrf_matches"
       ],
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::authorization_refresh_and_invalidate_match_python",
-        "gateway-rs/tests/platform_native.rs::https_mode_requires_matching_csrf_and_preserves_request_id"
+        "gateway-rs/tests/platform_native.rs::https_mode_requires_matching_csrf_and_preserves_request_id",
+        "gateway-rs/tests/platform_native.rs::https_only_csrf_applies_to_plain_http_and_authorization_subpaths"
       ],
       "source": {
         "kind": "async_function",
@@ -53740,8 +53709,8 @@
         "translated": 329
       },
       "services": {
-        "approved_changed": 43,
-        "translated": 143
+        "approved_changed": 46,
+        "translated": 140
       },
       "utils": {
         "approved_changed": 540,
@@ -53761,9 +53730,9 @@
     "reviewed_percent": 100.0,
     "reviewed_source_units": 2300,
     "status_counts": {
-      "approved_changed": 746,
+      "approved_changed": 749,
       "approved_obsolete": 183,
-      "translated": 1371
+      "translated": 1368
     },
     "total_source_units": 2300
   }

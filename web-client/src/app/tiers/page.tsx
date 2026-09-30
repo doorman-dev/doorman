@@ -74,9 +74,9 @@ export default function TiersPage() {
         params.append('enabled_only', 'true')
       }
       const query = params.toString()
-      const data = await getJson(`${SERVER_URL}/platform/tiers${query ? `?${query}` : ''}`)
-      // Ensure data is an array
-      let nextTiers = Array.isArray(data) ? data : []
+      const data: any = await getJson(`${SERVER_URL}/platform/tiers/${query ? `?${query}` : ''}`)
+      // The listing is paginated: {tiers: [...], page, page_size, ...}
+      let nextTiers: Tier[] = Array.isArray(data) ? data : (Array.isArray(data?.tiers) ? data.tiers : [])
 
       if (status === 'disabled') {
         nextTiers = nextTiers.filter(t => !t.enabled)

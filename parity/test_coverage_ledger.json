@@ -820,9 +820,10 @@
     {
       "domain": "live/other",
       "id": "backend-services/live-tests/test_95_chaos_backends.py::test_mongo_outage_during_requests",
-      "notes": "The shared chaos controls are protocol-independent; Rust verifies fault injection, bounded latency/error behavior, statistics, and timed reset through the same management API.",
+      "notes": "Approved security divergence; Rust asserts the 503 SEC012 fail-closed response during the outage and full recovery after the timed reset.",
+      "rationale": "Running this pinned live test against Rust fails its status assertion: during a simulated Mongo outage Rust fails platform requests closed with 503 SEC012 because the persisted security policy cannot be evaluated, while Python serves cached reads (200) and 500s uncached ones.",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract",
+        "gateway-rs/tests/chaos_platform_fail_closed.rs::storage_outage_fails_platform_requests_closed_and_recovers",
         "gateway-rs/tests/python_parity_suite.rs::parity_test_developer_tools_chaos_and_simulator"
       ],
       "source": {
@@ -830,7 +831,7 @@
         "path": "backend-services/live-tests/test_95_chaos_backends.py",
         "suite": "live"
       },
-      "status": "covered"
+      "status": "approved_changed"
     },
     {
       "domain": "live/platform/config",
@@ -877,7 +878,7 @@
     {
       "domain": "live/gateway/cors",
       "id": "backend-services/live-tests/test_99_cors_matrices.py::test_cors_wildcard_with_credentials_true_sets_origin",
-      "notes": "Approved security divergence: Rust rejects credentialed wildcard API configuration with 422/value_error.cors_origins instead of creating a browser-invalid policy.",
+      "notes": "Approved security divergence: Rust rejects credentialed wildcard API configuration with a 422 VAL001 validation error instead of creating a browser-invalid policy.",
       "rationale": "Credentialed wildcard origins are browser-invalid and unsafe; Rust requires an explicit non-empty origin allowlist when credentials are enabled.",
       "rust_tests": [
         "gateway-rs/tests/live_tests_parity.rs::live_test_99_cors_credentialed_wildcard_is_rejected_as_approved_security_divergence"
@@ -8453,8 +8454,9 @@
         "covered": 1
       },
       "live/other": {
+        "approved_changed": 1,
         "approved_obsolete": 1,
-        "covered": 18
+        "covered": 17
       },
       "live/platform/api": {
         "covered": 2
@@ -8608,9 +8610,9 @@
       }
     },
     "status_counts": {
-      "approved_changed": 23,
+      "approved_changed": 24,
       "approved_obsolete": 45,
-      "covered": 532
+      "covered": 531
     },
     "total_test_cases": 600
   }

@@ -112,7 +112,12 @@ pub fn normalize_update_api(payload: &Value) -> Result<Value, Vec<Value>> {
     if let Some(values) = normalized.as_object_mut() {
         values.retain(|field, value| {
             !value.is_null()
-                || matches!(field.as_str(), "api_client_tls_policy" | "api_upstream_tls_profile" | "api_upstream_tls_profiles")
+                || matches!(
+                    field.as_str(),
+                    "api_client_tls_policy"
+                        | "api_upstream_tls_profile"
+                        | "api_upstream_tls_profiles"
+                )
         });
     }
     Ok(normalized)
@@ -421,8 +426,11 @@ mod tests {
             "api_upstream_tls_profile": null
         }))
         .unwrap();
-        assert_eq!(value, json!({"api_name": "123", "api_public": true,
-            "api_client_tls_policy": null, "api_upstream_tls_profile": null}));
+        assert_eq!(
+            value,
+            json!({"api_name": "123", "api_public": true,
+            "api_client_tls_policy": null, "api_upstream_tls_profile": null})
+        );
     }
 
     #[test]

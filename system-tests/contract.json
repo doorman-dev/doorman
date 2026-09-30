@@ -85,9 +85,10 @@
     "snapshot-concurrent-restart-restore",
     "redis-outage-cached-auth-recovery",
     "mongo-stepdown-concurrent-writes",
-    "secret-data-logging-export-redaction"
+    "secret-data-logging-export-redaction",
+    "native-mtls-auth-rbac-credits"
   ],
-  "expected_dashboard_routes": 50,
-  "dashboard_routes_sha256": "5ed913fa0571809cfad5facf00c809ca773c7f9c89e99d519ef2b3b034a06be3",
+  "expected_dashboard_routes": 51,
+  "dashboard_routes_sha256": "06a4e914ebad825abcc108f62dfcfd58fa92d34c547a2e68508d8da62371dc5f",
   "approved_differences": []
 }

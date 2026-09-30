@@ -26,6 +26,8 @@ class ReleaseCheckTests(unittest.TestCase):
         scenario_names = [case["name"] for case in json.loads(scenario_path.read_text())]
         openapi_path = REPO_ROOT / "parity" / "openapi" / "python-openapi.json.gz.b64"
         openapi_bytes, openapi_document = load_openapi(openapi_path)
+        approvals_path = REPO_ROOT / "parity" / "differential" / "operation_approvals.json"
+        approvals = json.loads(approvals_path.read_text())
         operation_results = [
             {
                 "name": case["name"],
@@ -33,12 +35,11 @@ class ReleaseCheckTests(unittest.TestCase):
                 "path_template": case["path_template"],
                 "operation_id": case["operation_id"],
                 "probe_depth": "authenticated_synthetic_boundary",
-                "match": True,
-                "approved_divergence": None,
+                "match": case["name"] not in approvals,
+                "approved_divergence": approvals.get(case["name"]),
             }
             for case in operation_cases(openapi_document)
         ]
-        approvals_path = REPO_ROOT / "parity" / "differential" / "operation_approvals.json"
         differential.write_text(
             json.dumps(
                 {
@@ -97,6 +98,7 @@ class ReleaseCheckTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema_version": 1,
+                    "image_id": "sha256:" + "a" * 64,
                     "image_smoke": {"passed": True},
                     "restore_rehearsal": {"passed": True},
                     "cutover": {"passed": True},
@@ -158,6 +160,7 @@ class ReleaseCheckTests(unittest.TestCase):
             "EXTERNAL_STORAGE_LOG": str(external_log),
             "RELEASE_OPERATIONS_REPORT": str(operations),
             "SYSTEM_E2E_REPORT": str(system_e2e),
+            "RELEASE_IMAGE_ID": "sha256:" + "a" * 64,
         }
 
     def run_check(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -251,6 +254,23 @@ class ReleaseCheckTests(unittest.TestCase):
             completed = self.run_check(environment)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("without skips", completed.stderr)
+
+    def test_rejects_evidence_for_a_different_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = self.base_environment(Path(directory))
+            environment["RELEASE_IMAGE_ID"] = "sha256:" + "b" * 64
+            completed = self.run_check(environment)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("RELEASE_IMAGE_ID", completed.stderr)
+
+            environment = self.base_environment(Path(directory))
+            path = Path(environment["SYSTEM_E2E_REPORT"])
+            report = json.loads(path.read_text())
+            report["candidate_image_id"] = "sha256:" + "c" * 64
+            path.write_text(json.dumps(report))
+            completed = self.run_check(environment)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("SYSTEM_E2E_REPORT was not generated for RELEASE_IMAGE_ID", completed.stderr)
 
 
 if __name__ == "__main__":

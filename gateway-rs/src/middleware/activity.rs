@@ -165,8 +165,11 @@ pub async fn track_active_requests(
                 .as_secs()
                 / 60
                 * 60;
-            if let Err(error) = storage
-                .record_gateway_metric(GatewayMetric {
+            // Analytics are best-effort: never hold the response on a slow or
+            // unreachable store.
+            let recorded = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                storage.record_gateway_metric(GatewayMetric {
                     minute_start,
                     status,
                     duration_micros: elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -176,9 +179,15 @@ pub async fn track_active_requests(
                     username: context.username.as_deref(),
                     endpoint: context.endpoint.as_deref().or(Some(path.as_str())),
                     is_test,
-                })
-                .await
-            {
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::storage::runtime::StorageError::InvalidDocument(
+                    "analytics store timed out".to_owned(),
+                ))
+            });
+            if let Err(error) = recorded {
                 tracing::warn!(error = %error, "failed to persist gateway analytics bucket");
             }
         }

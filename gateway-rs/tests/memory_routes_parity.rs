@@ -179,7 +179,7 @@ async fn python_memory_route_contracts_in_isolated_processes() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["detail"][0]["loc"], json!(["body", "path"]));
+    assert_eq!(body["error_code"], "VAL001");
 
     let (status, body) = request(
         &app,

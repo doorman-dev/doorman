@@ -109,12 +109,25 @@ impl SharedStorage {
                 tls_mutation_key: String::new(),
             });
         }
-        let client = Client::with_uri_str(config.mongo_uri()).await?;
+        // Bound server selection so a MongoDB outage fails requests quickly
+        // (fail closed) instead of stalling them for the 30s driver default.
+        let mut mongo_options = mongodb::options::ClientOptions::parse(config.mongo_uri()).await?;
+        mongo_options.server_selection_timeout = Some(Duration::from_secs(5));
+        mongo_options.connect_timeout = Some(Duration::from_secs(5));
+        let client = Client::with_options(mongo_options)?;
         let mongo = client.database(&config.mongo_database);
         mongo.run_command(doc! { "ping": 1 }).await?;
 
+        // Without timeouts a Redis outage would hang every request, and an
+        // unbounded backoff would delay recovery after Redis returns.
         let redis_client = redis::Client::open(config.redis_url())?;
-        let mut redis = ConnectionManager::new(redis_client).await?;
+        let redis_config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Duration::from_secs(1))
+            .set_response_timeout(Duration::from_secs(2))
+            .set_number_of_retries(1)
+            .set_factor(100)
+            .set_max_delay(500);
+        let mut redis = ConnectionManager::new_with_config(redis_client, redis_config).await?;
         let _: String = redis::cmd("PING").query_async(&mut redis).await?;
         Self::ensure_indexes(&mongo).await?;
         Ok(Self {
@@ -131,20 +144,31 @@ impl SharedStorage {
     pub async fn tls_mutation_lock(&self) -> Result<TlsMutationGuard, StorageError> {
         let local = self.tls_mutation_mutex.clone().lock_owned().await;
         let Some(mut redis) = self.redis.clone() else {
-            return Ok(TlsMutationGuard { _local: local, redis: None, renewal: None });
+            return Ok(TlsMutationGuard {
+                _local: local,
+                redis: None,
+                renewal: None,
+            });
         };
         let key = self.tls_mutation_key.clone();
         let token = uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let acquired: Option<String> = redis::cmd("SET")
-                .arg(&key).arg(&token).arg("NX").arg("PX").arg(30_000)
-                .query_async(&mut redis).await?;
+                .arg(&key)
+                .arg(&token)
+                .arg("NX")
+                .arg("PX")
+                .arg(30_000)
+                .query_async(&mut redis)
+                .await?;
             if acquired.is_some() {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(StorageError::InvalidDocument("TLS mutation lock timed out".to_owned()));
+                return Err(StorageError::InvalidDocument(
+                    "TLS mutation lock timed out".to_owned(),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -163,7 +187,11 @@ impl SharedStorage {
                 }
             }
         });
-        Ok(TlsMutationGuard { _local: local, redis: Some((redis, key, token)), renewal: Some(renewal) })
+        Ok(TlsMutationGuard {
+            _local: local,
+            redis: Some((redis, key, token)),
+            renewal: Some(renewal),
+        })
     }
 
     async fn ensure_indexes(database: &Database) -> Result<(), StorageError> {
@@ -1520,11 +1548,23 @@ mod parity_tests {
 
     #[tokio::test]
     async fn tls_mutation_lock_serializes_cloned_memory_storage() {
-        let storage = SharedStorage::connect(&crate::config::SharedStorageConfig::default()).await.unwrap();
+        let storage = SharedStorage::connect(&crate::config::SharedStorageConfig::default())
+            .await
+            .unwrap();
         let first = storage.tls_mutation_lock().await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(20), storage.clone().tls_mutation_lock()).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                storage.clone().tls_mutation_lock()
+            )
+            .await
+            .is_err()
+        );
         drop(first);
-        tokio::time::timeout(Duration::from_secs(1), storage.tls_mutation_lock()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), storage.tls_mutation_lock())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

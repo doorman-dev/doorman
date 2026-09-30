@@ -8,7 +8,7 @@
 | `PORT` | `3001` | Backend API port |
 | `WEB_PORT` | `3000` | Frontend port (Docker only) |
 | `THREADS` | `4` | Worker threads. Must be `1` in MEM mode |
-| `DEV_RELOAD` | `false` | Auto-reload on code changes |
+| `DEV_RELOAD` | `false` | Legacy Python auto-reload; ignored by the Rust gateway |
 | `PID_FILE` | `doorman.pid` | Process ID file path |
 
 ## Frontend Configuration
@@ -42,6 +42,8 @@ localStorage.setItem('API_URL', 'https://api.doorman.example.com')
 | `MEM_OR_EXTERNAL` | `MEM` | `MEM` (in-memory) or `REDIS` (production) |
 | `MEM_ENCRYPTION_KEY` | - | 32+ char secret for memory dumps (required for dumps) |
 | `MEM_DUMP_PATH` | `generated/memory_dump.bin` | Memory dump file path. Relative paths are resolved from the service working directory; the container default maps to the `/app/data` volume. |
+| `MEM_AUTO_SAVE_ENABLED` | `false` | Periodically dump memory-mode data to `MEM_DUMP_PATH`. **Migration note:** the Python gateway dumped periodically even when this was unset or `false`; set it to `true` to keep that behaviour. |
+| `MEM_AUTO_SAVE_FREQ` | `900` | Seconds between memory auto-saves (minimum 60). |
 | `SECURITY_SETTINGS_FILE` | `generated/security_settings.json` | Best-effort JSON mirror of security settings. Memory-mode startup loads it only when no settings document exists; external mode always uses MongoDB. Compose defaults to `/app/data/security_settings.json` on its persistent volume. |
 | `PYTHONINTMAXSTRDIGITS` | `4300` | Digit limit for security-settings interval strings and autosave environment integers. Use `0` for unlimited digits or a value from `640` to `2147483647`. Captured at startup; invalid values prevent startup. |
 | `REDIS_HOST` | `localhost` | Redis hostname |
@@ -57,6 +59,8 @@ localStorage.setItem('API_URL', 'https://api.doorman.example.com')
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JWT_SECRET_KEY` | - | **Required.** JWT signing secret (32+ chars) |
+| `LOGIN_ACCOUNT_RATE_LIMIT` / `LOGIN_ACCOUNT_RATE_WINDOW` | `10` / `900` | Login attempts allowed per account per window (seconds); complements the per-IP limit |
+| `REGISTER_ACCOUNT_RATE_LIMIT` / `REGISTER_ACCOUNT_RATE_WINDOW` | `5` / `3600` | Registration attempts per account per window (seconds) |
 | `AUTH_EXPIRE_TIME` | `30` | Access token expiration (numeric) |
 | `AUTH_EXPIRE_TIME_FREQ` | `minutes` | `seconds`, `minutes`, `hours`, `days` |
 | `AUTH_REFRESH_EXPIRE_TIME` | `7` | Refresh token expiration (numeric) |
@@ -111,8 +115,13 @@ Policy matching trims surrounding whitespace. IPv4 networks accept prefix length
 |----------|---------|-------------|
 | `HTTP_CONNECT_TIMEOUT` | `5.0` | TCP connection timeout (seconds) |
 | `HTTP_READ_TIMEOUT` | `30.0` | Response read timeout |
-| `HTTP_WRITE_TIMEOUT` | `30.0` | Request write timeout |
-| `HTTP_TIMEOUT` | `30.0` | Pool acquire timeout |
+| `HTTP_WRITE_TIMEOUT` | `30.0` | Legacy Python write timeout; ignored by the Rust gateway |
+| `HTTP_TIMEOUT` | `30.0` | Legacy Python pool-acquire timeout; ignored by the Rust gateway |
+| `HTTP_MAX_KEEPALIVE` | `50` | Idle pooled upstream connections (per upstream host) |
+| `HTTP_KEEPALIVE_EXPIRY` | `30.0` | Seconds an idle upstream connection is kept |
+| `ENABLE_HTTPX_CLIENT_CACHE` | `true` | `false` disables upstream connection reuse |
+| `HTTP_ENABLE_HTTP2` | `false` | `true` allows HTTP/2 to upstreams; otherwise HTTP/1.1 only |
+| `HTTP_MAX_CONNECTIONS` | `100` | Legacy Python total connection cap; ignored by the Rust gateway |
 | `HTTP_RETRY_BASE_DELAY` | `0.25` | Retry base delay (seconds) |
 | `HTTP_RETRY_MAX_DELAY` | `2.0` | Max retry backoff |
 | `CIRCUIT_BREAKER_ENABLED` | `true` | Enable circuit breaker |

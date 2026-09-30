@@ -56,6 +56,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", any(status))
         .route("/caches", any(caches))
         .fallback(gateway_route_not_found)
+        .layer(axum_middleware::from_fn(
+            crate::routes::platform::gateway_route_guard,
+        ))
         .layer(axum_middleware::from_fn(chaos_middleware))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -124,15 +127,35 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(CatchPanicLayer::custom(handle_panic));
 
-    Router::new()
-        .nest("/api", api)
-        .nest("/platform", platform)
+    // gRPC-Web shares the data-plane guard and response headers.
+    let grpc_web = Router::new()
         .route(
             "/grpc-web/{api_name}/{service}/{method}",
             any(grpc_web_policy_then_execute),
         )
+        .layer(axum_middleware::from_fn(
+            crate::routes::platform::gateway_route_guard,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
+        .layer(axum_middleware::from_fn(request_id));
+    Router::new()
+        .nest("/api", api)
+        .nest("/platform", platform)
+        .merge(grpc_web)
         .route("/metrics", get(metrics))
-        .fallback(not_found)
+        // Unknown paths still carry the platform response headers.
+        .fallback_service(
+            Router::new()
+                .fallback(not_found)
+                .layer(axum_middleware::from_fn_with_state(
+                    state.clone(),
+                    security_headers,
+                ))
+                .with_state(state.clone()),
+        )
         .layer(axum_middleware::from_fn(latency_injection))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

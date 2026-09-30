@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     error::GatewayError,
@@ -25,7 +25,9 @@ use crate::{
     },
     policy::{
         PolicyErrorBody,
-        evaluator::{PolicyRequest, PolicyRuntime, evaluate_rest_policy, evaluate_shared_effects},
+        evaluator::{
+            PolicyRequest, PolicyRuntime, evaluate_rest_policy_staged, evaluate_shared_effects,
+        },
     },
     state::AppState,
 };
@@ -41,6 +43,32 @@ pub enum DataPlaneProtocol {
 
 #[derive(Clone, Debug)]
 pub struct PolicyPath(pub String);
+
+/// The pinned body-size middleware rejects a declared oversized body before
+/// any routing or policy runs (gRPC-Web paths are not covered by it).
+pub(crate) fn early_body_limit(request: &Request, protocol: DataPlaneProtocol) -> Option<Response> {
+    let limits = BodyLimits::from_env();
+    let limit = match protocol {
+        DataPlaneProtocol::Rest => limits.rest,
+        DataPlaneProtocol::Graphql => limits.graphql,
+        DataPlaneProtocol::Soap => limits.soap,
+        DataPlaneProtocol::Grpc => limits.grpc,
+        DataPlaneProtocol::GrpcWeb => return None,
+    };
+    let limit = BodyLimits::for_path(request.uri().path(), limit);
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())?;
+    (declared > limit as u64).then(|| {
+        policy_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "REQ001",
+            &format!("Request entity too large (max: {limit} bytes)"),
+        )
+    })
+}
 
 pub async fn rest_policy_then_proxy(
     State(state): State<AppState>,
@@ -63,6 +91,9 @@ pub async fn rest_policy_then_proxy(
         .get::<DataPlaneProtocol>()
         .copied()
         .unwrap_or(DataPlaneProtocol::Rest);
+    if let Some(response) = early_body_limit(&request, protocol) {
+        return Ok(response);
+    }
     let path = request
         .extensions()
         .get::<PolicyPath>()
@@ -78,7 +109,12 @@ pub async fn rest_policy_then_proxy(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0.ip())
-        .or_else(|| request.extensions().get::<ConnectInfo<crate::tls::TlsConnectionInfo>>().map(|value| value.0.peer.ip()));
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+                .map(|value| value.0.peer.ip())
+        });
     let headers = request.headers().clone();
     let content_length = headers
         .get(header::CONTENT_LENGTH)
@@ -91,6 +127,12 @@ pub async fn rest_policy_then_proxy(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| http::Method::from_bytes(value.as_bytes()).ok())
             .unwrap_or(http::Method::OPTIONS)
+    } else if matches!(protocol, DataPlaneProtocol::Grpc | DataPlaneProtocol::Soap)
+        && request.method() == http::Method::GET
+    {
+        // The pinned JSON gRPC and SOAP gateways match endpoints as POST
+        // (`'POST/' + endpoint_uri` for SOAP) whatever the request method.
+        http::Method::POST
     } else {
         request.method().clone()
     };
@@ -101,12 +143,20 @@ pub async fn rest_policy_then_proxy(
         direct_ip: peer,
         now_millis: now_millis(),
         content_length,
-        peer_certificates: request.extensions()
+        peer_certificates: request
+            .extensions()
             .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
             .map(|info| info.0.peer_certificates.clone())
             .unwrap_or_default(),
-        native_tls: request.extensions().get::<ConnectInfo<crate::tls::TlsConnectionInfo>>().is_some(),
+        native_tls: request
+            .extensions()
+            .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+            .is_some(),
         is_preflight: request.method() == http::Method::OPTIONS,
+        group_version_missing: matches!(protocol, DataPlaneProtocol::Grpc)
+            && !request.headers().contains_key("x-api-version"),
+        route_endpoint_check: protocol == DataPlaneProtocol::Rest,
+        endpoint_required: matches!(protocol, DataPlaneProtocol::Rest | DataPlaneProtocol::Soap),
     };
 
     let documents = if let Some(injected) = &state.policy_documents {
@@ -123,36 +173,71 @@ pub async fn rest_policy_then_proxy(
         Err("shared policy storage is unavailable".to_owned())
     };
     let result = match documents {
-        Ok(mut documents) => match evaluate_rest_policy(
-            &mut documents,
-            &policy_request,
-            &state.config.shared_storage,
-            &PolicyRuntime { tls_profiles: state.tls_snapshot().profiles.clone(), ..PolicyRuntime::default() },
-        ) {
-            Ok(Some(mut decision)) => {
-                if let Some(storage) = &state.storage {
-                    evaluate_shared_effects(
-                        &documents,
-                        &policy_request,
-                        &mut decision,
-                        storage,
-                        true,
+        Ok(mut documents) => {
+            // The pinned tier middleware runs before routing, for every gateway
+            // request whose token verifies.
+            let mut tier_status = None;
+            let tier_user = (!state.config.shared_storage.skip_tier_rate_limit
+                && !policy_request.is_preflight)
+                .then(|| {
+                    crate::policy::auth::verify_request_token(
+                        &policy_request.headers,
+                        &state.config.shared_storage,
                     )
-                    .await
-                    .map(|()| Some(decision))
-                } else if state.policy_documents.is_some() {
-                    Ok(Some(decision))
-                } else {
-                    Err(crate::policy::PolicyFailure::new(
-                        crate::policy::PolicyStage::Resolution,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "GTW006",
-                        "Gateway state store unavailable",
-                    ))
+                    .ok()
+                    .and_then(|claims| claims.sub)
+                })
+                .flatten();
+            let tier_result = match (&state.storage, tier_user.as_deref()) {
+                (Some(storage), Some(user)) => crate::policy::tier::enforce(
+                    &documents,
+                    storage,
+                    user,
+                    policy_request.now_millis / 1_000,
+                    true,
+                )
+                .await
+                .map(|status| tier_status = status),
+                _ => Ok(()),
+            };
+            match tier_result.and_then(|()| {
+                evaluate_rest_policy_staged(
+                    &mut documents,
+                    &policy_request,
+                    &state.config.shared_storage,
+                    &PolicyRuntime {
+                        tls_profiles: state.tls_snapshot().profiles.clone(),
+                        ..PolicyRuntime::default()
+                    },
+                )
+            }) {
+                Ok(Some(mut decision)) => {
+                    decision.tier_rate_limit_enabled = false;
+                    decision.tier_limit_status = tier_status.clone();
+                    if let Some(storage) = &state.storage {
+                        evaluate_shared_effects(
+                            &documents,
+                            &policy_request,
+                            &mut decision,
+                            storage,
+                            true,
+                        )
+                        .await
+                        .map(|()| Some(decision))
+                    } else if state.policy_documents.is_some() {
+                        Ok(Some(decision))
+                    } else {
+                        Err(crate::policy::PolicyFailure::new(
+                            crate::policy::PolicyStage::Resolution,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "GTW006",
+                            "Gateway state store unavailable",
+                        ))
+                    }
                 }
+                other => other,
             }
-            other => other,
-        },
+        }
         Err(error) => {
             tracing::error!(error = %error, "rust policy storage unavailable");
             Err(crate::policy::PolicyFailure::new(
@@ -163,6 +248,13 @@ pub async fn rest_policy_then_proxy(
             ))
         }
     };
+    // Tier limits (applied above as shared effects) precede the service-level checks.
+    let result = result.and_then(|decision| match decision {
+        Some(decision) if decision.deferred_failure.is_some() => {
+            Err(decision.deferred_failure.expect("checked above"))
+        }
+        other => Ok(other),
+    });
     match result {
         Ok(Some(decision)) => {
             if request.method() == http::Method::OPTIONS {
@@ -200,6 +292,13 @@ pub async fn rest_policy_then_proxy(
                 });
             Ok(response)
         }
+        // The pinned SOAP service renders its not-found error as XML too.
+        Ok(None) if protocol == DataPlaneProtocol::Soap => Ok((
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/xml")],
+            "<error><error_code>GTW001</error_code><error_message>API does not exist for the requested name and version</error_message></error>",
+        )
+            .into_response()),
         Ok(None) => Ok((
             StatusCode::NOT_FOUND,
             Json(PolicyErrorBody {
@@ -227,6 +326,22 @@ pub async fn rest_policy_then_proxy(
                 let mut response = (failure.status, Json(body)).into_response();
                 apply_tier_headers(&mut response, Some(&status));
                 return Ok(response);
+            }
+            // The pinned SOAP service renders its own 400/403/404 errors as
+            // an XML <error> document (process_soap_response).
+            if protocol == DataPlaneProtocol::Soap
+                && failure.stage == crate::policy::PolicyStage::Resolution
+                && matches!(failure.status.as_u16(), 400 | 403 | 404)
+            {
+                return Ok((
+                    failure.status,
+                    [(header::CONTENT_TYPE, "application/xml")],
+                    format!(
+                        "<error><error_code>{}</error_code><error_message>{}</error_message></error>",
+                        failure.error_code, failure.error_message
+                    ),
+                )
+                    .into_response());
             }
             Ok((
                 failure.status,
@@ -329,21 +444,34 @@ async fn execute_rest(
         )
             .into_response());
     };
-    if !matches!(protocol, DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb)
-        && decision.upstream_tls_profile_id.as_deref()
-            .and_then(|id| state.tls_snapshot().profiles.upstreams.get(id).cloned())
-            .is_some_and(|profile| profile.server_name.is_some())
+    if !matches!(
+        protocol,
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb
+    ) && decision
+        .upstream_tls_profile_id
+        .as_deref()
+        .and_then(|id| state.tls_snapshot().profiles.upstreams.get(id).cloned())
+        .is_some_and(|profile| profile.server_name.is_some())
     {
-        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(PolicyErrorBody {
-            error_code: "TLS004".to_owned(),
-            error_message: "HTTP upstream TLS server-name override is unsupported".to_owned(),
-        })).into_response());
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(PolicyErrorBody {
+                error_code: "TLS004".to_owned(),
+                error_message: "HTTP upstream TLS server-name override is unsupported".to_owned(),
+            }),
+        )
+            .into_response());
     }
-    let Some(proxy_client) = state.proxy_client_for(decision.upstream_tls_profile_id.as_deref()) else {
-        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(PolicyErrorBody {
-            error_code: "TLS004".to_owned(),
-            error_message: "Upstream TLS profile is unavailable".to_owned(),
-        })).into_response());
+    let Some(proxy_client) = state.proxy_client_for(decision.upstream_tls_profile_id.as_deref())
+    else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(PolicyErrorBody {
+                error_code: "TLS004".to_owned(),
+                error_message: "Upstream TLS profile is unavailable".to_owned(),
+            }),
+        )
+            .into_response());
     };
     if !circuit_allows(&state.runtime.circuits, &circuit_key) {
         return Ok((
@@ -596,7 +724,7 @@ async fn execute_rest(
     } else {
         record_success(&state.runtime.circuits, &circuit_key);
     }
-    if status == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND && protocol != DataPlaneProtocol::Graphql {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(PolicyErrorBody {
@@ -639,26 +767,46 @@ async fn execute_rest(
         status,
         decision.response_transform.as_ref(),
     );
-    // GraphQL clients expect execution failures in a valid `errors` envelope,
-    // even when an upstream incorrectly reports that envelope with a 5xx status.
-    // Preserve transport failures and malformed/non-GraphQL responses as errors.
-    let status = if protocol == DataPlaneProtocol::Graphql
-        && status.is_server_error()
-        && serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|body| body.get("errors").and_then(Value::as_array).cloned())
-            .is_some_and(|errors| !errors.is_empty())
-    {
-        StatusCode::OK
+    // The pinned GraphQL gateway always answers 200 with a GraphQL envelope:
+    // an upstream error status without `errors` is wrapped, and a body that is
+    // not JSON becomes a BAD_RESPONSE error.
+    let (status, bytes) = if protocol == DataPlaneProtocol::Graphql {
+        let envelope = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) if status != StatusCode::OK && value.get("errors").is_none() => json!({
+                "errors": [{
+                    "message": value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+                    "extensions": {"code": format!("HTTP_{}", status.as_u16())},
+                }]
+            }),
+            Ok(value) => value,
+            Err(error) => json!({
+                "errors": [{
+                    "message": format!("Invalid JSON from upstream: {error}"),
+                    "extensions": {"code": "BAD_RESPONSE"},
+                }]
+            }),
+        };
+        (
+            StatusCode::OK,
+            serde_json::to_vec(&envelope).unwrap_or_default(),
+        )
     } else {
-        status
+        (status, bytes)
     };
     let is_json = upstream_headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
+    // A HEAD (or any bodiless) reply legitimately carries a JSON content type
+    // with no payload; only a non-empty body can be malformed.
     if protocol == DataPlaneProtocol::Rest
         && is_json
+        && parts.method != http::Method::HEAD
+        && !bytes.is_empty()
         && serde_json::from_slice::<Value>(&bytes).is_err()
     {
         return Ok(policy_error_response(
@@ -677,10 +825,12 @@ async fn execute_rest(
         })
         .to_owned();
     let (body, content_type) = match protocol {
-        DataPlaneProtocol::Soap
-        | DataPlaneProtocol::Graphql
-        | DataPlaneProtocol::Grpc
-        | DataPlaneProtocol::GrpcWeb => (bytes.to_vec(), upstream_content_type),
+        // The pinned SOAP gateway always answers with application/xml.
+        DataPlaneProtocol::Soap => (bytes.to_vec(), "application/xml".to_owned()),
+        DataPlaneProtocol::Graphql => (bytes.to_vec(), "application/json".to_owned()),
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => {
+            (bytes.to_vec(), upstream_content_type)
+        }
         DataPlaneProtocol::Rest if !is_json => (
             serde_json::to_vec(&String::from_utf8_lossy(&bytes))
                 .unwrap_or_else(|_| b"null".to_vec()),
@@ -1062,7 +1212,8 @@ fn validate_crud_fields(
                 ));
             }
             if let Some(pattern) = rules.get("pattern").and_then(Value::as_str)
-                && let Ok(pattern) = regex::Regex::new(&format!("^(?:{pattern})"))
+                && let Some(pattern) =
+                    crate::validation::json::cached_pattern(&format!("^(?:{pattern})"))
                 && !pattern.is_match(text)
             {
                 errors.push(format!(
@@ -1246,9 +1397,11 @@ fn validate_protocol_request_with_registry(
 }
 
 fn graphql_validation_schema(schema: &Value, query: &str) -> Value {
-    let Some(operation) = regex::Regex::new(r"(?:query|mutation)\s+(\w+)")
-        .ok()
-        .and_then(|regex| regex.captures(query))
+    static OPERATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:query|mutation)\s+(\w+)").expect("static GraphQL operation regex")
+    });
+    let Some(operation) = OPERATION
+        .captures(query)
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str())
     else {

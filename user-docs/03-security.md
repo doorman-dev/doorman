@@ -88,6 +88,12 @@ Users are assigned roles that grant specific permissions:
 - `manage_users`: User administration
 - `view_logs`: Access audit logs
 - `manage_security`: Security settings and IP policies
+- `manage_tiers`: Create, update, delete and assign rate-limit tiers (`/platform/tiers/*`)
+- `manage_rate_limits`: Manage rate-limit rules (`/platform/rate-limits/*`; any signed-in user may read their own `/platform/rate-limits/status`)
+
+> **Upgrade note:** the Python gateway exposed the tier and rate-limit-rule endpoints without authentication. Doorman now requires a signed-in user with the permission above; grant it to any automation that manages tiers or rules.
+
+Only roles flagged `platform_admin`, or named `admin`, bypass API subscriptions.
 
 ### Groups and Subscriptions
 

@@ -78,12 +78,13 @@ async fn disabled_logs_leave_request_metrics_running_without_creating_log_files(
 #[tokio::test]
 async fn platform_routes_are_native_and_never_use_an_internal_backend() {
     let (upstream_url, server) =
-        spawn_upstream(Router::new().route("/platform/ping", get(|| async { "upstream" }))).await;
+        spawn_upstream(Router::new().route("/platform/user/me", get(|| async { "upstream" })))
+            .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/platform/ping")
+                .uri("/platform/user/me")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -171,17 +172,18 @@ async fn rust_serves_health_independent_of_removed_rollout_flags() {
 
 #[tokio::test]
 async fn platform_requests_are_not_forwarded_to_an_internal_backend() {
-    let (upstream_url, server) = spawn_upstream(
-        Router::new().route("/platform/echo", any(|| async { StatusCode::IM_A_TEAPOT })),
-    )
+    let (upstream_url, server) = spawn_upstream(Router::new().route(
+        "/platform/api/all",
+        any(|| async { StatusCode::IM_A_TEAPOT }),
+    ))
     .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .method(Method::POST)
-                .uri("/platform/echo?value=1")
-                .body(Body::from("payload"))
+                .method(Method::GET)
+                .uri("/platform/api/all?value=1")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -194,13 +196,13 @@ async fn platform_requests_are_not_forwarded_to_an_internal_backend() {
 #[tokio::test]
 async fn spoofed_forwarding_headers_do_not_enable_platform_access() {
     let (upstream_url, server) =
-        spawn_upstream(Router::new().route("/platform/headers", any(|| async { StatusCode::OK })))
+        spawn_upstream(Router::new().route("/platform/user/me", any(|| async { StatusCode::OK })))
             .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/platform/headers")
+                .uri("/platform/user/me")
                 .header("x-forwarded-for", "203.0.113.10")
                 .header("x-real-ip", "203.0.113.11")
                 .body(Body::empty())
@@ -376,7 +378,7 @@ async fn rust_handles_cache_delete_locally() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         to_bytes(response.into_body(), 1024).await.unwrap(),
-        r#"{"error_code":"GTW401","error_message":"Unauthorized"}"#
+        r#"{"detail":"Unauthorized"}"#
     );
     server.abort();
 }
@@ -432,11 +434,10 @@ async fn rust_rejects_unported_health_methods_in_rust() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert!(
-        to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap()
-            .is_empty()
+    // Verified against the pinned server: Starlette renders the FastAPI detail body.
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap(),
+        br#"{"detail":"Method Not Allowed"}"#.as_slice()
     );
     server.abort();
 }

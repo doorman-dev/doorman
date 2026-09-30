@@ -239,7 +239,13 @@ def validate_reports() -> None:
             "bash scripts/run_external_storage_tests.sh"
         )
 
+    release_image_id = os.environ.get("RELEASE_IMAGE_ID", "").strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", release_image_id):
+        fail("RELEASE_IMAGE_ID must identify the immutable candidate image")
+
     operations = load_report("RELEASE_OPERATIONS_REPORT")
+    if operations.get("image_id") != release_image_id:
+        fail("RELEASE_OPERATIONS_REPORT was not generated for RELEASE_IMAGE_ID")
     required_operations = ("image_smoke", "restore_rehearsal", "cutover", "rollback")
     for operation in required_operations:
         evidence = operations.get(operation)
@@ -286,6 +292,8 @@ def validate_reports() -> None:
     image_id = system.get("candidate_image_id")
     if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         fail("SYSTEM_E2E_REPORT must identify the immutable candidate image")
+    if image_id != release_image_id:
+        fail("SYSTEM_E2E_REPORT was not generated for RELEASE_IMAGE_ID")
     expected_manifests = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in (

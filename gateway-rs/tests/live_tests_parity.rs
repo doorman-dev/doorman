@@ -248,6 +248,15 @@ async fn test_app_state_with(configure: impl FnOnce(&mut Config)) -> AppState {
     state
 }
 
+const PROTO_MULTIPART_CONTENT_TYPE: &str = "multipart/form-data; boundary=live-proto-boundary";
+
+/// The pinned proto upload takes a multipart `file` part (FastAPI UploadFile).
+fn proto_multipart(proto: &str) -> String {
+    format!(
+        "--live-proto-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"service.proto\"\r\nContent-Type: application/octet-stream\r\n\r\n{proto}\r\n--live-proto-boundary--\r\n"
+    )
+}
+
 async fn login_admin(app: &axum::Router) -> String {
     let response = app
         .clone()
@@ -999,7 +1008,6 @@ async fn configure_bandwidth_gateway(
         json!({
             "bandwidth_limit_bytes": limit,
             "bandwidth_limit_window": window,
-            "bandwidth_limit_enabled": true,
         }),
     )
     .await;
@@ -1193,7 +1201,7 @@ async fn live_test_99_cors_credentialed_wildcard_is_rejected_as_approved_securit
     let (status, body) =
         authed_json_response(&app, &token, Method::POST, "/platform/api", api).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["detail"][0]["type"], "value_error.cors_origins");
+    assert_eq!(body["error_code"], "VAL001");
 }
 
 #[tokio::test]
@@ -3968,8 +3976,8 @@ message DeleteReply { bool ok = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4120,8 +4128,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4246,8 +4254,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4437,8 +4445,8 @@ message WatchReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4541,8 +4549,8 @@ message SumReply { int32 sum = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4715,8 +4723,8 @@ service Greeter {}
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4797,8 +4805,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4896,8 +4904,8 @@ message SumReply { int32 sum = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -5106,7 +5114,7 @@ async fn live_test_40_soap_gateway_basic_flow_parity() {
         response.headers()[header::CONTENT_TYPE]
             .to_str()
             .unwrap()
-            .starts_with("text/xml")
+            .starts_with("application/xml")
     );
     let body = String::from_utf8(
         to_bytes(response.into_body(), usize::MAX)

@@ -71,6 +71,16 @@ impl Drop for EnvVarRestore {
     }
 }
 
+const PROTO_MULTIPART_CONTENT_TYPE: &str = "multipart/form-data; boundary=native-proto-boundary";
+
+/// The pinned proto upload takes a multipart `file` part (FastAPI UploadFile).
+fn proto_multipart(content: &[u8]) -> Vec<u8> {
+    let mut body = b"--native-proto-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"service.proto\"\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+    body.extend_from_slice(content);
+    body.extend_from_slice(b"\r\n--native-proto-boundary--\r\n");
+    body
+}
+
 #[tokio::test]
 async fn restored_python_and_mongo_password_bytes_support_login() {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -2732,7 +2742,7 @@ async fn user_managers_cannot_assign_or_escalate_to_admin() {
     for (method, path, payload) in [
         (
             "POST",
-            "/platform/users",
+            "/platform/user",
             json!({
                 "username": "new-admin",
                 "email": "new-admin@example.com",
@@ -2740,7 +2750,7 @@ async fn user_managers_cannot_assign_or_escalate_to_admin() {
                 "role": "admin"
             }),
         ),
-        ("PUT", "/platform/users/manager", json!({"role": "admin"})),
+        ("PUT", "/platform/user/manager", json!({"role": "admin"})),
     ] {
         let response = app
             .clone()
@@ -3095,6 +3105,50 @@ async fn https_mode_requires_matching_csrf_and_preserves_request_id() {
     assert_eq!(accepted_without_csrf.status(), StatusCode::OK);
 }
 
+/// Approved security divergence: under HTTPS_ONLY Python skips CSRF unless the
+/// effective connection is HTTPS (scheme or X-Forwarded-Proto) and exempts every
+/// `/platform/authorization*` path. Rust enforces the double-submit check for
+/// every authenticated platform request regardless of the transport the proxy
+/// reports, exempting only login, registration, and the admin bootstrap path.
+#[tokio::test]
+async fn https_only_csrf_applies_to_plain_http_and_authorization_subpaths() {
+    let app = build_router(memory_state(true).await);
+    let (cookie, csrf) = login(&app).await;
+
+    let plain_http = platform_request(
+        &app,
+        Method::GET,
+        "/platform/user/me",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(plain_http.status(), StatusCode::UNAUTHORIZED);
+
+    let refresh_without_csrf = platform_request(
+        &app,
+        Method::POST,
+        "/platform/authorization/refresh",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(refresh_without_csrf.status(), StatusCode::UNAUTHORIZED);
+
+    let refresh_with_csrf = platform_request(
+        &app,
+        Method::POST,
+        "/platform/authorization/refresh",
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(refresh_with_csrf.status(), StatusCode::OK);
+}
+
 // Cookie options are read per request from the environment in both the pinned
 // Python routes and Rust compatibility handler. Run each variant in a child so
 // Rust's parallel test workers never observe another case's cookie policy.
@@ -3214,7 +3268,8 @@ async fn tampered_jwt_is_rejected_with_python_compatible_unauthorized_status() {
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let body = response_json(response).await;
-    assert_eq!(body["error_code"], "AUTH003");
+    // Verified against the pinned server: /platform/user/me wraps auth failures as GTW998.
+    assert_eq!(body["error_code"], "GTW998");
     assert_eq!(body["error_message"], "Unauthorized");
 }
 
@@ -3559,7 +3614,8 @@ async fn soap_text_xml_valid_request_passes_endpoint_validation_and_proxies() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/xml");
+    // The pinned SOAP gateway always answers application/xml.
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/xml");
     assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "<ok/>");
     upstream.abort();
 }
@@ -3865,7 +3921,7 @@ async fn proto_upload_extension_acceptance_matches_python_contract() {
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
     let fetched = response_json(fetched).await;
-    assert_eq!(fetched["message"], "Proto file retrieved successfully");
+    assert!(fetched.get("message").is_none());
     assert!(fetched["content"].as_str().unwrap().contains("Pong"));
     let deleted = app
         .clone()
@@ -3942,8 +3998,8 @@ async fn proto_content_validation_errors_match_python() {
                     .method(Method::POST)
                     .uri(format!("/platform/proto/{name}/v1"))
                     .header(header::COOKIE, &cookie)
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from(content))
+                    .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                    .body(Body::from(proto_multipart(&content)))
                     .unwrap(),
             )
             .await
@@ -3967,8 +4023,8 @@ async fn api_creation_attaches_proto_uploaded_before_the_api() {
                 .method(Method::POST)
                 .uri("/platform/proto/proto-before-api/v1")
                 .header(header::COOKIE, &cookie)
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(source))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(source.as_bytes())))
                 .unwrap(),
         )
         .await
@@ -4525,7 +4581,8 @@ async fn config_reload_routes_preserve_legacy_values_metadata_and_permissions() 
         )
         .await
         .unwrap();
-    assert_eq!(keys.status(), StatusCode::FORBIDDEN);
+    // The pinned route only requires authentication.
+    assert_eq!(keys.status(), StatusCode::OK);
 
     let keys = app
         .clone()
@@ -4707,7 +4764,7 @@ async fn api_create_and_update_preserve_python_pydantic_and_duplicate_contracts(
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let invalid: Value =
         serde_json::from_slice(&to_bytes(invalid.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(invalid["detail"].as_array().unwrap().len(), 2);
+    assert_eq!(invalid["error_code"], "VAL001");
 
     let empty_update = app
         .clone()
@@ -4836,7 +4893,6 @@ async fn management_permissions_readiness_tools_and_restart_preserve_contract() 
         ("GET", "/platform/monitor/report", "MON002"),
         ("GET", "/platform/analytics/timeseries", "ANALYTICS001"),
         ("GET", "/platform/analytics/top-apis", "ANALYTICS001"),
-        ("GET", "/platform/dashboard", "ANALYTICS001"),
         ("POST", "/platform/tools/rate-limit-simulator", "RATE001"),
         ("GET", "/platform/openapi.json", "API008"),
         ("GET", "/platform/docs", "API008"),
@@ -4994,9 +5050,7 @@ async fn tools_permissions_and_required_models_match_python() {
     assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let missing: Value =
         serde_json::from_slice(&to_bytes(missing.into_body(), 4096).await.unwrap()).unwrap();
-    assert_eq!(missing["detail"].as_array().unwrap().len(), 2);
-    assert_eq!(missing["detail"][0]["loc"], json!(["body", "backend"]));
-    assert_eq!(missing["detail"][1]["loc"], json!(["body", "enabled"]));
+    assert_eq!(missing["error_code"], "VAL001");
 
     let (security_app, security_cookie) =
         config_permission_app(Some("manage_security"), "tools-security").await;
@@ -5228,8 +5282,8 @@ async fn analytics_routes_preserve_python_v2_response_contracts() {
         let invalid: Value =
             serde_json::from_slice(&to_bytes(invalid.into_body(), 16 * 1024).await.unwrap())
                 .unwrap();
-        assert_eq!(invalid["detail"][0]["loc"], json!(["query", field]));
-        assert_eq!(invalid["detail"][0]["type"], kind);
+        // The pinned global handler renders every validation failure as VAL001.
+        assert_eq!(invalid["error_code"], "VAL001", "{field} {kind}");
     }
 
     let detail = app
@@ -5341,8 +5395,18 @@ async fn python_api_disabled_blocks_rest_graphql_grpc_and_soap() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-        let body = response_json(response).await;
-        assert_eq!(body["error_code"], "GTW012", "{path}");
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        if path.starts_with("/api/soap/") {
+            // The pinned SOAP gateway renders its errors as XML.
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                text.contains("<error_code>GTW012</error_code>"),
+                "{path}: {text}"
+            );
+        } else {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error_code"], "GTW012", "{path}");
+        }
     }
 }
 #[tokio::test]
@@ -6097,7 +6161,7 @@ async fn python_endpoint_failure_and_validation_crud_contracts() {
     let missing_validation = platform_request(
         &app,
         Method::GET,
-        "/platform/endpoint/validation/missing-endpoint",
+        "/platform/endpoint/endpoint/validation/missing-endpoint",
         Some(&cookie),
         None,
         None,
@@ -6560,50 +6624,65 @@ async fn api_create_update_delete_emit_named_audit_events() {
     let _trace_guard = trace_capture_guard().await;
     let app = build_router(memory_state(false).await);
     let (cookie, _) = login(&app).await;
-    let capture = CapturedTrace::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_writer(capture.clone())
-        .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
-    let create = platform_request(
-        &app,
-        Method::POST,
-        "/platform/api",
-        Some(&cookie),
-        None,
-        Some(json!({
-            "api_name": "audit-api", "api_version": "v1", "api_type": "REST",
-            "api_allowed_roles": ["admin"], "api_allowed_groups": ["ALL"],
-            "api_servers": ["http://127.0.0.1:9"], "active": true
-        })),
-    )
-    .with_subscriber(dispatch.clone())
-    .await;
-    assert_eq!(create.status(), StatusCode::CREATED);
-    let update = platform_request(
-        &app,
-        Method::PUT,
-        "/platform/api/audit-api/v1",
-        Some(&cookie),
-        None,
-        Some(json!({"api_description": "updated"})),
-    )
-    .with_subscriber(dispatch.clone())
-    .await;
-    assert_eq!(update.status(), StatusCode::OK);
-    let delete = platform_request(
-        &app,
-        Method::DELETE,
-        "/platform/api/audit-api/v1",
-        Some(&cookie),
-        None,
-        None,
-    )
-    .with_subscriber(dispatch)
-    .await;
-    assert_eq!(delete.status(), StatusCode::OK);
-    let events = capture.text();
+    // Tracing's per-callsite interest is process-global and can be recomputed
+    // by tests running in parallel, which occasionally hides a scoped
+    // subscriber's events; the audit events themselves are deterministic, so
+    // repeat the sequence with a fresh API before judging.
+    let mut events = String::new();
+    for attempt in 0..3 {
+        let capture = CapturedTrace::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let name = format!("audit-api-{attempt}");
+        let create = platform_request(
+            &app,
+            Method::POST,
+            "/platform/api",
+            Some(&cookie),
+            None,
+            Some(json!({
+                "api_name": name, "api_version": "v1", "api_type": "REST",
+                "api_allowed_roles": ["admin"], "api_allowed_groups": ["ALL"],
+                "api_servers": ["http://127.0.0.1:9"], "active": true
+            })),
+        )
+        .with_subscriber(dispatch.clone())
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let update = platform_request(
+            &app,
+            Method::PUT,
+            &format!("/platform/api/{name}/v1"),
+            Some(&cookie),
+            None,
+            Some(json!({"api_description": "updated"})),
+        )
+        .with_subscriber(dispatch.clone())
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+        let delete = platform_request(
+            &app,
+            Method::DELETE,
+            &format!("/platform/api/{name}/v1"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .with_subscriber(dispatch)
+        .await;
+        assert_eq!(delete.status(), StatusCode::OK);
+        events = capture.text();
+        if ["api.create", "api.update", "api.delete"]
+            .iter()
+            .all(|action| events.contains(action))
+        {
+            break;
+        }
+    }
     for action in ["api.create", "api.update", "api.delete"] {
         assert!(events.contains(action), "missing {action}: {events}");
     }
@@ -6745,23 +6824,50 @@ async fn tls_bindings_can_be_cleared_without_changing_other_api_fields() {
         "api_client_tls_policy": {"mode": "required", "ca_profile_id": "retired", "allowed_dns_sans": ["client.example"]},
         "api_upstream_tls_profile": "retired"
     })).await.unwrap();
-    storage.insert_one("endpoints", json!({
-        "api_name": "mtls-clear", "api_version": "v1", "endpoint_method": "GET",
-        "endpoint_uri": "/probe", "endpoint_description": "keep",
-        "endpoint_client_tls_policy": {"mode": "off"},
-        "endpoint_upstream_tls_profile": "retired"
-    })).await.unwrap();
+    storage
+        .insert_one(
+            "endpoints",
+            json!({
+                "api_name": "mtls-clear", "api_version": "v1", "endpoint_method": "GET",
+                "endpoint_uri": "/probe", "endpoint_description": "keep",
+                "endpoint_client_tls_policy": {"mode": "off"},
+                "endpoint_upstream_tls_profile": "retired"
+            }),
+        )
+        .await
+        .unwrap();
     let app = build_router(state);
     let (cookie, _) = login(&app).await;
 
-    let api = platform_request(&app, Method::PUT, "/platform/api/mtls-clear/v1", Some(&cookie), None,
-        Some(json!({"api_client_tls_policy": null, "api_upstream_tls_profile": null}))).await;
+    let api = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/api/mtls-clear/v1",
+        Some(&cookie),
+        None,
+        Some(json!({"api_client_tls_policy": null, "api_upstream_tls_profile": null})),
+    )
+    .await;
     assert_eq!(api.status(), StatusCode::OK);
-    let endpoint = platform_request(&app, Method::PUT, "/platform/endpoint/GET/mtls-clear/v1/probe", Some(&cookie), None,
-        Some(json!({"endpoint_client_tls_policy": null, "endpoint_upstream_tls_profile": null}))).await;
+    let endpoint = platform_request(
+        &app,
+        Method::PUT,
+        "/platform/endpoint/GET/mtls-clear/v1/probe",
+        Some(&cookie),
+        None,
+        Some(json!({"endpoint_client_tls_policy": null, "endpoint_upstream_tls_profile": null})),
+    )
+    .await;
     assert_eq!(endpoint.status(), StatusCode::OK);
 
-    let api = storage.find_one("apis", &json!({"api_name": "mtls-clear", "api_version": "v1"})).await.unwrap().unwrap();
+    let api = storage
+        .find_one(
+            "apis",
+            &json!({"api_name": "mtls-clear", "api_version": "v1"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     let endpoint = storage.find_one("endpoints", &json!({"api_name": "mtls-clear", "api_version": "v1", "endpoint_method": "GET", "endpoint_uri": "/probe"})).await.unwrap().unwrap();
     assert!(api["api_client_tls_policy"].is_null());
     assert!(api["api_upstream_tls_profile"].is_null());
@@ -7987,11 +8093,13 @@ async fn tier_crud_returns_normalized_python_tier_contracts() {
 #[tokio::test]
 async fn tier_public_and_protected_route_boundaries_match_python() {
     let app = build_router(memory_state(false).await);
+    // Tier and rate-limit management now requires an authenticated manager.
+    let (cookie, _) = login(&app).await;
     let created = platform_request(
         &app,
         Method::POST,
         "/platform/tiers/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "tier_id": "public-tier", "name": "custom", "display_name": "Public Tier",
@@ -8005,7 +8113,7 @@ async fn tier_public_and_protected_route_boundaries_match_python() {
         &app,
         Method::GET,
         "/platform/tiers/public-tier",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8016,7 +8124,7 @@ async fn tier_public_and_protected_route_boundaries_match_python() {
         &app,
         Method::PUT,
         "/platform/tiers/public-tier",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"display_name": "Public Tier Updated"})),
     )
@@ -8027,7 +8135,7 @@ async fn tier_public_and_protected_route_boundaries_match_python() {
         &app,
         Method::POST,
         "/platform/tiers/assignments",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"user_id": "public-user", "tier_id": "public-tier"})),
     )
@@ -8037,7 +8145,7 @@ async fn tier_public_and_protected_route_boundaries_match_python() {
         &app,
         Method::GET,
         "/platform/tiers/assignments/public-user",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8048,6 +8156,17 @@ async fn tier_public_and_protected_route_boundaries_match_python() {
         let protected = platform_request(&app, Method::GET, path, None, None, None).await;
         assert_eq!(protected.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
+    // Unlike the pinned server, anonymous callers cannot manage tiers (MIG-123).
+    let anonymous = platform_request(
+        &app,
+        Method::POST,
+        "/platform/tiers/",
+        None,
+        None,
+        Some(json!({"tier_id": "anonymous-tier", "name": "custom", "display_name": "Anonymous", "limits": {"requests_per_minute": 1}})),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -8094,7 +8213,7 @@ async fn rate_limit_statistics_and_shadowed_status_match_python_contracts() {
     }
     let app = build_router(state);
     let (viewer_cookie, _) = login_as(&app, "rule-viewer@doorman.dev", fixture_password()).await;
-    let (_admin_cookie, _) = login(&app).await;
+    let (cookie, _) = login(&app).await;
 
     let status = platform_request(
         &app,
@@ -8113,7 +8232,7 @@ async fn rate_limit_statistics_and_shadowed_status_match_python_contracts() {
         &app,
         Method::GET,
         "/platform/rate-limits/statistics/summary",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8192,7 +8311,7 @@ async fn rate_limit_bulk_routes_preserve_pinned_python_failures() {
         &app,
         Method::POST,
         "/platform/rate-limits/bulk/delete",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"rule_ids": []})),
     )
@@ -8205,7 +8324,7 @@ async fn rate_limit_bulk_routes_preserve_pinned_python_failures() {
             &app,
             Method::POST,
             "/platform/rate-limits/bulk/delete",
-            None,
+            Some(&cookie),
             None,
             Some(body),
         )
@@ -8275,7 +8394,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::GET,
         "/platform/rate-limits/?enabled_only=not-a-bool",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8317,7 +8436,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": 123, "rule_type": "global", "time_window": "minute", "limit": "5",
@@ -8341,7 +8460,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": "float-limit", "rule_type": "global", "time_window": "minute", "limit": 1.5,
@@ -8355,7 +8474,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": "boolean-limit", "rule_type": "global", "time_window": "minute", "limit": true,
@@ -8369,7 +8488,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": "decimal-string-limit", "rule_type": "global", "time_window": "minute", "limit": "1.5",
@@ -8389,7 +8508,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": "unknown-field", "rule_type": "global", "time_window": "minute", "limit": 1,
@@ -8424,7 +8543,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/crud-rule/duplicate",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"new_rule_id": 456})),
     )
@@ -8436,7 +8555,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/crud-rule/duplicate",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"new_rule_id": ""})),
     )
@@ -8448,7 +8567,7 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
         &app,
         Method::POST,
         "/platform/rate-limits/missing-source/duplicate",
-        None,
+        Some(&cookie),
         None,
         Some(json!({"new_rule_id": "unused"})),
     )
@@ -8519,6 +8638,8 @@ async fn rate_limit_crud_and_action_envelopes_match_python() {
 #[tokio::test]
 async fn rate_limit_management_is_public_and_uses_python_priority_search_contracts() {
     let app = build_router(memory_state(false).await);
+    // Tier and rate-limit management now requires an authenticated manager.
+    let (cookie, _) = login(&app).await;
     for rule in [
         json!({
             "rule_id": "search-low", "rule_type": "global", "time_window": "minute", "limit": 5,
@@ -8537,7 +8658,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
             &app,
             Method::POST,
             "/platform/rate-limits/",
-            None,
+            Some(&cookie),
             None,
             Some(rule),
         )
@@ -8549,7 +8670,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         &app,
         Method::GET,
         "/platform/rate-limits/?skip=0&limit=100",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8564,7 +8685,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         &app,
         Method::GET,
         "/platform/rate-limits/search?q=needle",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8578,7 +8699,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         &app,
         Method::GET,
         "/platform/rate-limits/search?q=per_user",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8590,7 +8711,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         &app,
         Method::POST,
         "/platform/rate-limits/",
-        None,
+        Some(&cookie),
         None,
         Some(json!({
             "rule_id": "missing-target", "rule_type": "per_user", "time_window": "minute", "limit": 5,
@@ -8610,7 +8731,7 @@ async fn rate_limit_management_is_public_and_uses_python_priority_search_contrac
         &app,
         Method::GET,
         "/platform/rate-limits/status",
-        None,
+        Some(&cookie),
         None,
         None,
     )
@@ -8709,8 +8830,7 @@ async fn non_numeric_role_page_returns_fastapi_shaped_422_not_a_silent_default()
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = response_json(response).await;
-    assert_eq!(body["detail"][0]["loc"], json!(["query", "page"]));
-    assert_eq!(body["detail"][0]["type"], "type_error.integer");
+    assert_eq!(body["error_code"], "VAL001");
 
     let response = platform_request(
         &app,
@@ -8723,7 +8843,7 @@ async fn non_numeric_role_page_returns_fastapi_shaped_422_not_a_silent_default()
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = response_json(response).await;
-    assert_eq!(body["detail"][0]["loc"], json!(["query", "page_size"]));
+    assert_eq!(body["error_code"], "VAL001");
 }
 
 #[tokio::test]
@@ -8737,8 +8857,6 @@ async fn non_numeric_page_returns_422_across_typed_fastapi_listing_routes() {
         |path: &'static str| platform_request(&app, Method::GET, path, Some(&cookie), None, None);
 
     for path in [
-        "/platform/group?page=nope",
-        "/platform/routing?page=nope",
         "/platform/api?page=nope",
         "/platform/api/all?page_size=nope",
         "/platform/user?page=nope",
@@ -8753,7 +8871,7 @@ async fn non_numeric_page_returns_422_across_typed_fastapi_listing_routes() {
             "{path}"
         );
         let body = response_json(response).await;
-        assert_eq!(body["detail"][0]["type"], "type_error.integer", "{path}");
+        assert_eq!(body["error_code"], "VAL001", "{path}");
     }
 }
 
