@@ -892,6 +892,8 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
                 .method(Method::POST)
                 .uri("/api/rest/limited/v1/items")
                 .header("content-type", "application/json")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
                 .body(Body::from(vec![b'x'; 1024 * 1024 + 1]))
                 .unwrap(),
         )
@@ -899,6 +901,7 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
     assert_eq!(body["error_code"], "REQ001");
@@ -907,6 +910,28 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
         "Request entity too large (max: 1048576 bytes)"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn oversized_grpc_web_body_is_rejected_before_policy() {
+    let state = AppState::new(Config::for_test("removed-internal-backend".to_owned()))
+        .unwrap()
+        .with_policy_documents(PolicyDocuments::default());
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/grpc-web/missing/fixture.v1.Resource/Create")
+                .header(header::CONTENT_TYPE, "application/grpc-web-text")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
 }
 
 #[tokio::test]

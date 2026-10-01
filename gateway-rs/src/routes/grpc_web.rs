@@ -40,6 +40,17 @@ pub async fn grpc_web_policy_then_execute(
             .body(axum::body::Body::from("Invalid Content-Type"))
             .expect("static 415 response"));
     }
+    if let Some(response) = crate::routes::rest::early_body_limit(
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
+        DataPlaneProtocol::GrpcWeb,
+    )
+    .await
+    {
+        return Ok(response);
+    }
     let version = request
         .headers()
         .get("x-api-version")

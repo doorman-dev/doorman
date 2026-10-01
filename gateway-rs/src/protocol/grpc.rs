@@ -100,6 +100,13 @@ pub async fn execute_web_gateway(
             "gRPC-Web disabled",
         );
     }
+    // The pinned gRPC-Web proxy accepts an empty body and emits an empty
+    // successful data frame instead of treating it as malformed framing.
+    if body.is_empty() {
+        let mut framed = web_data_frame(&[]);
+        framed.extend(web_trailer_frame(tonic::Code::Ok, "OK"));
+        return web_body_response(text_mode, framed);
+    }
     let descriptor = match decision.grpc_descriptor_set.as_deref() {
         Some(descriptor) => descriptor,
         None => {

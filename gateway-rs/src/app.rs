@@ -7,7 +7,10 @@ use http::StatusCode;
 use std::any::Any;
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove},
+    compression::{
+        CompressionLayer, CompressionLevel,
+        predicate::{Predicate, SizeAbove},
+    },
     trace::TraceLayer,
 };
 
@@ -45,7 +48,16 @@ pub fn build_router(state: AppState) -> Router {
         // Starlette treats the legacy gateway responses as streaming and emits
         // gzip whenever the client accepts it, even below its configured size.
         // Preserve that observed public wire contract during the Rust cutover.
-        .compress_when(SizeAbove::new(1));
+        .compress_when(SizeAbove::new(1).and(
+            |_: http::StatusCode,
+             _: http::Version,
+             _: &http::HeaderMap,
+             extensions: &http::Extensions| {
+                extensions
+                    .get::<crate::middleware::body_limit::NoCompression>()
+                    .is_none()
+            },
+        ));
     let api = Router::new()
         .route("/rest/{*path}", any(rest_policy_then_proxy))
         .route("/graphql/{*path}", any(graphql_policy_then_execute))

@@ -23,9 +23,14 @@ pub async fn graphql_policy_then_execute(
         return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
     if let Some(response) = crate::routes::rest::early_body_limit(
-        &request,
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
         crate::routes::rest::DataPlaneProtocol::Graphql,
-    ) {
+    )
+    .await
+    {
         return Ok(response);
     }
     let version = request

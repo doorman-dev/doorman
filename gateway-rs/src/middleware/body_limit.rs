@@ -1,5 +1,8 @@
 use std::env;
 
+#[derive(Clone, Copy, Debug)]
+pub struct NoCompression;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BodyLimits {
     pub default: usize,

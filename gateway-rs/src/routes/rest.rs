@@ -20,7 +20,7 @@ use crate::{
         transforms::{transform_request, transform_response},
     },
     middleware::{
-        body_limit::BodyLimits,
+        body_limit::{BodyLimits, NoCompression},
         cors::{apply_actual_response, preflight_response},
     },
     policy::{
@@ -44,30 +44,71 @@ pub enum DataPlaneProtocol {
 #[derive(Clone, Debug)]
 pub struct PolicyPath(pub String);
 
-/// The pinned body-size middleware rejects a declared oversized body before
-/// any routing or policy runs (gRPC-Web paths are not covered by it).
-pub(crate) fn early_body_limit(request: &Request, protocol: DataPlaneProtocol) -> Option<Response> {
+/// The pinned tier middleware runs before the body-size middleware, which
+/// rejects a declared oversized body before routing and endpoint policy.
+pub(crate) async fn early_body_limit(
+    state: &AppState,
+    path: &str,
+    headers: &HeaderMap,
+    is_preflight: bool,
+    protocol: DataPlaneProtocol,
+) -> Option<Response> {
     let limits = BodyLimits::from_env();
     let limit = match protocol {
         DataPlaneProtocol::Rest => limits.rest,
         DataPlaneProtocol::Graphql => limits.graphql,
         DataPlaneProtocol::Soap => limits.soap,
-        DataPlaneProtocol::Grpc => limits.grpc,
-        DataPlaneProtocol::GrpcWeb => return None,
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => limits.grpc,
     };
-    let limit = BodyLimits::for_path(request.uri().path(), limit);
-    let declared = request
-        .headers()
+    let limit = BodyLimits::for_path(path, limit);
+    let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())?;
-    (declared > limit as u64).then(|| {
-        policy_error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "REQ001",
-            &format!("Request entity too large (max: {limit} bytes)"),
-        )
-    })
+    if declared <= limit as u64 {
+        return None;
+    }
+    let tier_username = (!state.config.shared_storage.skip_tier_rate_limit && !is_preflight)
+        .then(|| {
+            crate::policy::auth::verify_request_token(headers, &state.config.shared_storage)
+                .ok()
+                .and_then(|claims| claims.sub)
+        })
+        .flatten();
+    if let (Some(storage), Some(username)) = (&state.storage, tier_username) {
+        let injected_snapshot = state
+            .policy_documents
+            .as_ref()
+            .map(|injected| injected.lock().ok().map(|documents| documents.clone()));
+        let documents = match injected_snapshot {
+            Some(snapshot) => snapshot,
+            None => storage.load_policy_documents().await.ok(),
+        };
+        if let Some(documents) = documents
+            && let Err(failure) = crate::policy::tier::enforce(
+                &documents,
+                storage,
+                &username,
+                now_millis() / 1_000,
+                true,
+            )
+            .await
+            && let Some(tier_limit) = failure.tier_limit
+        {
+            let (body, status) = *tier_limit;
+            let mut response = (failure.status, Json(body)).into_response();
+            apply_tier_headers(&mut response, Some(&status));
+            response.extensions_mut().insert(NoCompression);
+            return Some(response);
+        }
+    }
+    let mut response = policy_error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "REQ001",
+        &format!("Request entity too large (max: {limit} bytes)"),
+    );
+    response.extensions_mut().insert(NoCompression);
+    Some(response)
 }
 
 pub async fn rest_policy_then_proxy(
@@ -91,7 +132,15 @@ pub async fn rest_policy_then_proxy(
         .get::<DataPlaneProtocol>()
         .copied()
         .unwrap_or(DataPlaneProtocol::Rest);
-    if let Some(response) = early_body_limit(&request, protocol) {
+    if let Some(response) = early_body_limit(
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
+        protocol,
+    )
+    .await
+    {
         return Ok(response);
     }
     let path = request

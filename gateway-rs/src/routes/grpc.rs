@@ -27,9 +27,14 @@ pub async fn grpc_policy_then_execute(
         return Ok(http::StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
     if let Some(response) = crate::routes::rest::early_body_limit(
-        &request,
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
         crate::routes::rest::DataPlaneProtocol::Grpc,
-    ) {
+    )
+    .await
+    {
         return Ok(response);
     }
     let path = request.uri().path();

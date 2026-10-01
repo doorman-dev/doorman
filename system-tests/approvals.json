@@ -449,6 +449,69 @@
       "issue": "MIG-125",
       "owner": "doorman-maintainers",
       "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::0014",
+      "signature": {
+        "candidate": {
+          "status": 413,
+          "error_code": "REQ001"
+        },
+        "oracle": {
+          "status": 200,
+          "content_type": "application/grpc-web"
+        }
+      },
+      "rationale": "The pinned gRPC-Web route accepts this oversized binary body without checking its size and emits a stub response. The candidate enforces MAX_BODY_SIZE_BYTES_GRPC before buffering the body, consistent with MIG-125.",
+      "issue": "MIG-125",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": 400,
+          "content_type": "text/plain"
+        },
+        "oracle": {
+          "status": 200,
+          "content_type": {
+            "one_of": [
+              "application/grpc-web",
+              "application/grpc-web+proto",
+              "application/grpc-web-text"
+            ]
+          }
+        }
+      },
+      "rationale": "gRPC-Web rows with an empty or unframed body: the pinned gRPC-Web route is a stub that never parses the request and always answers grpc-status 0 (MIG-111). The candidate proxies the call and rejects a body without a gRPC-Web data frame with 400.",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": {
+            "one_of": [
+              401,
+              403,
+              404,
+              429
+            ]
+          }
+        },
+        "oracle": {
+          "status": 400,
+          "content_type": ""
+        }
+      },
+      "rationale": "gRPC-Web rows whose body the pinned stub rejects (bare 400 'Invalid base64 body') while the candidate first applies the gateway policy chain (IP policy, authentication, subscription, limits) that the pinned gRPC-Web route skips entirely (MIG-111).",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
     }
   ]
 }
