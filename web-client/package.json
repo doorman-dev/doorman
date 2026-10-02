@@ -26,7 +26,7 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22",
+    "@types/node": "20.17.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "dotenv-cli": "^11.0.0",
@@ -34,7 +34,7 @@
     "eslint-config-next": "15.5.25",
     "postcss": "8.5.28",
     "tailwindcss": "^3.4.1",
-    "typescript": "5.8.3"
+    "typescript": "5.8.2"
   },
   "overrides": {
     "next": {

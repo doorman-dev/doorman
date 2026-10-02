@@ -200,7 +200,6 @@ impl SharedStorage {
             ("users", doc! {"email": 1}, true),
             ("roles", doc! {"role_name": 1}, true),
             ("groups", doc! {"group_name": 1}, true),
-            ("apis", doc! {"api_id": 1}, true),
             ("apis", doc! {"api_name": 1, "api_version": 1}, false),
             (
                 "endpoints",
@@ -242,6 +241,42 @@ impl SharedStorage {
                 )
                 .await?;
         }
+        // api_id is unique only where present: a proto uploaded before its API
+        // exists is stored as an API record without an id, and several of
+        // those must not collide on a null key.  Earlier releases created a
+        // plain unique index, which MongoDB cannot alter in place.
+        let apis = database.collection::<Document>("apis");
+        let legacy = apis
+            .list_index_names()
+            .await?
+            .into_iter()
+            .any(|name| name == "api_id_1");
+        if legacy {
+            // Nodes starting together may race to drop it; "index not found"
+            // (code 27) means another node already migrated.
+            if let Err(error) = apis.drop_index("api_id_1").await {
+                let not_found = matches!(
+                    error.kind.as_ref(),
+                    mongodb::error::ErrorKind::Command(command) if command.code == 27
+                );
+                if !not_found {
+                    return Err(error.into());
+                }
+            }
+        }
+        apis.create_index(
+            IndexModel::builder()
+                .keys(doc! {"api_id": 1})
+                .options(
+                    IndexOptions::builder()
+                        .name("api_id_present_1".to_owned())
+                        .unique(true)
+                        .partial_filter_expression(doc! {"api_id": {"$type": "string"}})
+                        .build(),
+                )
+                .build(),
+        )
+        .await?;
         Ok(())
     }
     pub async fn initialize_core(&self) -> Result<(), StorageError> {

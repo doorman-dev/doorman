@@ -268,7 +268,7 @@ class Runner:
         )
         self.run(
             "image-build",
-            ["docker", "build", "--iidfile", str(self.evidence / "image-id.txt"), "."],
+            ["docker", "build", "--provenance=false", "--iidfile", str(self.evidence / "image-id.txt"), "."],
             verification,
         )
         self.image_id = (self.evidence / "image-id.txt").read_text().strip()

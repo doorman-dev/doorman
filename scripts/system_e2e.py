@@ -560,7 +560,9 @@ class Runtime:
     def build_images(self) -> None:
         candidate_iid = self.evidence / "candidate-image-id.txt"
         fixture_iid = self.evidence / "fixture-image-id.txt"
-        command(["docker", "build", "--iidfile", str(candidate_iid), "."], timeout=2400)
+        # Without provenance attestations (which embed build timestamps) the same
+        # source yields the same image ID, so release_check can bind this evidence.
+        command(["docker", "build", "--provenance=false", "--iidfile", str(candidate_iid), "."], timeout=2400)
         command(
             ["docker", "build", "--iidfile", str(fixture_iid), "system-tests/fixture"], timeout=1200
         )

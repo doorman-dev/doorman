@@ -85,7 +85,7 @@ web-build:
 	npm --prefix web-client run build
 
 web-audit:
-	npm --prefix web-client audit --omit=dev --audit-level=high
+	npm --prefix web-client audit --omit=dev --audit-level=moderate
 
 smoke preflight live liveq:
 	BASE_URL=$(BASE_URL) \

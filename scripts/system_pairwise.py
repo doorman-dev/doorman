@@ -288,6 +288,10 @@ class Pairwise:
         # Two-node rows are configured through one node and exercised through the other.
         base = target.peer or target.base
         self.program(profile, plan.faults)
+        # Tier and user limits count per minute; keep the warm-ups and the
+        # measured request inside one window so a boundary cannot reset them.
+        if plan.warmups and time.time() % 60 > 30:
+            time.sleep(60.5 - time.time() % 60)
         for _ in range(plan.warmups):
             send(base, plan.method, plan.path, token=plan.token, body=plan.body,
                  headers=plan.headers, timeout=15)
