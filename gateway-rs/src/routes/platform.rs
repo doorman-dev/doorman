@@ -14945,8 +14945,24 @@ mod tests {
         );
         assert!(!secure_password(&without_special));
 
-        assert!(secure_password("Ää1!xxxxxxxxxxxx"));
-        assert!(!secure_password("Ää1!xxxxxxxxxx"));
+        // 16 characters but 18 bytes passes; 14 characters (16 bytes) must not.
+        assert!(secure_password(&non_ascii_test_password(16)));
+        assert!(!secure_password(&non_ascii_test_password(14)));
+    }
+
+    fn non_ascii_test_password(chars: usize) -> String {
+        let bytes = Uuid::new_v4().into_bytes();
+        let uppercase = char::from_u32(0xC0 + u32::from(bytes[0] % 0x17)).unwrap();
+        let lowercase = char::from_u32(0xE0 + u32::from(bytes[1] % 0x17)).unwrap();
+        let digit = char::from(bytes[2] % 10 + b'0');
+        let special = char::from(bytes[3] % 15 + b'!');
+        let padding = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(chars - 4)
+            .collect::<String>();
+        format!("{uppercase}{lowercase}{digit}{special}{padding}")
     }
 
     fn test_password() -> String {
