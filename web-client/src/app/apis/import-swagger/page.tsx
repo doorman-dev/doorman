@@ -36,7 +36,7 @@ export default function ImportSwaggerPage() {
   useEffect(() => {
     const fetchApis = async () => {
       try {
-        const data = await getJson<any>(`${SERVER_URL}/platform/api/all?page=1&page_size=1000`)
+        const data = await getJson<any>(`${SERVER_URL}/platform/api/all?page=1&page_size=200`)
         const apisList = Array.isArray(data) ? data : (data.apis || data.response?.apis || [])
         setExistingApis(apisList.map((a: any) => ({ api_name: a.api_name || a.name, api_version: a.api_version || a.version })))
       } catch (err) {

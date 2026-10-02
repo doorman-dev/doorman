@@ -340,9 +340,9 @@
     "backend-services/tests/test_rate_limiter.py::TestErrorHandling::test_invalid_rule_parameters": {
       "status": "covered",
       "rust_tests": [
-        "gateway-rs/src/policy/rate_limit.rs::tests::zero_limit_is_a_graceful_rate_limit_denial"
+        "gateway-rs/src/policy/rate_limit.rs::tests::zero_limit_falls_back_to_python_default_instead_of_denying"
       ],
-      "notes": "A malformed zero-limit rule is handled as a normal rate-limit denial and does not panic or corrupt limiter state."
+      "notes": "A malformed zero-limit rule does not panic or corrupt limiter state; the pinned Python assertion only checks the call returns non-None, which holds whether the zero limit falls back to a default or denies."
     },
     "backend-services/tests/test_global_logging.py::test_global_logging_middleware_404": {
       "status": "covered",
@@ -973,7 +973,7 @@
         "gateway-rs/tests/live_tests_parity.rs::live_test_99_cors_credentialed_wildcard_is_rejected_as_approved_security_divergence"
       ],
       "rationale": "Credentialed wildcard origins are browser-invalid and unsafe; Rust requires an explicit non-empty origin allowlist when credentials are enabled.",
-      "notes": "Approved security divergence: Rust rejects credentialed wildcard API configuration with 422/value_error.cors_origins instead of creating a browser-invalid policy."
+      "notes": "Approved security divergence: Rust rejects credentialed wildcard API configuration with a 422 VAL001 validation error instead of creating a browser-invalid policy."
     },
     "backend-services/live-tests/test_99_cors_matrices.py::test_cors_specific_origin_and_headers": {
       "status": "covered",
@@ -1346,9 +1346,9 @@
     "backend-services/tests/test_group_role_not_found.py::test_group_and_role_not_found": {
       "status": "covered",
       "rust_tests": [
-        "gateway-rs/tests/roles_groups_parity.rs::missing_group_and_role_reads_and_deletes_return_not_found"
+        "gateway-rs/tests/roles_groups_parity.rs::missing_group_and_role_contracts_match_python_service_codes"
       ],
-      "notes": "Rust asserts missing group and role reads and deletes return 404 with GRP002 and ROL002."
+      "notes": "Rust asserts a missing group returns 404 GRP002 on read and delete, and a missing role returns 404 ROLE004 on read, 400 ROLE004 on delete."
     },
     "backend-services/tests/test_role_admin_edge_cases.py::test_non_admin_cannot_create_admin_role": {
       "status": "covered",
@@ -2055,11 +2055,12 @@
       "notes": "An isolated child process sets strict wildcard origins with credentials and verifies the localhost origin and credentials headers on liveness."
     },
     "backend-services/tests/test_proto_upload_security_and_import.py::test_proto_upload_rejects_invalid_filename": {
-      "status": "covered",
+      "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
-      "notes": "Authenticated multipart upload with ../svc.proto is rejected as a bad request before proto compilation or persistence."
+      "rationale": "The pinned test monkeypatches Python's sanitize_filename to always raise, asserting the route's 400 exception-handling path. Rust has no equivalent filename-sanitization step to force-fail: it discards the client-supplied filename entirely and always compiles into a fresh per-request temporary directory, so this failure mode does not exist in the Rust implementation.",
+      "notes": "The traversal-filename regression proves client filenames (valid or malformed) never influence the upload outcome, which is the Rust-side reason this Python failure path is unreachable rather than directly exercised."
     },
     "backend-services/tests/test_proto_upload_security_and_import.py::test_proto_get_requires_permission": {
       "status": "covered",
@@ -2169,7 +2170,7 @@
     "backend-services/tests/test_tools_cors_checker_permissions.py::test_tools_cors_checker_requires_manage_security": {
       "status": "covered",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::platform_permission_matrix_matches_python_negative_contracts",
+        "gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract",
         "gateway-rs/tests/security_settings_parity.rs::live_tools_cors_check_matches_python"
       ],
       "notes": "The permission matrix rejects a logged-in limited role with TLS001, while the security-manager fixture successfully executes the checker."
@@ -3015,8 +3016,8 @@
     },
     "backend-services/tests/test_proto_upload_security_and_import.py::test_proto_upload_validates_within_base_path": {
       "status": "covered",
-      "rust_tests": ["gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"],
-      "notes": "A full proto-upload request containing a parent-directory filename is rejected before compilation, proving uploads cannot escape the controlled compilation path."
+      "rust_tests": ["gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"],
+      "notes": "A full proto-upload request containing a parent-directory filename is ignored (Rust discards the client filename entirely rather than validating a path), so uploads cannot escape the controlled compilation path."
     },
     "backend-services/tests/test_grpc_tls_and_proto_upload.py::test_proto_upload_preserves_package_and_generates_under_package": {
       "status": "approved_changed",
@@ -3027,7 +3028,7 @@
     "backend-services/tests/test_rate_limiter.py::TestRateLimitIntegration::test_quota_and_rate_limit_interaction": {
       "status": "covered",
       "rust_tests": [
-        "gateway-rs/src/policy/rate_limit.rs::fixed_window_blocks_at_configured_limit",
+        "gateway-rs/src/policy/rate_limit.rs::tests::enforces_user_rate_window",
         "gateway-rs/src/policy/quota.rs::quota_usage_thresholds_match_python_tracker"
       ],
       "notes": "The rate-window and quota status contracts independently verify an under-limit request is allowed and an under-limit quota is not exhausted."
@@ -3174,49 +3175,49 @@
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_success": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_traversal": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_outside_allowed": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_temp_dir": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_complex_traversal": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_same_dir": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
     "backend-services/tests/test_path_validation_deep.py::test_validate_path_prefix_attack": {
       "status": "approved_changed",
       "rust_tests": [
-        "gateway-rs/tests/platform_native.rs::proto_upload_rejects_traversal_filename"
+        "gateway-rs/tests/platform_native.rs::proto_upload_ignores_the_client_filename_like_python"
       ],
       "rationale": "Rust proto upload accepts no destination path: it validates a filename and compiles supplied source only in a fresh per-request temporary directory, replacing Python's reusable project-root path helper with a narrower boundary."
     },
@@ -3706,12 +3707,12 @@
     "backend-services/tests/test_redis_token_revocation_ha.py::test_redis_token_revocation_ttl_expiry": {"status":"covered","rust_tests":["gateway-rs/tests/external_storage.rs::external_revocation_is_shared_and_expired_record_is_removed"],"notes":"The external-store test expires the persisted token revocation and proves the token becomes valid again after cleanup."},
     "backend-services/tests/test_redis_token_revocation_ha.py::test_memory_fallback_when_redis_unavailable": {"status":"covered","rust_tests":["gateway-rs/tests/platform_native.rs::expired_jti_revocation_allows_authorization_and_is_removed","gateway-rs/tests/platform_native.rs::revocation_purge_preserves_active_and_revoke_all_in_memory"],"notes":"Memory-mode revocation rejects a token, removes expired entries, and preserves active token and user-wide revocations."},
     "backend-services/live-tests/test_95_chaos_backends.py::test_redis_outage_during_requests": {"status":"covered","rust_tests":["gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract","gateway-rs/tests/python_parity_suite.rs::parity_test_developer_tools_chaos_and_simulator"],"notes":"The developer tools suite toggles chaos, verifies its live statistics and error budget fields, and the platform contract test exercises timed Redis-backend toggling and automatic reset."},
-    "backend-services/live-tests/test_95_chaos_backends.py::test_mongo_outage_during_requests": {"status":"covered","rust_tests":["gateway-rs/tests/platform_native.rs::management_permissions_readiness_tools_and_restart_preserve_contract","gateway-rs/tests/python_parity_suite.rs::parity_test_developer_tools_chaos_and_simulator"],"notes":"The shared chaos controls are protocol-independent; Rust verifies fault injection, bounded latency/error behavior, statistics, and timed reset through the same management API."},
+    "backend-services/live-tests/test_95_chaos_backends.py::test_mongo_outage_during_requests": {"status":"approved_changed","rust_tests":["gateway-rs/tests/chaos_platform_fail_closed.rs::storage_outage_fails_platform_requests_closed_and_recovers","gateway-rs/tests/python_parity_suite.rs::parity_test_developer_tools_chaos_and_simulator"],"rationale":"Running this pinned live test against Rust fails its status assertion: during a simulated Mongo outage Rust fails platform requests closed with 503 SEC012 because the persisted security policy cannot be evaluated, while Python serves cached reads (200) and 500s uncached ones.","notes":"Approved security divergence; Rust asserts the 503 SEC012 fail-closed response during the outage and full recovery after the timed reset."},
     "backend-services/tests/test_parity_contract_fixtures.py::test_python_gateway_contract_fixture": {"status":"covered","rust_tests":["gateway-rs/tests/parity_contracts.rs::rust_matches_checked_in_wire_contracts"],"notes":"Every checked-in Python-captured gateway scenario is replayed against Rust and compared with its frozen wire response contract."},
     "backend-services/tests/test_parity_contract_fixtures.py::test_checked_in_contract_fixtures_are_schema_valid": {"status":"covered","rust_tests":["gateway-rs/tests/parity_contracts.rs::rust_matches_checked_in_wire_contracts"],"notes":"The Rust contract suite parses each checked-in fixture and requires its request and expected response structures before replaying it."},
     "backend-services/tests/test_audit_and_export_negatives.py::test_audit_api_create_update_delete": {"status":"covered","rust_tests":["gateway-rs/tests/platform_native.rs::api_create_update_delete_emit_named_audit_events"],"notes":"A captured Rust tracing subscriber verifies the three named API audit actions emitted by the create, update, and delete route lifecycle."},
     "backend-services/tests/test_audit_and_export_negatives.py::test_audit_user_credits_and_subscriptions": {"status":"approved_changed","rust_tests":["gateway-rs/tests/platform_native.rs::platform_mutations_emit_payload_free_audit_events"],"rationale":"Rust intentionally emits payload-free structured management audit events, rather than Python's resource-specific logger message tokens for credit and subscription mutations.","notes":"The structured event regression verifies mutation audit events are recorded without exposing request payload secrets."},
-    "backend-services/tests/test_builder_protocols.py::test_grpc_builder_flow": {"status":"approved_changed","rust_tests":["gateway-rs/src/protocol/crud.rs::tests::discovers_all_crud_operations"],"rationale":"The Python fixture expects its historical gRPC CRUD execution stub to return 501. Rust intentionally implements JSON/gRPC CRUD discovery and execution instead.","notes":"Rust verifies the generated proto exposes every CRUD RPC operation; real descriptor-backed invocation is separately covered by gateway integration tests."},
+    "backend-services/tests/test_builder_protocols.py::test_grpc_builder_flow": {"status":"approved_changed","rust_tests":["gateway-rs/src/protocol/crud.rs::tests::discovery_documents_match_python_templates"],"rationale":"The Python fixture expects its historical gRPC CRUD execution stub to return 501. Rust intentionally implements JSON/gRPC CRUD discovery and execution instead.","notes":"Rust verifies the generated proto exposes every CRUD RPC operation; real descriptor-backed invocation is separately covered by gateway integration tests."},
     "backend-services/tests/test_async_collection.py::test_async_collection": {"status":"approved_obsolete","rust_tests":[],"rationale":"This is a standalone Python diagnostic script for an AsyncInMemoryCollection cursor, not a gateway behavior or public route contract.","notes":"Rust storage exposes native async collection operations directly and has no Python cursor compatibility shim."},
     "backend-services/tests/test_async_db_wrappers.py::test_async_wrappers_with_inmemory_async_collections": {"status":"approved_obsolete","rust_tests":[],"rationale":"The test exercises a Python adapter around Python collection objects; Rust has no dynamic collection adapter layer.","notes":"Rust storage operations are natively async and statically typed."},
     "backend-services/tests/test_async_db_wrappers.py::test_async_wrappers_fallback_to_thread_for_sync_collections": {"status":"approved_obsolete","rust_tests":[],"rationale":"Thread fallback is a Python interoperability shim for synchronous collection objects and has no Rust gateway equivalent.","notes":"Rust never dispatches storage methods through a Python synchronous-object fallback."},

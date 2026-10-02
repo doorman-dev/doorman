@@ -22,6 +22,17 @@ pub async fn graphql_policy_then_execute(
     ) {
         return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
+    if let Some(response) = crate::routes::rest::early_body_limit(
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
+        crate::routes::rest::DataPlaneProtocol::Graphql,
+    )
+    .await
+    {
+        return Ok(response);
+    }
     let version = request
         .headers()
         .get("x-api-version")
@@ -47,6 +58,18 @@ pub async fn graphql_policy_then_execute(
         .trim_start_matches("/api/graphql/")
         .trim_matches('/')
         .to_owned();
+    // The pinned route uses the whole remaining path as the API name, so extra
+    // segments name an API that cannot exist.
+    if api_name.contains('/') {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(PolicyErrorBody {
+                error_code: "GTW001".to_owned(),
+                error_message: "API does not exist for the requested name and version".to_owned(),
+            }),
+        )
+            .into_response());
+    }
     request
         .extensions_mut()
         .insert(PolicyPath(graphql_policy_path(&api_name, &version)));

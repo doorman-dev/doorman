@@ -95,6 +95,42 @@ pub fn openapi_endpoints(spec: &Value) -> Vec<Value> {
     endpoints
 }
 
+/// The pinned `validate_wsdl_content`: well-formed XML whose root is a WSDL
+/// `definitions` element containing at least one service or portType.
+pub fn validate_wsdl(content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Err("Empty WSDL content".to_owned());
+    }
+    let mut reader = Reader::from_str(content);
+    let mut root: Option<Vec<u8>> = None;
+    let mut has_service = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                if root.is_none() {
+                    root = Some(event.name().as_ref().to_ascii_lowercase());
+                }
+                let local = event.local_name();
+                has_service |= matches!(local.as_ref(), b"service" | b"portType");
+            }
+            Ok(Event::DocType(_)) => return Err("DTD declarations are not allowed".to_owned()),
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("Invalid XML: {error}")),
+            _ => {}
+        }
+    }
+    let Some(root) = root else {
+        return Err("Invalid XML: no element found".to_owned());
+    };
+    if !String::from_utf8_lossy(&root).contains("definitions") {
+        return Err("Root element must be wsdl:definitions".to_owned());
+    }
+    if !has_service {
+        return Err("WSDL must contain at least one service or portType".to_owned());
+    }
+    Ok(())
+}
+
 pub fn parse_wsdl(content: &str) -> Result<Value, String> {
     let lowered = content.to_ascii_lowercase();
     if lowered.contains("<!doctype") || lowered.contains("<!entity") {

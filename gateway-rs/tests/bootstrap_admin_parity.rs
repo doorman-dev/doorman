@@ -110,3 +110,53 @@ async fn bootstrap_admin_seed_matches_python_and_preserves_existing_credentials(
         .unwrap()
     );
 }
+
+#[tokio::test]
+async fn bootstrap_repairs_missing_admin_fields_like_python_mongo_mode() {
+    if std::env::var_os("DOORMAN_BOOTSTRAP_REPAIR_TEST_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bootstrap_repairs_missing_admin_fields_like_python_mongo_mode",
+                "--nocapture",
+            ])
+            .env("DOORMAN_BOOTSTRAP_REPAIR_TEST_CHILD", "1")
+            .env("DOORMAN_ADMIN_EMAIL", "repair@doorman.dev")
+            .env("DOORMAN_ADMIN_PASSWORD", "repair-password-12chars")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let config = Config::for_test("removed-internal-backend".to_owned());
+    let storage = SharedStorage::connect(&config.shared_storage)
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "users",
+            json!({"username": "admin", "ui_access": false, "email": ""}),
+        )
+        .await
+        .unwrap();
+    storage.initialize_core().await.unwrap();
+    let admin = storage
+        .find_one("users", &json!({"username": "admin"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admin["ui_access"], true);
+    assert_eq!(admin["email"], "repair@doorman.dev");
+    assert!(
+        bcrypt::verify(
+            "repair-password-12chars",
+            admin["password"].as_str().unwrap()
+        )
+        .unwrap()
+    );
+}

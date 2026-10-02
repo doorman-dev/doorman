@@ -1,24 +1,45 @@
 use std::{
-    env,
-    path::PathBuf,
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, atomic::Ordering},
+    thread,
     time::Duration,
 };
 
 use doorman_gateway::{
     AppState, Config, build_router,
+    demo_seed::{SeedOptions, run_seed},
     hot_reload::HotReloadConfig,
     observability::analytics_aggregator::global_analytics,
     routes::platform::backfill_grpc_descriptors,
     state::{GatewayRuntime, MemoryAutosaveConfig},
     storage::{runtime::SharedStorage, security_settings, snapshot},
+    tls::{TlsConnectionInfo, TlsListener},
 };
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reqwest, Tonic, and the native listener enable different Rustls feature sets.
+    // Select one provider before any of them construct TLS configuration.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     doorman_gateway::observability::init();
+
+    match env::args().nth(1).as_deref() {
+        Some("start") => return start_process(),
+        Some("stop") => return stop_process(),
+        Some("restart") => {
+            stop_process()?;
+            thread::sleep(Duration::from_secs(1));
+            return start_process();
+        }
+        Some("seed") => return seed_command(env::args().skip(2)).await,
+        Some("run") | None => {}
+        Some(command) => return Err(format!("unknown command: {command}").into()),
+    }
+
     restore_metrics();
 
     let config = Config::from_env()?;
@@ -91,16 +112,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     spawn_sighup_reload(state.hot_reload.clone());
-    let app = build_router(state);
+    let tls_config = state.reload_tls_from_storage().await?;
+    let app = build_router(state.clone());
     let listener = TcpListener::bind(&bind_addr).await?;
 
+    let reload_state = state.clone();
+    let reload_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = reload_state.reload_tls_from_storage().await {
+                warn!(%error, "TLS reload rejected; retaining active configuration");
+            }
+        }
+    });
+
     info!(address = %bind_addr, "Doorman Rust gateway listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if let Some(tls_config) = tls_config {
+        let listener = TlsListener::new(listener, tls_config);
+        state.set_tls_listener_handle(listener.reload_handle());
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<TlsConnectionInfo>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    }
+    reload_task.abort();
 
     // Axum has now drained active requests. Stop writers before the final dump
     // so an older autosave cannot replace the state committed during draining.
@@ -128,6 +174,160 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     persist_metrics();
     Ok(())
+}
+
+async fn seed_command(
+    arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = arguments.collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        print_seed_help();
+        return Ok(());
+    }
+    let options = parse_seed_options(arguments.into_iter())?;
+    println!("Starting demo seed with:");
+    println!("  Users: {}", options.users);
+    println!("  APIs: {}", options.apis);
+    println!("  Endpoints per API: {}", options.endpoints);
+    println!("  Groups: {}", options.groups);
+    println!("  Protos: {}", options.protos);
+    println!("  Logs: {}", options.logs);
+    if let Some(seed) = options.seed {
+        println!("  Random Seed: {seed}");
+    }
+    println!();
+
+    let config = Config::from_env()?;
+    let storage = SharedStorage::connect(&config.shared_storage).await?;
+    storage.initialize_core().await?;
+    let result = run_seed(&storage, &options).await?;
+    println!("\n✓ Seeding completed successfully!");
+    println!("Result: {result}");
+    Ok(())
+}
+
+fn parse_seed_options(
+    arguments: impl Iterator<Item = String>,
+) -> Result<SeedOptions, Box<dyn std::error::Error>> {
+    let mut options = SeedOptions::default();
+    let mut arguments = arguments.peekable();
+    while let Some(argument) = arguments.next() {
+        let (name, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value.to_owned()))
+            });
+        let value = inline_value
+            .or_else(|| arguments.next())
+            .ok_or_else(|| format!("{name} requires an integer value"))?;
+        match name {
+            "--users" => options.users = value.parse()?,
+            "--apis" => options.apis = value.parse()?,
+            "--endpoints" => options.endpoints = value.parse()?,
+            "--groups" => options.groups = value.parse()?,
+            "--protos" => options.protos = value.parse()?,
+            "--logs" => options.logs = value.parse()?,
+            "--seed" => options.seed = Some(value.parse()?),
+            _ => return Err(format!("unknown seed option: {name}").into()),
+        }
+    }
+    Ok(options)
+}
+
+fn print_seed_help() {
+    println!(
+        "Seed the database with demo data\n\n  --users N       Number of users (default: 60)\n  --apis N        Number of APIs (default: 20)\n  --endpoints N   Endpoints per API (default: 6)\n  --groups N      Number of groups (default: 10)\n  --protos N      Number of proto files (default: 6)\n  --logs N        Number of log entries (default: 2000)\n  --seed N        Random seed for reproducibility"
+    );
+}
+
+fn pid_file_path() -> PathBuf {
+    env::var_os("PID_FILE")
+        .or_else(|| env::var_os("DOORMAN_PID_FILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("doorman.pid"))
+}
+
+fn start_process() -> Result<(), Box<dyn std::error::Error>> {
+    let pid_file = pid_file_path();
+    if pid_file.exists() {
+        info!(path = %pid_file.display(), "doorman is already running");
+        return Ok(());
+    }
+
+    let executable = env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn()?;
+    fs::write(&pid_file, child.id().to_string())?;
+    info!(pid = child.id(), "starting doorman");
+    Ok(())
+}
+
+fn stop_process() -> Result<(), Box<dyn std::error::Error>> {
+    let pid_file = pid_file_path();
+    if !pid_file.exists() {
+        info!("no running instance found");
+        return Ok(());
+    }
+    let pid = read_pid(&pid_file)?;
+
+    #[cfg(unix)]
+    stop_unix_process_group(pid);
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+
+    if pid_file.exists() {
+        fs::remove_file(&pid_file)?;
+    }
+    info!(pid, "stopping doorman");
+    Ok(())
+}
+
+fn read_pid(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+    let pid = fs::read_to_string(path)?.trim().parse::<u32>()?;
+    if pid == 0 {
+        return Err("PID file must contain a positive process ID".into());
+    }
+    Ok(pid)
+}
+
+#[cfg(unix)]
+fn stop_unix_process_group(pid: u32) {
+    let group = format!("-{pid}");
+    let status = Command::new("kill").args(["-TERM", "--", &group]).status();
+    if !status.is_ok_and(|status| status.success()) {
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let running = Command::new("kill")
+            .args(["-0", "--", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !running {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 #[cfg(unix)]
@@ -322,4 +522,64 @@ fn spawn_metrics_autosave(runtime: Arc<GatewayRuntime>) {
                 .store(persist_metrics(), Ordering::Relaxed);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_files_require_a_positive_integer() {
+        let directory = env::temp_dir().join(format!("doorman-pid-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("doorman.pid");
+
+        fs::write(&path, "1234\n").unwrap();
+        assert_eq!(read_pid(&path).unwrap(), 1234);
+        fs::write(&path, "0").unwrap();
+        assert!(read_pid(&path).is_err());
+        fs::write(&path, "invalid").unwrap();
+        assert!(read_pid(&path).is_err());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn seed_options_match_python_cli_names_and_defaults() {
+        assert_eq!(
+            parse_seed_options(std::iter::empty()).unwrap(),
+            SeedOptions::default()
+        );
+        assert_eq!(
+            parse_seed_options(
+                [
+                    "--users=2",
+                    "--apis",
+                    "3",
+                    "--endpoints",
+                    "4",
+                    "--groups",
+                    "5",
+                    "--protos",
+                    "6",
+                    "--logs",
+                    "7",
+                    "--seed",
+                    "8",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap(),
+            SeedOptions {
+                users: 2,
+                apis: 3,
+                endpoints: 4,
+                groups: 5,
+                protos: 6,
+                logs: 7,
+                seed: Some(8),
+            }
+        );
+    }
 }

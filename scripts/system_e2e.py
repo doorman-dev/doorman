@@ -9,6 +9,8 @@ and never reuse or prune resources outside their run label.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import functools
 import hashlib
 import html
@@ -21,12 +23,14 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -39,7 +43,11 @@ OPENAPI = ROOT / "parity/openapi/python-openapi.json.gz.b64"
 EVIDENCE_ROOT = ROOT / "system-e2e-evidence"
 REPORT_NAME = "system-e2e-report.json"
 LABEL = "com.doorman.system-e2e.run"
-PROFILE_BUDGETS = {"smoke": 300, "comprehensive": 1800, "soak": 3600}
+# The comprehensive corpus (4,704 differential cells, 102 settings on fresh
+# containers, 64 pairwise rows, 51 browser routes, three topologies) takes ~2h.
+PROFILE_BUDGETS = {"smoke": 300, "comprehensive": 10800, "soak": 14400}
+PLAYWRIGHT_IMAGE = "mcr.microsoft.com/playwright/python:v1.49.1-noble"
+PLAYWRIGHT_RUNNER = "doorman-system-e2e-ui:1.49.1"
 PROFILE_TOPOLOGIES = {
     "smoke": ["memory"],
     "comprehensive": ["memory", "external", "two-node"],
@@ -409,11 +417,15 @@ def free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def command(args: list[str], *, env: dict[str, str] | None = None, cwd: Path = ROOT, timeout: int = 1800) -> str:
+def command(
+    args: list[str], *, env: dict[str, str] | None = None, cwd: Path = ROOT, timeout: int = 1800,
+    input_text: str | None = None,
+) -> str:
     completed = subprocess.run(
         args,
         cwd=cwd,
         env=env,
+        input=input_text,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -501,6 +513,7 @@ class Runtime:
         self.evidence = Path(tempfile.mkdtemp(prefix=f"{self.run_id}-", dir=EVIDENCE_ROOT))
         self.evidence.chmod(0o700)
         self.resources = OwnedResources(self.run_id, [], [])
+        self.results: dict[str, bool] = {}
         self.started = time.monotonic()
         commit, dirty = git_state()
         ledger = validate_contract()
@@ -547,7 +560,9 @@ class Runtime:
     def build_images(self) -> None:
         candidate_iid = self.evidence / "candidate-image-id.txt"
         fixture_iid = self.evidence / "fixture-image-id.txt"
-        command(["docker", "build", "--iidfile", str(candidate_iid), "."], timeout=2400)
+        # Without provenance attestations (which embed build timestamps) the same
+        # source yields the same image ID, so release_check can bind this evidence.
+        command(["docker", "build", "--provenance=false", "--iidfile", str(candidate_iid), "."], timeout=2400)
         command(
             ["docker", "build", "--iidfile", str(fixture_iid), "system-tests/fixture"], timeout=1200
         )
@@ -616,7 +631,7 @@ class Runtime:
         raw = response.read()
         try:
             decoded: Any = json.loads(raw) if raw else None
-        except json.JSONDecodeError:
+        except ValueError:  # includes binary bodies that fail text decoding
             decoded = raw
         return response.status, decoded
 
@@ -638,6 +653,7 @@ class Runtime:
             "THREADS": "1",
             "MEM_DUMP_PATH": "/app/data/system-e2e.bin",
             "MEM_ENCRYPTION_KEY": secrets.token_hex(32),
+            "VAULT_KEY": secrets.token_hex(32),
             "MEM_AUTO_SAVE_ENABLED": "false",
             "DOORMAN_ADMIN_EMAIL": self.admin_email,
             "DOORMAN_ADMIN_PASSWORD": self.admin_password,
@@ -651,10 +667,18 @@ class Runtime:
             "LOCAL_HOST_IP_BYPASS": "false",
             "HTTPS_ONLY": "false",
             "DEMO_SEED": "false",
+            # The operation corpus logs in thousands of times from one address.
+            "LOGIN_IP_RATE_LIMIT": "1000000",
+            "LOGIN_ACCOUNT_RATE_LIMIT": "1000000",
+            "REGISTER_IP_RATE_LIMIT": "1000000",
+            "REGISTER_ACCOUNT_RATE_LIMIT": "1000000",
         }
+        self.candidate_settings = dict(settings)
         env_file = self.evidence / "candidate.env"
         env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
-        env_file.chmod(0o600)
+        # Bind-mounted into a container that runs as its own user; the file is
+        # removed when the run finishes.
+        env_file.chmod(0o644)
         command(
             [
                 "docker", "run", "--detach", "--name", name,
@@ -677,7 +701,8 @@ class Runtime:
                 with urllib.request.urlopen(f"http://127.0.0.1:{web_port}", timeout=3) as response:
                     if response.status == 200:
                         break
-            except urllib.error.URLError:
+            except (urllib.error.URLError, OSError):
+                # Includes resets while the dashboard server is still starting.
                 time.sleep(0.5)
         else:
             raise RuntimeError("candidate dashboard readiness timed out")
@@ -720,6 +745,55 @@ class Runtime:
         if status not in {200, 201}:
             raise RuntimeError(f"proto upload for {api_name} returned HTTP {status}")
 
+    @staticmethod
+    def baseline_response_error(protocol: str, status: int, body: Any, profile_id: str) -> str | None:
+        if status != 200:
+            return f"expected HTTP 200, got {status}"
+        if protocol == "rest":
+            return None if body == {"items": [], "next": None} else "REST item list differs from fixture"
+        if protocol == "graphql":
+            expected = {"data": {"hello": "Hello, Doorman!", "variables": None}}
+            return None if body == expected else "GraphQL response differs from fixture"
+        if protocol == "soap":
+            if not isinstance(body, bytes):
+                return "SOAP response is not XML bytes"
+            try:
+                root = ET.fromstring(body)
+            except ET.ParseError:
+                return "SOAP response is malformed XML"
+            for node in root.iter():
+                if node.tag.rsplit("}", 1)[-1] == "PingResponse":
+                    if any(child.tag.rsplit("}", 1)[-1] == "ok" and child.text == "true" for child in node):
+                        return None
+            return "SOAP PingResponse is missing ok=true"
+        if protocol == "grpc":
+            return None if body == {"message": "ok"} else "gRPC reply differs from fixture"
+        if not isinstance(body, bytes):
+            return "gRPC-Web response is not framed bytes"
+        if profile_id == "grpc-web-2":
+            try:
+                body = base64.b64decode(body, validate=True)
+            except (binascii.Error, ValueError):
+                return "gRPC-Web text response is invalid base64"
+        frames: list[tuple[int, bytes]] = []
+        offset = 0
+        while offset < len(body):
+            if len(body) - offset < 5:
+                return "gRPC-Web response has an incomplete frame header"
+            flag = body[offset]
+            length = int.from_bytes(body[offset + 1 : offset + 5], "big")
+            offset += 5
+            if length > len(body) - offset:
+                return "gRPC-Web response has an incomplete frame payload"
+            frames.append((flag, body[offset : offset + length]))
+            offset += length
+        if len(frames) != 2 or frames[0] != (0, b"\x0a\x02ok") or frames[1][0] != 0x80:
+            return "gRPC-Web reply frames differ from fixture"
+        statuses = [line for line in frames[1][1].split(b"\r\n") if line.startswith(b"grpc-status:")]
+        if statuses != [b"grpc-status: 0"]:
+            return "gRPC-Web reply has no successful grpc-status trailer"
+        return None
+
     def seed_and_probe(self, base: str) -> None:
         token = self.login(base)
         protocol_paths = {
@@ -736,6 +810,11 @@ class Runtime:
             port = 50051 if profile["protocol"] == "grpc" else 8080
             scheme = "grpc" if profile["protocol"] == "grpc" else "http"
             server = f"{scheme}://doorman-system-{self.run_id}-{profile['id']}:{port}"
+            if profile["protocol"] == "grpc-web":
+                # The gateway translates gRPC-Web into native gRPC, so its
+                # upstream is the native fixture; the gRPC-Web fixtures' own
+                # framing is covered by their self-test.
+                server = f"grpc://doorman-system-{self.run_id}-grpc-1:50051"
             payload = {
                 "api_name": api_name,
                 "api_version": "v1",
@@ -756,7 +835,7 @@ class Runtime:
             if status not in {200, 201}:
                 results.append({"profile": profile["id"], "phase": "create-api", "status": status, "body_class": type(body).__name__})
                 continue
-            if profile["protocol"] == "grpc":
+            if profile["protocol"] in ("grpc", "grpc-web"):
                 try:
                     self.upload_proto(base, token, api_name)
                 except RuntimeError as error:
@@ -802,32 +881,366 @@ class Runtime:
             elif profile["protocol"] == "grpc":
                 request = ("POST", f"/api/grpc/{api_name}", {"method": "Resource.Create", "message": {"name": "probe"}}, {"X-API-Version": "v1"})
             else:
-                # The current Rust implementation handles CRUD gRPC-Web locally;
-                # this probe documents the advertised route while the profile's
-                # direct self-test proves its upstream framing behavior.
-                request = ("OPTIONS", f"/api/grpc-web/{api_name}/fixture.v1.CrudService/ListItems", None, {"Origin": "https://system-e2e.invalid", "Access-Control-Request-Method": "POST"})
+                frame = b"\x00\x00\x00\x00\x07\x0a\x05probe"
+                text = profile["id"] == "grpc-web-2"
+                request = (
+                    "POST",
+                    f"/grpc-web/{api_name}/fixture.v1.Resource/Create",
+                    base64.b64encode(frame) if text else frame,
+                    {"Content-Type": "application/grpc-web-text" if text else "application/grpc-web+proto",
+                     "X-API-Version": "v1"},
+                )
             method_name, path, request_value, headers = request
             if isinstance(request_value, bytes):
                 status, body = self.http(base, method_name, path, body=request_value, headers=headers)
             else:
                 status, body = self.http(base, method_name, path, value=request_value, headers=headers)
-            results.append({"profile": profile["id"], "phase": "gateway", "status": status, "body_class": type(body).__name__})
+            error = self.baseline_response_error(profile["protocol"], status, body, profile["id"])
+            result = {"profile": profile["id"], "phase": "gateway", "status": status, "body_class": type(body).__name__}
+            if error:
+                result["error"] = error
+            results.append(result)
         (self.evidence / "baseline-probes.json").write_text(json.dumps(results, indent=2) + "\n")
         for result in results:
-            if result.get("phase") != "gateway" or result.get("status", 500) >= 400:
+            if result.get("phase") != "gateway" or result.get("error"):
                 self.report["failures"].append(
                     {
                         "scenario_id": f"fixture-baseline::{result['profile']}",
                         "domain": "protocol",
                         "signature": f"{result.get('phase')}-{result.get('status', 'error')}",
-                        "message": "upstream onboarding or gateway probe failed",
+                        "message": result.get("error", "upstream onboarding failed"),
                     }
                 )
+
+    def start_native_tls_candidate(self) -> dict[str, str]:
+        if not shutil.which("openssl"):
+            raise RuntimeError("native TLS combination test requires openssl")
+        tls_dir = self.evidence / "tls"
+        tls_dir.mkdir(mode=0o755)
+        root = tls_dir / "ca"
+        command([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "2", "-nodes",
+            "-subj", "/CN=Doorman system test CA", "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-keyout", str(root.with_suffix(".key")), "-out", str(root.with_suffix(".crt")),
+        ], timeout=60)
+        for name, san, usage in (
+            ("server", "IP:127.0.0.1", "serverAuth"),
+            ("client", "DNS:client.system.test", "clientAuth"),
+            ("wrong-client", "DNS:wrong.system.test", "clientAuth"),
+        ):
+            stem = tls_dir / name
+            command([
+                "openssl", "req", "-newkey", "rsa:2048", "-sha256", "-nodes",
+                "-subj", f"/CN={name}", "-keyout", str(stem.with_suffix(".key")),
+                "-out", str(stem.with_suffix(".csr")),
+            ], timeout=60)
+            extension = tls_dir / f"{name}.ext"
+            extension.write_text(
+                f"subjectAltName={san}\nextendedKeyUsage={usage}\nkeyUsage=digitalSignature,keyEncipherment\n"
+            )
+            command([
+                "openssl", "x509", "-req", "-in", str(stem.with_suffix(".csr")),
+                "-CA", str(root.with_suffix(".crt")), "-CAkey", str(root.with_suffix(".key")),
+                "-CAcreateserial", "-days", "2", "-sha256", "-extfile", str(extension),
+                "-out", str(stem.with_suffix(".crt")),
+            ], timeout=60)
+        (tls_dir / "profiles.yaml").write_text(
+            "client_ca_profiles:\n  - id: system-client-ca\n    ca_files:\n      - /run/tls/ca.crt\n"
+        )
+        for path in tls_dir.iterdir():
+            path.chmod(0o644)
+        port = free_port()
+        name = f"doorman-system-{self.run_id}-native-tls"
+        settings = {
+            **self.candidate_settings,
+            "MEM_DUMP_PATH": "/tmp/native-tls-system.bin",
+            "DOWNSTREAM_TLS_MODE": "native",
+            "DOWNSTREAM_TLS_CERT_FILE": "/run/tls/server.crt",
+            "DOWNSTREAM_TLS_KEY_FILE": "/run/tls/server.key",
+            "TLS_PROFILES_FILE": "/run/tls/profiles.yaml",
+            "TLS_SECRET_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode(),
+        }
+        env_file = self.evidence / "native-tls.env"
+        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
+        env_file.chmod(0o644)
+        command([
+            "docker", "run", "--detach", "--name", name, "--label", f"{LABEL}={self.run_id}",
+            "--network", f"doorman-system-{self.run_id}", "--publish", f"127.0.0.1:{port}:3001",
+            "--mount", f"type=bind,src={env_file},dst=/env/system.env,readonly",
+            "--mount", f"type=bind,src={tls_dir},dst=/run/tls,readonly",
+            self.report["candidate_image_id"],
+        ])
+        self.resources.names.append(name)
+        base = f"https://127.0.0.1:{port}"
+        context = ssl.create_default_context(cafile=str(root.with_suffix(".crt")))
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(base + "/platform/monitor/liveness", context=context, timeout=2) as response:
+                    if json.load(response).get("status") == "alive":
+                        break
+            except (OSError, ValueError, urllib.error.URLError):
+                time.sleep(0.5)
+        else:
+            raise RuntimeError("native TLS candidate readiness timed out")
+        return {
+            "base": base, "ca": str(root.with_suffix(".crt")),
+            "client_cert": str(tls_dir / "client.crt"), "client_key": str(tls_dir / "client.key"),
+            "wrong_cert": str(tls_dir / "wrong-client.crt"),
+            "wrong_key": str(tls_dir / "wrong-client.key"),
+        }
+
+    def start_python_oracle(self, storage: dict[str, str] | None = None, suffix: str = "oracle") -> str:
+        """Run the pinned Python reference with the candidate's settings."""
+        from scripts.release_fixtures import ReleaseFixtures
+
+        image = self.report["fixture_image_ids"].get("python_oracle")
+        if not image:
+            fixtures = ReleaseFixtures(self.evidence, self.report["candidate_image_id"], dict(os.environ))
+            fixtures.build_python_reference()
+            image = fixtures.python_image_id
+            self.report["fixture_image_ids"]["python_oracle"] = image
+            self.save()
+        port = free_port()
+        name = f"doorman-system-{self.run_id}-{suffix}"
+        settings = {**self.candidate_settings, "HOST": "0.0.0.0", "PORT": "8000", "THREADS": "1",
+                    "MEM_DUMP_PATH": "/tmp/oracle-dump.bin", **(storage or {})}
+        env_file = self.evidence / f"{suffix}.env"
+        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
+        env_file.chmod(0o600)
+        command([
+            "docker", "run", "--detach", "--name", name,
+            "--label", f"{LABEL}={self.run_id}", "--network", f"doorman-system-{self.run_id}",
+            "--publish", f"127.0.0.1:{port}:8000", "--env-file", str(env_file), str(image),
+        ])
+        self.resources.names.append(name)
+        base = f"http://127.0.0.1:{port}"
+        wait_json(base + "/platform/monitor/liveness", {"status": "alive"}, timeout=180)
+        return base
+
+    def start_storage_pair(self, suffix: str, redis_auth: bool = True) -> dict[str, str]:
+        """Private MongoDB + Redis for one side of an external topology.
+
+        The pinned Python cache cannot authenticate to Redis (it never reads
+        REDIS_PASSWORD), so the oracle's private Redis runs without a password."""
+        host = f"doorman-system-{self.run_id}"
+        password = secrets.token_hex(24)
+        mongo, redis = f"{host}-mongo-{suffix}", f"{host}-redis-{suffix}"
+        # Container names exceed the 63-character DNS label limit; gateways
+        # reach the stores through short network aliases instead.
+        tag = hashlib.sha256(suffix.encode()).hexdigest()[:8]
+        aliases = {mongo: f"mongo-{tag}", redis: f"redis-{tag}"}
+        for name, args in (
+            (mongo, ["--env", "MONGO_INITDB_ROOT_USERNAME=doorman", "--env",
+                     f"MONGO_INITDB_ROOT_PASSWORD={password}", "mongo:7"]),
+            (redis, ["redis:7-alpine", "redis-server", *(["--requirepass", password] if redis_auth else [])]),
+        ):
+            command(["docker", "run", "--detach", "--name", name, "--label", f"{LABEL}={self.run_id}",
+                     "--network", host, "--network-alias", aliases[name], *args])
+            self.resources.names.append(name)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            mongo_ok = subprocess.run(
+                ["docker", "exec", mongo, "mongosh", "--quiet", "-u", "doorman", "-p", password,
+                 "--authenticationDatabase", "admin", "--eval", "db.runCommand({ping: 1}).ok"],
+                capture_output=True, text=True).stdout.strip().endswith("1")
+            redis_ok = subprocess.run(
+                ["docker", "exec", redis, "redis-cli", "--no-auth-warning",
+                 *(["-a", password] if redis_auth else []), "ping"],
+                capture_output=True, text=True).stdout.strip() == "PONG"
+            if mongo_ok and redis_ok:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"external storage {suffix} did not become ready")
+        return {
+            "MEM_OR_EXTERNAL": "REDIS", "MONGO_DB_HOSTS": f"{aliases[mongo]}:27017", "MONGO_DB_USER": "doorman",
+            "MONGO_DB_PASSWORD": password, "MONGO_DB_AUTH_SOURCE": "admin", "REDIS_HOST": aliases[redis],
+            "REDIS_PORT": "6379", "REDIS_DB": "0", **({"REDIS_PASSWORD": password} if redis_auth else {}),
+        }
+
+    def start_candidate_node(self, suffix: str, storage: dict[str, str]) -> str:
+        """An additional candidate container using external storage."""
+        port = free_port()
+        name = f"doorman-system-{self.run_id}-{suffix}"
+        env_file = self.evidence / f"{suffix}.env"
+        settings = {**self.candidate_settings, **storage}
+        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
+        env_file.chmod(0o644)
+        command([
+            "docker", "run", "--detach", "--name", name, "--label", f"{LABEL}={self.run_id}",
+            "--network", f"doorman-system-{self.run_id}", "--publish", f"127.0.0.1:{port}:3001",
+            "--mount", f"type=bind,src={env_file},dst=/env/system.env,readonly",
+            self.report["candidate_image_id"],
+        ])
+        self.resources.names.append(name)
+        base = f"http://127.0.0.1:{port}"
+        wait_json(base + "/platform/monitor/liveness", {"status": "alive"}, timeout=180)
+        wait_json(base + "/platform/monitor/readiness", {"status": "ready"}, timeout=180)
+        return base
+
+    def mark_topology(self, name: str) -> None:
+        for topology in self.report["topologies"]:
+            if topology["name"] == name:
+                topology["status"] = "passed"
+        self.save()
+
+    def run_operation_corpus(self, candidate: str, oracle: str, classes_excluded: set[str],
+                             classes_only: set[str] | None = None, peer: str | None = None) -> None:
+        from scripts.system_operations import Executor, Target, World, load_approvals
+
+        host = f"doorman-system-{self.run_id}"
+        world = World(f"http://{host}-rest-1:8080", {
+            "soap": f"http://{host}-soap-1:8080",
+            "graphql": f"http://{host}-graphql-1:8080",
+            "grpc": f"grpc://{host}-grpc-1:50051",
+        })
+        secret = self.candidate_settings["JWT_SECRET_KEY"]
+        executor = Executor(
+            Target("candidate", candidate, self.admin_email, self.admin_password, secret, peer=peer),
+            Target("oracle", oracle, self.admin_email, self.admin_password, secret),
+            world, load_approvals(), log=lambda line: None,
+        )
+        executor.setup()
+        outcomes = []
+        for scenario in self.ledger["scenarios"]:
+            if scenario["executor"] != "openapi-operation":
+                continue
+            case = scenario["id"].rsplit("::", 1)[1]
+            if case in classes_excluded or (classes_only is not None and case not in classes_only):
+                continue
+            outcome = executor.run(scenario["id"])
+            outcomes.append(outcome.__dict__)
+            self.results[scenario["id"]] = outcome.passed
+            if not outcome.passed:
+                self.report["failures"].append({
+                    "scenario_id": scenario["id"], "domain": "operation",
+                    "signature": json.dumps(outcome.signatures, sort_keys=True),
+                    "message": outcome.reason,
+                })
+        label = "-".join(sorted(classes_only)) if classes_only else "memory"
+        (self.evidence / f"operation-outcomes-{label}.json").write_text(json.dumps(outcomes, indent=1) + "\n")
+        self.save()
+
+    def run_settings_corpus(self, fixtures: dict[str, str]) -> None:
+        """Every runtime setting, positive and invalid, on fresh candidate and oracle containers."""
+        from scripts.system_settings import Context, DockerLauncher, run_corpus
+
+        host = f"doorman-system-{self.run_id}"
+        launcher = DockerLauncher(
+            {"rust": self.report["candidate_image_id"], "python": self.report["fixture_image_ids"]["python_oracle"]},
+            host, {LABEL: self.run_id}, host,
+        )
+        outcomes = run_corpus(launcher, Context(f"http://{host}-rest-1:8080", fixtures["rest-1"]))
+        for outcome in outcomes:
+            self.results[outcome.scenario_id] = outcome.passed
+            if not outcome.passed:
+                self.report["failures"].append({
+                    "scenario_id": outcome.scenario_id, "domain": "configuration",
+                    "signature": json.dumps(outcome.observation, sort_keys=True), "message": outcome.reason,
+                })
+        (self.evidence / "setting-outcomes.json").write_text(
+            json.dumps([outcome.__dict__ for outcome in outcomes], indent=1) + "\n")
+        self.save()
+
+    def run_pairwise_rows(self, candidate: str, oracle: str, fixtures: dict[str, str], storage: str,
+                          peer: str | None = None) -> None:
+        """The generated pairwise policy rows whose storage axis matches this topology."""
+        from scripts.system_operations import Target, World
+        from scripts.system_pairwise import Pairwise
+
+        host = f"doorman-system-{self.run_id}"
+        upstreams = {
+            "soap": f"http://{host}-soap-1:8080",
+            "graphql": f"http://{host}-graphql-1:8080",
+            "grpc": f"grpc://{host}-grpc-1:50051",
+        }
+        for profile in load_json(SYSTEM / "upstreams.json")["profiles"]:
+            profile_id = profile["id"]
+            if profile["protocol"] in ("grpc", "grpc-web"):
+                native_id = profile_id.replace("grpc-web-", "grpc-")
+                upstreams[profile_id] = f"grpc://{host}-{native_id}:50051"
+            else:
+                upstreams[profile_id] = f"http://{host}-{profile_id}:8080"
+        world = World(upstreams["rest-1"], upstreams)
+        controls = {**fixtures, "grpc-web-1": fixtures["grpc-1"], "grpc-web-2": fixtures["grpc-2"]}
+        secret = self.candidate_settings["JWT_SECRET_KEY"]
+        runner = Pairwise(
+            Target("candidate", candidate, self.admin_email, self.admin_password, secret, peer=peer),
+            Target("oracle", oracle, self.admin_email, self.admin_password, secret),
+            world, controls, log=lambda line: None,
+        )
+        runner.setup()
+        outcomes = []
+        for index, row in enumerate(self.ledger["pairwise_rows"], 1):
+            if row["storage"] != storage:
+                continue
+            outcome = runner.run(index, row)
+            outcomes.append(outcome)
+            self.results[outcome["scenario_id"]] = outcome["passed"]
+            if not outcome["passed"]:
+                self.report["failures"].append({
+                    "scenario_id": outcome["scenario_id"], "domain": "pairwise",
+                    "signature": json.dumps(outcome["signatures"], sort_keys=True), "message": outcome["reason"],
+                })
+        (self.evidence / f"pairwise-{storage}-outcomes.json").write_text(json.dumps(outcomes, indent=1) + "\n")
+        self.save()
+
+    def run_ui_corpus(self) -> None:
+        """Every dashboard route in a real browser (official Playwright image)."""
+        host = f"doorman-system-{self.run_id}"
+        routes_file = self.evidence / "ui-routes.json"
+        routes_file.write_text(json.dumps(self.ledger["dashboard_routes"]) + "\n")
+        report = self.evidence / "ui-outcomes.json"
+        # The official image ships the browsers; add the matching Python package.
+        command(["docker", "build", "--tag", PLAYWRIGHT_RUNNER, "-"], timeout=1200,
+                input_text=f"FROM {PLAYWRIGHT_IMAGE}\nRUN pip install --break-system-packages playwright==1.49.1\n")
+        completed = subprocess.run(
+            [
+                "docker", "run", "--rm", "--label", f"{LABEL}={self.run_id}", "--network", host,
+                "--ipc", "host", "--mount", f"type=bind,src={ROOT / 'scripts'},dst=/work/scripts,readonly",
+                "--mount", f"type=bind,src={self.evidence},dst=/out",
+                PLAYWRIGHT_RUNNER, "python3", "/work/scripts/system_ui.py",
+                "--web", f"http://{host}-memory:3000", "--admin-email", self.admin_email,
+                "--admin-password", self.admin_password, "--routes", "/out/ui-routes.json",
+                "--report", "/out/ui-outcomes.json",
+            ],
+            capture_output=True, text=True, timeout=1800,
+        )
+        (self.evidence / "ui.log").write_text(completed.stdout + completed.stderr)
+        if not report.exists():
+            raise RuntimeError(f"UI executor produced no report (exit {completed.returncode})")
+        for outcome in json.loads(report.read_text()):
+            self.results[outcome["scenario_id"]] = outcome["passed"]
+            if not outcome["passed"]:
+                self.report["failures"].append({
+                    "scenario_id": outcome["scenario_id"], "domain": "browser",
+                    "signature": "ui-check", "message": outcome["reason"],
+                })
+        self.save()
+
+    def run_packs(self, topology: Any) -> None:
+        from scripts.system_packs import PACKS, prepare, run_pack
+
+        prepare(topology)
+        outcomes = [run_pack(name, topology) for name in PACKS]
+        for outcome in outcomes:
+            self.results[outcome["scenario_id"]] = outcome["passed"]
+            if not outcome["passed"]:
+                self.report["failures"].append({
+                    "scenario_id": outcome["scenario_id"], "domain": "higher-order",
+                    "signature": "pack-assertion", "message": outcome["reason"],
+                })
+        (self.evidence / "pack-outcomes.json").write_text(json.dumps(outcomes, indent=1) + "\n")
+        self.save()
 
     def record_unimplemented_corpus(self) -> None:
         # This is deliberately fail-closed. Infrastructure can be developed and
         # inspected without ever turning absent product assertions into a pass.
         for scenario in self.ledger["scenarios"]:
+            if scenario["id"] in self.results:
+                continue
             self.report["failures"].append(
                 {
                     "scenario_id": scenario["id"],
@@ -836,16 +1249,74 @@ class Runtime:
                     "message": f"runtime executor {scenario['executor']} has no result",
                 }
             )
-        self.report["scenario_counts"]["failed"] = len(self.report["failures"])
+        passed = sum(self.results.values())
+        self.report["scenario_counts"]["passed"] = passed
+        self.report["scenario_counts"]["failed"] = len(self.ledger["scenarios"]) - passed
+        by_operation: dict[str, bool] = {}
+        for scenario in self.ledger["scenarios"]:
+            if scenario["executor"] == "openapi-operation":
+                key = scenario["id"].rsplit("::", 1)[0]
+                by_operation[key] = by_operation.get(key, True) and self.results.get(scenario["id"], False)
+        self.report["operation_coverage"]["covered"] = sum(by_operation.values())
+        pairs: set[tuple[str, str, str, str]] = set()
+        for index, row in enumerate(self.ledger["pairwise_rows"], 1):
+            if self.results.get(f"pairwise::{index:04d}"):
+                pairs |= covered_pairs(row)
+        self.report["pair_coverage"]["covered"] = len(pairs & valid_pairs(load_json(SYSTEM / "pairwise.json")))
+        self.report["ui_coverage"]["covered"] = sum(
+            bool(self.results.get(f"ui::{route}")) for route in self.ledger["dashboard_routes"])
 
     def execute(self) -> None:
         self.build_images()
-        self.start_fixtures()
+        fixtures = self.start_fixtures()
         base, _web = self.start_memory_candidate()
         self.seed_and_probe(base)
-        for topology in self.report["topologies"]:
-            if topology["name"] == "memory":
-                topology["status"] = "passed"
+        oracle = self.start_python_oracle()
+        # external_storage / cross_node cells need their topologies.
+        self.run_operation_corpus(base, oracle, {"external_storage", "cross_node"})
+        self.run_pairwise_rows(base, oracle, fixtures, "memory")
+        self.run_ui_corpus()
+        self.mark_topology("memory")
+        from scripts.system_operations import Target
+        from scripts.system_packs import Topology
+
+        host = f"doorman-system-{self.run_id}"
+        secret = self.candidate_settings["JWT_SECRET_KEY"]
+
+        def target(name: str, url: str) -> Target:
+            return Target(name, url, self.admin_email, self.admin_password, secret)
+
+        packs = Topology(
+            candidate=target("candidate", base), oracle=target("oracle", oracle),
+            upstream=lambda profile: (f"grpc://{host}-{profile}:50051" if profile.startswith("grpc")
+                                      else f"http://{host}-{profile}:8080"),
+            control=fixtures, memory_container=f"{host}-memory",
+        )
+        topologies = {item["name"] for item in self.report["topologies"]}
+        if "external" in topologies:
+            candidate_storage = self.start_storage_pair("candidate-external")
+            candidate = self.start_candidate_node("external", candidate_storage)
+            external_oracle = self.start_python_oracle(self.start_storage_pair("oracle-external", redis_auth=False), "oracle-external")
+            self.run_operation_corpus(candidate, external_oracle, set(), {"external_storage"})
+            self.run_pairwise_rows(candidate, external_oracle, fixtures, "external")
+            packs.external = target("external", candidate)
+            packs.external_redis = f"{host}-redis-candidate-external"
+            packs.external_mongo = f"{host}-mongo-candidate-external"
+            self.mark_topology("external")
+        if "two-node" in topologies:
+            shared = self.start_storage_pair("candidate-two-node")
+            node_a = self.start_candidate_node("node-a", shared)
+            node_b = self.start_candidate_node("node-b", shared)
+            two_node_oracle = self.start_python_oracle(self.start_storage_pair("oracle-two-node", redis_auth=False), "oracle-two-node")
+            self.run_operation_corpus(node_a, two_node_oracle, set(), {"cross_node"}, peer=node_b)
+            self.run_pairwise_rows(node_a, two_node_oracle, fixtures, "two-node", peer=node_b)
+            packs.node_a, packs.node_b = target("node-a", node_a), target("node-b", node_b)
+            self.mark_topology("two-node")
+        packs.candidate.tokens["admin"] = packs.candidate.login(self.admin_email, self.admin_password)
+        packs.oracle.tokens["admin"] = packs.oracle.login(self.admin_email, self.admin_password)
+        packs.native_tls = self.start_native_tls_candidate()
+        self.run_packs(packs)
+        self.run_settings_corpus(fixtures)
         self.record_unimplemented_corpus()
 
     def write_summary_artifacts(self) -> None:
@@ -881,9 +1352,10 @@ UI: {self.report['ui_coverage']['covered']} / {self.report['ui_coverage']['total
 
     def finish(self, status: str) -> None:
         cleanup_errors = self.resources.cleanup(self.evidence)
-        secret_file = self.evidence / "candidate.env"
-        if secret_file.exists():
+        # Every env file carries run secrets (candidate, extra nodes, oracles).
+        for secret_file in self.evidence.glob("*.env"):
             secret_file.unlink()
+        shutil.rmtree(self.evidence / "tls", ignore_errors=True)
         self.report["infrastructure_errors"].extend(cleanup_errors)
         elapsed = time.monotonic() - self.started
         self.report["timings"].update(finished_at=utc_now(), elapsed_seconds=round(elapsed, 3))

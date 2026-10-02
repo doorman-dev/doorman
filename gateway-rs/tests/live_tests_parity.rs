@@ -28,6 +28,27 @@ async fn test_app_state() -> AppState {
     test_app_state_with(|_| {}).await
 }
 
+/// Re-runs `name` in a child process with ENFORCE_ADMIN_SUBSCRIPTION=true (as the Python
+/// live tests do) so the process-global variable cannot leak into concurrent tests.
+fn reexec_with_enforced_admin_subscription(name: &str) -> bool {
+    if std::env::var_os("DOORMAN_ENFORCE_ADMIN_SUB_CHILD").is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("DOORMAN_ENFORCE_ADMIN_SUB_CHILD", "1")
+        .env("ENFORCE_ADMIN_SUBSCRIPTION", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test]
 async fn hot_reload_changes_retry_and_timeout_on_real_http_requests() {
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -225,6 +246,15 @@ async fn test_app_state_with(configure: impl FnOnce(&mut Config)) -> AppState {
     let mut state = AppState::new(config).unwrap();
     state.storage = Some(Arc::new(storage));
     state
+}
+
+const PROTO_MULTIPART_CONTENT_TYPE: &str = "multipart/form-data; boundary=live-proto-boundary";
+
+/// The pinned proto upload takes a multipart `file` part (FastAPI UploadFile).
+fn proto_multipart(proto: &str) -> String {
+    format!(
+        "--live-proto-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"service.proto\"\r\nContent-Type: application/octet-stream\r\n\r\n{proto}\r\n--live-proto-boundary--\r\n"
+    )
 }
 
 async fn login_admin(app: &axum::Router) -> String {
@@ -978,7 +1008,6 @@ async fn configure_bandwidth_gateway(
         json!({
             "bandwidth_limit_bytes": limit,
             "bandwidth_limit_window": window,
-            "bandwidth_limit_enabled": true,
         }),
     )
     .await;
@@ -1172,7 +1201,7 @@ async fn live_test_99_cors_credentialed_wildcard_is_rejected_as_approved_securit
     let (status, body) =
         authed_json_response(&app, &token, Method::POST, "/platform/api", api).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["detail"][0]["type"], "value_error.cors_origins");
+    assert_eq!(body["error_code"], "VAL001");
 }
 
 #[tokio::test]
@@ -1388,11 +1417,18 @@ async fn monitor_metrics_increment_status_series_and_top_apis_parity() {
     assert!(metrics["total_requests"].as_u64().unwrap_or(0) >= 3);
     assert!(metrics["status_counts"]["200"].as_u64().unwrap_or(0) >= 3);
     assert!(metrics["series"].is_array());
+    // Python's MetricsStore.snapshot serializes top_apis as a list of
+    // [name, count] tuples (sorted(dict.items())), not objects.
     assert!(metrics["top_apis"].as_array().unwrap().iter().any(|entry| {
-        entry["name"]
-            .as_str()
+        entry
+            .as_array()
+            .and_then(|pair| pair.first())
+            .and_then(|name| name.as_str())
             .is_some_and(|name| name.starts_with("rest:"))
     }));
+    // Python's unique_users is len(agg_user_counts) reconstructed from the
+    // selected range's buckets, not a process-global all-time distinct count.
+    assert!(metrics["unique_users"].as_u64().unwrap_or(0) >= 1);
     upstream.abort();
 }
 
@@ -2225,6 +2261,10 @@ async fn request_id_is_forwarded_to_authenticated_rest_upstream_and_response() {
 
 #[tokio::test]
 async fn live_test_21_subscription_list_unsubscribe_parity() {
+    if reexec_with_enforced_admin_subscription("live_test_21_subscription_list_unsubscribe_parity")
+    {
+        return;
+    }
     let app = build_router(test_app_state().await);
     let token = login_admin(&app).await;
     let api_name = "subs-test-21";
@@ -3157,10 +3197,12 @@ async fn live_test_41_soap_and_85_endpoint_validation_parity() {
                         "endpoint_id": endpoint_id,
                         "validation_enabled": true,
                         "validation_schema": {
-                            "intA": {
-                                "required": true,
-                                "type": "string",
-                                "min": 2
+                            "validation_schema": {
+                                "intA": {
+                                    "required": true,
+                                    "type": "string",
+                                    "min": 2
+                                }
                             }
                         }
                     })
@@ -3221,7 +3263,7 @@ async fn live_test_90_security_tools_and_config_export_import_parity() {
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"origin": "http://localhost:3000"}).to_string(),
+                    json!({"origin": "http://localhost:3000", "method": "GET"}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -3934,8 +3976,8 @@ message DeleteReply { bool ok = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4086,8 +4128,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4168,6 +4210,9 @@ message HelloReply { string message = 1; }
 
 #[tokio::test]
 async fn grpc_gateway_maps_upstream_statuses_parity() {
+    if reexec_with_enforced_admin_subscription("grpc_gateway_maps_upstream_statuses_parity") {
+        return;
+    }
     let (upstream_url, upstream) = start_grpc_status_upstream().await;
     let app = build_router(test_app_state().await);
     let token = login_admin(&app).await;
@@ -4209,8 +4254,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4400,8 +4445,8 @@ message WatchReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4504,8 +4549,8 @@ message SumReply { int32 sum = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4678,8 +4723,8 @@ service Greeter {}
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4760,8 +4805,8 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -4859,8 +4904,8 @@ message SumReply { int32 sum = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                .header(header::CONTENT_TYPE, PROTO_MULTIPART_CONTENT_TYPE)
+                .body(Body::from(proto_multipart(proto)))
                 .unwrap(),
         )
         .await
@@ -5069,7 +5114,7 @@ async fn live_test_40_soap_gateway_basic_flow_parity() {
         response.headers()[header::CONTENT_TYPE]
             .to_str()
             .unwrap()
-            .starts_with("text/xml")
+            .starts_with("application/xml")
     );
     let body = String::from_utf8(
         to_bytes(response.into_body(), usize::MAX)

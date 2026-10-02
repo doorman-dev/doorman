@@ -19,7 +19,8 @@ make local-e2e
 `make test-e2e` remains an alias for `make local-e2e`.
 No separately running Doorman server is needed. This sequential, fail-fast runner:
 
-1. Tests the Python verification scripts and checks the pinned reference/600-entry ledger.
+1. Tests the Python verification scripts and checks the pinned reference plus the
+   test and production-source coverage ledgers.
 2. Runs Rust formatting, Clippy, and the full Cargo suite (including protocol,
    platform, persistence, and process-lifecycle tests).
 3. Installs frontend dependencies and builds the dashboard.

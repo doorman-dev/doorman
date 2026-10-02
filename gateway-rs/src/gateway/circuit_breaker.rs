@@ -89,11 +89,12 @@ fn enabled() -> bool {
 }
 
 fn threshold() -> u64 {
+    // The pinned int() parse keeps zero and negative thresholds, which open the
+    // circuit on the first failure.
     env::var("CIRCUIT_BREAKER_THRESHOLD")
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(5)
-        .max(1)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .map_or(5, |value| u64::try_from(value.max(1)).unwrap_or(1))
 }
 
 fn open_duration() -> Duration {

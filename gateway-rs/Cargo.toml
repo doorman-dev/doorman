@@ -14,7 +14,7 @@ name = "doorman-gateway"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.8.9", features = ["http2", "macros"] }
+axum = { version = "0.8.9", features = ["http2", "macros", "ws"] }
 base64 = "0.22"
 bytes = "1.10"
 futures-util = "0.3"
@@ -25,6 +25,7 @@ mongodb = "3"
 prost = "0.14"
 prost-reflect = { version = "0.16", features = ["serde"] }
 quick-xml = "0.38"
+rand = "0.9.5"
 redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
 regex = "1"
 ryu = "1"
@@ -37,13 +38,15 @@ sha2 = "0.10"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.48", features = ["full"] }
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["catch-panic", "compression-gzip", "trace", "sensitive-headers"] }
-tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 uuid = { version = "1.18", features = ["v4"] }
+x509-parser = "0.18"
 bcrypt = "0.19.3"
 aes-gcm = "0.11.0"
 hkdf = "0.12.4"

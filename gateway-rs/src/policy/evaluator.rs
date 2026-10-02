@@ -30,6 +30,10 @@ use crate::{
         redis::{bandwidth_key, rate_limit_key, throttle_key},
         runtime::SharedStorage,
     },
+    tls::{
+        policy::{ClientTlsFailure, ClientTlsPolicy},
+        profiles::{TlsProfiles, select_upstream_profile},
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -40,17 +44,50 @@ pub struct PolicyRequest {
     pub direct_ip: Option<IpAddr>,
     pub now_millis: u64,
     pub content_length: u64,
+    pub peer_certificates: Vec<Vec<u8>>,
+    pub native_tls: bool,
+    pub is_preflight: bool,
+    /// The pinned group check resolves a gRPC API under `X-API-Version`
+    /// defaulting to `v0`, so a request without the header fails it.
+    pub group_version_missing: bool,
+    /// The pinned REST route matches the endpoint before authenticating
+    /// (GTW003, even when the API has no endpoints at all).
+    pub route_endpoint_check: bool,
+    /// Only the pinned REST and SOAP gateways require a registered endpoint;
+    /// GraphQL and gRPC forward any call for an existing API.
+    pub endpoint_required: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PolicyRuntime {
     pub rate_counter: WindowCounter,
     pub rate_bucket_counter: TokenBucketCounter,
     pub throttle_counter: WindowCounter,
     pub bandwidth_counter: WindowCounter,
+    pub tls_profiles: std::sync::Arc<TlsProfiles>,
 }
 
 pub fn evaluate_rest_policy(
+    documents: &mut PolicyDocuments,
+    request: &PolicyRequest,
+    storage_config: &SharedStorageConfig,
+    runtime: &PolicyRuntime,
+) -> Result<Option<PolicyDecision>, PolicyFailure> {
+    match evaluate_rest_policy_staged(documents, request, storage_config, runtime)? {
+        Some(decision) if decision.deferred_failure.is_some() => {
+            Err(decision.deferred_failure.expect("checked above"))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Evaluates in the pinned order: IP policy and CORS preflight, then the
+/// route-level identity checks for private APIs (authentication, subscription,
+/// group, user limits), and only then the service-level checks (API active,
+/// endpoint existence, credits).  A service-level failure is returned as
+/// `deferred_failure` so the caller can first apply the tier limits that the
+/// pinned middleware enforces ahead of every route.
+pub fn evaluate_rest_policy_staged(
     documents: &mut PolicyDocuments,
     request: &PolicyRequest,
     storage_config: &SharedStorageConfig,
@@ -62,14 +99,6 @@ pub fn evaluate_rest_policy(
     let Some(api) = find_api(&documents.apis, &route.api_name, &route.api_version).cloned() else {
         return Ok(None);
     };
-    if bool_field(&api, "active") == Some(false) {
-        return Err(PolicyFailure::new(
-            PolicyStage::Resolution,
-            StatusCode::FORBIDDEN,
-            "GTW012",
-            "API is disabled",
-        ));
-    }
     let settings = documents
         .settings
         .iter()
@@ -106,18 +135,153 @@ pub fn evaluate_rest_policy(
     } else {
         request.method.as_str()
     };
-    if !endpoint_exists(&documents.endpoints, &api, method, &route.endpoint_uri) {
-        return Err(PolicyFailure::new(
+    if request.route_endpoint_check
+        && !endpoint_exists(&documents.endpoints, &api, method, &route.endpoint_uri)
+    {
+        return Ok(Some(PolicyDecision {
+            deferred_failure: Some(PolicyFailure::new(
+                PolicyStage::Resolution,
+                StatusCode::NOT_FOUND,
+                "GTW003",
+                "Endpoint does not exist for the requested API",
+            )),
+            ..Default::default()
+        }));
+    }
+    let api_public = bool_field(&api, "api_public").unwrap_or(false);
+    let api_auth_required = bool_field(&api, "api_auth_required").unwrap_or(true);
+    let mut authenticated: Option<(String, Option<u64>)> = None;
+    if !api_public && api_auth_required {
+        let claims = verify_request_token(&request.headers, storage_config)?;
+        let username = claims.sub.as_deref().unwrap_or_default();
+        if is_revoked(&documents.revocations, username, claims.jti.as_deref()) {
+            // auth_required's broad except re-raises every failure as a bare Unauthorized.
+            return Err(super::auth::unauthorized("Unauthorized"));
+        }
+        let user = documents
+            .users
+            .iter()
+            .find(|item| string_field(item, "username") == Some(username))
+            .cloned()
+            .ok_or_else(|| {
+                PolicyFailure::new(
+                    PolicyStage::Authentication,
+                    StatusCode::NOT_FOUND,
+                    "User not found",
+                    "User not found",
+                )
+            })?;
+        if bool_field(&user, "active") == Some(false) {
+            return Err(super::auth::unauthorized("Unauthorized"));
+        }
+
+        let enforce_admin_sub = std::env::var("ENFORCE_ADMIN_SUBSCRIPTION")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                api.get("enforce_admin_subscription")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
+
+        enforce_subscription(
+            &format!("{}/{}", route.api_name, route.api_version),
+            &user,
+            &documents.roles,
+            &documents.subscriptions,
+            enforce_admin_sub,
+        )?;
+        if request.group_version_missing {
+            return Err(PolicyFailure::new(
+                PolicyStage::Group,
+                StatusCode::NOT_FOUND,
+                "API not found",
+                "API not found",
+            ));
+        }
+        enforce_group_access(&api, &user)?;
+        enforce_rate_limit(
+            username,
+            &user,
+            &runtime.rate_counter,
+            &runtime.rate_bucket_counter,
+            request.now_millis,
+        )?;
+        let throttle = enforce_throttle(
+            username,
+            &user,
+            &runtime.throttle_counter,
+            request.now_millis,
+        )?;
+        enforce_allowed_roles(&api, &user)?;
+        enforce_pre_request_limit(
+            username,
+            &user,
+            &runtime.bandwidth_counter,
+            request.now_millis / 1000,
+            request.content_length,
+        )?;
+        authenticated = Some((username.to_owned(), throttle.delay_ms));
+    }
+
+    let deferred = if bool_field(&api, "active") == Some(false) {
+        Some(PolicyFailure::new(
+            PolicyStage::Resolution,
+            StatusCode::FORBIDDEN,
+            "GTW012",
+            "API is disabled",
+        ))
+    } else if request.endpoint_required
+        && !documents
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint_belongs_to_api(endpoint, &api))
+    {
+        Some(PolicyFailure::new(
+            PolicyStage::Resolution,
+            StatusCode::NOT_FOUND,
+            "GTW002",
+            "No endpoints found for the requested API",
+        ))
+    } else if request.endpoint_required
+        && !endpoint_exists(&documents.endpoints, &api, method, &route.endpoint_uri)
+    {
+        Some(PolicyFailure::new(
             PolicyStage::Resolution,
             StatusCode::NOT_FOUND,
             "GTW003",
             "Endpoint does not exist for the requested API",
-        ));
+        ))
+    } else {
+        None
+    };
+    let username = authenticated.as_ref().map(|(name, _)| name.clone());
+    let tier_username = username.clone().or_else(|| {
+        verify_request_token(&request.headers, storage_config)
+            .ok()
+            .and_then(|claims| claims.sub)
+    });
+    if let Some(failure) = deferred {
+        return Ok(Some(PolicyDecision {
+            username,
+            tier_username,
+            tier_rate_limit_enabled: !storage_config.skip_tier_rate_limit,
+            deferred_failure: Some(failure),
+            ..Default::default()
+        }));
     }
     let endpoint = find_endpoint(&documents.endpoints, &api, method, &route.endpoint_uri).cloned();
+    if !request.is_preflight {
+        let policy =
+            ClientTlsPolicy::from_documents(&api, endpoint.as_ref()).map_err(client_tls_failure)?;
+        policy
+            .enforce(
+                &request.peer_certificates,
+                &runtime.tls_profiles,
+                request.native_tls,
+            )
+            .map_err(client_tls_failure)?;
+    }
 
-    let api_public = bool_field(&api, "api_public").unwrap_or(false);
-    let api_auth_required = bool_field(&api, "api_auth_required").unwrap_or(true);
     let endpoint_id = endpoint
         .as_ref()
         .and_then(|item| string_field(item, "endpoint_id"));
@@ -202,86 +366,22 @@ pub fn evaluate_rest_policy(
         ..Default::default()
     };
 
-    if !api_public && api_auth_required {
-        let claims = verify_request_token(&request.headers, storage_config)?;
-        let username = claims.sub.as_deref().unwrap_or_default();
-        if is_revoked(&documents.revocations, username, claims.jti.as_deref()) {
-            return Err(super::auth::unauthorized("Token has been revoked"));
-        }
-        let user = documents
-            .users
-            .iter()
-            .find(|item| string_field(item, "username") == Some(username))
-            .cloned()
-            .ok_or_else(|| {
-                PolicyFailure::new(
-                    PolicyStage::Authentication,
-                    StatusCode::NOT_FOUND,
-                    "User not found",
-                    "User not found",
-                )
-            })?;
-        if bool_field(&user, "active") == Some(false) {
-            return Err(super::auth::unauthorized("User is inactive"));
-        }
-
-        let enforce_admin_sub = std::env::var("ENFORCE_ADMIN_SUBSCRIPTION")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or_else(|_| {
-                api.get("enforce_admin_subscription")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
-            });
-
-        enforce_subscription(
-            &format!("{}/{}", route.api_name, route.api_version),
-            &user,
-            &documents.roles,
-            &documents.subscriptions,
-            enforce_admin_sub,
-        )?;
-        enforce_group_access(&api, &user)?;
-        enforce_rate_limit(
-            username,
-            &user,
-            &runtime.rate_counter,
-            &runtime.rate_bucket_counter,
-            request.now_millis,
-        )?;
-        let throttle = enforce_throttle(
-            username,
-            &user,
-            &runtime.throttle_counter,
-            request.now_millis,
-        )?;
-        enforce_allowed_roles(&api, &user)?;
-        enforce_pre_request_limit(
-            username,
-            &user,
-            &runtime.bandwidth_counter,
-            request.now_millis / 1000,
-            request.content_length,
-        )?;
+    if let Some((username, throttle_delay_ms)) = authenticated {
         let credit = evaluate_credits(
             &api,
-            Some(username),
+            Some(&username),
             &documents.credit_defs,
             &documents.user_credits,
         )?;
-        decision.username = Some(username.to_owned());
-        decision.throttle_delay_ms = throttle.delay_ms;
+        decision.throttle_delay_ms = throttle_delay_ms;
         decision.credit_required = credit.required;
         decision.credit_group = string_field(&api, "api_credit_group").map(str::to_owned);
         decision.credit_header_name = credit.header_name;
         decision.credit_header_value = credit.header_value;
         decision.user_credit_header_value = credit.user_header_value;
+        decision.username = Some(username);
     }
-
-    decision.tier_username = decision.username.clone().or_else(|| {
-        verify_request_token(&request.headers, storage_config)
-            .ok()
-            .and_then(|claims| claims.sub)
-    });
+    decision.tier_username = tier_username;
 
     let client_key = request
         .headers
@@ -296,6 +396,33 @@ pub fn evaluate_rest_policy(
         &route.endpoint_uri,
         client_key,
     ) {
+        let profile =
+            select_upstream_profile(&api, endpoint.as_ref(), &upstream.url).map_err(|_| {
+                PolicyFailure::new(
+                    PolicyStage::Resolution,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "Upstream TLS binding is invalid",
+                )
+            })?;
+        if let Some(id) = profile.as_deref() {
+            if !matches!(
+                url::Url::parse(&upstream.url)
+                    .ok()
+                    .map(|url| url.scheme().to_owned())
+                    .as_deref(),
+                Some("https" | "grpcs")
+            ) || !runtime.tls_profiles.upstreams.contains_key(id)
+            {
+                return Err(PolicyFailure::new(
+                    PolicyStage::Resolution,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "Upstream TLS profile is unavailable",
+                ));
+            }
+        }
+        decision.upstream_tls_profile_id = profile;
         decision.upstream = Some(upstream.url);
         decision.routing_key = Some(upstream.key);
         decision.routing_servers = upstream.servers;
@@ -303,6 +430,27 @@ pub fn evaluate_rest_policy(
     }
 
     Ok(Some(decision))
+}
+
+fn client_tls_failure(failure: ClientTlsFailure) -> PolicyFailure {
+    let (status, code, message) = match failure {
+        ClientTlsFailure::Missing => (
+            StatusCode::UNAUTHORIZED,
+            "TLS001",
+            "Client certificate required",
+        ),
+        ClientTlsFailure::Invalid => (
+            StatusCode::FORBIDDEN,
+            "TLS002",
+            "Client certificate is not authorized",
+        ),
+        ClientTlsFailure::Configuration => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TLS003",
+            "Client TLS policy is unavailable",
+        ),
+    };
+    PolicyFailure::new(PolicyStage::Authentication, status, code, message)
 }
 
 fn default_http_read_timeout_ms() -> u64 {
@@ -349,9 +497,9 @@ pub async fn evaluate_shared_effects(
             })?;
 
         let rate_enabled = bool_field_default(user, "rate_limit_enabled", false)
-            || user.get("rate_limit_duration").is_some();
+            || super::rate_limit::truthy_count(user, "rate_limit_duration").is_some();
         if rate_enabled {
-            let limit = u64_field(user, "rate_limit_duration").unwrap_or(60);
+            let limit = super::rate_limit::truthy_count(user, "rate_limit_duration").unwrap_or(60);
             let window = super::rate_limit::duration_to_seconds(
                 string_field(user, "rate_limit_duration_type").unwrap_or("minute"),
             )
@@ -369,17 +517,18 @@ pub async fn evaluate_shared_effects(
         }
 
         let throttle_enabled = bool_field_default(user, "throttle_enabled", false)
-            || user.get("throttle_duration").is_some()
-            || user.get("throttle_queue_limit").is_some();
+            || super::rate_limit::truthy_count(user, "throttle_duration").is_some()
+            || super::rate_limit::truthy_count(user, "throttle_queue_limit").is_some();
         if throttle_enabled {
-            let limit = u64_field(user, "throttle_duration").unwrap_or(10);
+            let limit = super::rate_limit::truthy_count(user, "throttle_duration").unwrap_or(10);
             let window = super::rate_limit::duration_to_seconds(
                 string_field(user, "throttle_duration_type").unwrap_or("second"),
             )
             .max(1);
             let key = throttle_key(username, request.now_millis / (window * 1000));
             let count = shared_counter(storage, &key, window, mutate).await?;
-            let queue_limit = u64_field(user, "throttle_queue_limit").unwrap_or(10);
+            let queue_limit =
+                super::rate_limit::truthy_count(user, "throttle_queue_limit").unwrap_or(10);
             let excess = count.saturating_sub(limit);
             if queue_limit > 0 && (count > queue_limit || excess > queue_limit) {
                 return Err(PolicyFailure::new(
@@ -397,21 +546,20 @@ pub async fn evaluate_shared_effects(
         if bool_field(user, "bandwidth_limit_enabled") != Some(false) {
             if let Some(limit) = u64_field(user, "bandwidth_limit_bytes").filter(|limit| *limit > 0)
             {
-                let window = super::rate_limit::duration_to_seconds(
+                let window = super::bandwidth::window_seconds(
                     string_field(user, "bandwidth_limit_window").unwrap_or("day"),
-                )
-                .max(1);
+                );
                 let now_seconds = request.now_millis / 1000;
                 let bucket = (now_seconds / window) * window;
                 let key = bandwidth_key(username, window, bucket);
-                let total = storage
+                let used = storage
                     .current_counter(&key)
                     .await
-                    .map_err(storage_failure)?
-                    .saturating_add(request.content_length);
+                    .map_err(storage_failure)?;
+                let total = used.saturating_add(request.content_length);
                 decision.bandwidth_key = Some(key);
                 decision.bandwidth_ttl_seconds = Some(window);
-                if total > limit {
+                if used >= limit || total > limit {
                     return Err(PolicyFailure::new(
                         PolicyStage::Bandwidth,
                         StatusCode::TOO_MANY_REQUESTS,
@@ -503,8 +651,7 @@ fn storage_failure(error: crate::storage::runtime::StorageError) -> PolicyFailur
 
 fn endpoint_exists(endpoints: &[Value], api: &Value, method: &str, endpoint_uri: &str) -> bool {
     endpoints.iter().any(|endpoint| {
-        let same_api = string_field(endpoint, "api_name") == string_field(api, "api_name")
-            && string_field(endpoint, "api_version") == string_field(api, "api_version");
+        let same_api = endpoint_belongs_to_api(endpoint, api);
         let same_method = string_field(endpoint, "endpoint_method")
             .is_some_and(|actual| actual.eq_ignore_ascii_case(method));
         let uri =
@@ -513,6 +660,19 @@ fn endpoint_exists(endpoints: &[Value], api: &Value, method: &str, endpoint_uri:
             && same_method
             && uri.is_some_and(|pattern| endpoint_pattern_matches(pattern, endpoint_uri))
     })
+}
+
+fn endpoint_belongs_to_api(endpoint: &Value, api: &Value) -> bool {
+    match (
+        string_field(endpoint, "api_id"),
+        string_field(api, "api_id"),
+    ) {
+        (Some(endpoint_id), Some(api_id)) => endpoint_id == api_id,
+        _ => {
+            string_field(endpoint, "api_name") == string_field(api, "api_name")
+                && string_field(endpoint, "api_version") == string_field(api, "api_version")
+        }
+    }
 }
 
 fn optional_string_list(value: &Value, field: &str) -> Option<Vec<String>> {
@@ -526,6 +686,10 @@ fn optional_string_list(value: &Value, field: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn is_revoked(revocations: &[Value], username: &str, jti: Option<&str>) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     revocations
         .iter()
         .any(|revocation| match string_field(revocation, "type") {
@@ -536,6 +700,10 @@ pub(crate) fn is_revoked(revocations: &[Value], username: &str, jti: Option<&str
             Some("jti") => {
                 string_field(revocation, "username") == Some(username)
                     && jti.is_some_and(|jti| string_field(revocation, "jti") == Some(jti))
+                    && revocation
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|expires_at| expires_at > now)
             }
             _ => false,
         })
@@ -546,6 +714,29 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn expired_or_malformed_jti_revocations_do_not_block_requests() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"old", "expires_at": now})],
+            "alice",
+            Some("old")
+        ));
+        assert!(!is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"missing"})],
+            "alice",
+            Some("missing")
+        ));
+        assert!(is_revoked(
+            &[json!({"type":"jti", "username":"alice", "jti":"live", "expires_at": now + 60})],
+            "alice",
+            Some("live")
+        ));
+    }
 
     #[test]
     fn mixed_settings_records_cannot_override_api_proxy_policy() {
@@ -573,6 +764,12 @@ mod tests {
             direct_ip: Some("10.0.0.2".parse().unwrap()),
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: true,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -623,6 +820,12 @@ mod tests {
             direct_ip: None,
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: true,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -632,6 +835,45 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.error_code, "GTW003");
+    }
+
+    #[test]
+    fn returns_no_endpoints_for_api_without_registered_endpoints() {
+        let mut documents = PolicyDocuments {
+            apis: vec![json!({
+                "api_id": "api-1",
+                "api_name": "demo",
+                "api_version": "v1",
+                "api_public": true,
+            })],
+            ..Default::default()
+        };
+        let request = PolicyRequest {
+            method: Method::GET,
+            path: "/api/rest/demo/v1/missing".to_owned(),
+            headers: HeaderMap::new(),
+            direct_ip: None,
+            now_millis: 0,
+            content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: true,
+        };
+        let failure = evaluate_rest_policy(
+            &mut documents,
+            &request,
+            &SharedStorageConfig::default(),
+            &PolicyRuntime::default(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error_code, "GTW002");
+        assert_eq!(
+            failure.error_message,
+            "No endpoints found for the requested API"
+        );
     }
 
     #[test]
@@ -665,6 +907,12 @@ mod tests {
             direct_ip: None,
             now_millis: 0,
             content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: true,
         };
         let decision = evaluate_rest_policy(
             &mut documents,

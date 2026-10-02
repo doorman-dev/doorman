@@ -91,8 +91,12 @@ async fn external_storage_shares_mongo_documents_and_redis_state() {
         .unwrap();
     assert!(first.find_one("apis", &id_filter).await.unwrap().is_some());
     let marker = format!("external-{nonce}");
+    let marker_id = format!("{marker}-id");
     first
-        .insert_one("apis", json!({"api_name": marker, "api_version": "v1"}))
+        .insert_one(
+            "apis",
+            json!({"api_name": marker, "api_version": "v1", "api_id": marker_id}),
+        )
         .await
         .unwrap();
     assert!(
@@ -102,9 +106,13 @@ async fn external_storage_shares_mongo_documents_and_redis_state() {
             .unwrap()
             .is_some()
     );
+    // The unique api_id index is enforced across connections.
     assert!(
         second
-            .insert_one("apis", json!({"api_name": marker, "api_version": "v1"}))
+            .insert_one(
+                "apis",
+                json!({"api_name": marker, "api_version": "v2", "api_id": marker_id}),
+            )
             .await
             .is_err()
     );
@@ -659,8 +667,14 @@ message HelloReply { string message = 1; }
                 .method(Method::POST)
                 .uri(format!("/platform/proto/{api_name}/{api_version}"))
                 .header(header::COOKIE, &cookie)
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(proto))
+                // The upload is a multipart `file` part (FastAPI UploadFile).
+                .header(
+                    header::CONTENT_TYPE,
+                    "multipart/form-data; boundary=external-proto-boundary",
+                )
+                .body(Body::from(format!(
+                    "--external-proto-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"service.proto\"\r\nContent-Type: application/octet-stream\r\n\r\n{proto}\r\n--external-proto-boundary--\r\n"
+                )))
                 .unwrap(),
         )
         .await

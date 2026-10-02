@@ -38,7 +38,11 @@ pub fn transform_response(
     let status = direction
         .get("status_map")
         .and_then(|mapping| mapping.get(status.as_u16().to_string()))
-        .and_then(Value::as_u64)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
         .and_then(|value| u16::try_from(value).ok())
         .and_then(|value| StatusCode::from_u16(value).ok())
         .unwrap_or(status);
@@ -71,7 +75,7 @@ fn transform_headers(mut headers: HeaderMap, config: Option<&Value>) -> HeaderMa
         for (name, value) in add {
             let (Ok(name), Ok(value)) = (
                 HeaderName::try_from(name),
-                HeaderValue::from_str(value.as_str().unwrap_or(&value.to_string())),
+                HeaderValue::from_str(&python_string(value)),
             ) else {
                 continue;
             };
@@ -134,13 +138,20 @@ fn transform_query(query: Option<&str>, config: Option<&Value>) -> String {
     if let Some(add) = config.get("add").and_then(Value::as_object) {
         for (name, value) in add {
             pairs.retain(|(existing, _)| existing != name);
-            pairs.push((
-                name.clone(),
-                value.as_str().unwrap_or(&value.to_string()).to_owned(),
-            ));
+            pairs.push((name.clone(), python_string(value)));
         }
     }
     encode_query(&pairs)
+}
+
+fn python_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Null => "None".to_owned(),
+        value => value.to_string(),
+    }
 }
 
 fn encode_query(pairs: &[(String, String)]) -> String {
@@ -156,29 +167,32 @@ struct PathPart {
 }
 
 fn path_parts(path: &str) -> Option<Vec<PathPart>> {
-    let path = path.trim().strip_prefix("$.")?;
+    // Python: only "$." prefixed paths; each segment is either `word[digits]` or a plain key.
+    let path = path.strip_prefix("$.")?;
     let mut parts = Vec::new();
     for raw in path.split('.') {
         if raw.is_empty() {
             continue;
         }
-        let (field, index) = if let Some((field, raw_index)) = raw.split_once('[') {
-            let index = raw_index.strip_suffix(']')?.parse().ok()?;
-            (field, Some(index))
-        } else {
-            (raw, None)
-        };
-        if field.is_empty()
-            || !field
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            return None;
-        }
-        parts.push(PathPart {
-            field: field.to_owned(),
-            index,
+        let indexed = raw.strip_suffix(']').and_then(|head| {
+            let (field, digits) = head.split_once('[')?;
+            let word = !field.is_empty()
+                && field
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_');
+            let numeric = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+            (word && numeric).then_some((field, digits))
         });
+        match indexed {
+            Some((field, digits)) => parts.push(PathPart {
+                field: field.to_owned(),
+                index: Some(digits.parse().ok()?),
+            }),
+            None => parts.push(PathPart {
+                field: raw.to_owned(),
+                index: None,
+            }),
+        }
     }
     (!parts.is_empty()).then_some(parts)
 }
@@ -296,6 +310,25 @@ mod tests {
             Some(&config),
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let config = serde_json::json!({"request": {
+            "headers": {"add": {"x-enabled": true, "x-empty": null}},
+            "query": {"add": {"enabled": false}}
+        }});
+        let (headers, _, query) =
+            transform_request(HeaderMap::new(), Vec::new(), None, Some(&config));
+        assert_eq!(headers["x-enabled"], "True");
+        assert_eq!(headers["x-empty"], "None");
+        assert_eq!(query, "enabled=False");
+
+        let config = serde_json::json!({"response": {"status_map": {"500": "502"}}});
+        let (_, _, status) = transform_response(
+            HeaderMap::new(),
+            Vec::new(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(&config),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -316,5 +349,26 @@ mod tests {
         assert_eq!(value["items"][1]["renamed"], "value");
         assert_eq!(value["items"][2]["created"], true);
         assert_eq!(value["tags"], serde_json::json!(["old", "new"]));
+    }
+
+    #[test]
+    fn jsonpath_segments_accept_any_plain_key_like_python() {
+        let config = serde_json::json!({"request": {"body": {
+            "remove": ["$.a-b"],
+            "set": {"$.first-name": "x", "$.p q.r": 1},
+            "rename": {"$.old key": "$.new-key"}
+        }}});
+        let (_, body, _) = transform_request(
+            HeaderMap::new(),
+            br#"{"a-b":1,"old key":"v"}"#.to_vec(),
+            None,
+            Some(&config),
+        );
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("a-b").is_none());
+        assert_eq!(value["first-name"], "x");
+        assert_eq!(value["p q"]["r"], 1);
+        assert_eq!(value["new-key"], "v");
+        assert!(value.get("old key").is_none());
     }
 }

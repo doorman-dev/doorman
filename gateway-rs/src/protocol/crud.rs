@@ -50,6 +50,7 @@ pub async fn execute(
     }
     let query = request.uri().query().unwrap_or_default().to_owned();
     let request_path = request.uri().path().to_owned();
+    let is_get = request.method() == http::Method::GET;
     let grpc_web_target = request
         .extensions()
         .get::<crate::routes::grpc_web::GrpcWebTarget>()
@@ -79,8 +80,8 @@ pub async fn execute(
     };
     let response = match protocol {
         DataPlaneProtocol::Graphql => execute_graphql(state, decision, &body).await,
-        DataPlaneProtocol::Soap => execute_soap(state, decision, &query, &body).await,
-        DataPlaneProtocol::Grpc => execute_grpc(state, decision, &query, &body).await,
+        DataPlaneProtocol::Soap => execute_soap(state, decision, is_get, &query, &body).await,
+        DataPlaneProtocol::Grpc => execute_grpc(state, decision, is_get, &query, &body).await,
         DataPlaneProtocol::GrpcWeb => {
             execute_grpc_web(
                 state,
@@ -99,6 +100,12 @@ pub async fn execute(
     };
     Ok(match response {
         Ok(response) => response,
+        // Python's CRUD SOAP handler turns every failure into a 500 fault that
+        // `process_soap_response` renders as the generic unknown-error message.
+        Err(error) if protocol == DataPlaneProtocol::Soap => {
+            tracing::debug!(error = %error, "SOAP CRUD failed");
+            soap_python_fault()
+        }
         Err(StorageError::InvalidDocument(error)) => {
             if protocol == DataPlaneProtocol::GrpcWeb {
                 crate::protocol::grpc::web_trailer_response(
@@ -320,14 +327,16 @@ async fn execute_graphql(
 async fn execute_soap(
     state: &AppState,
     decision: &PolicyDecision,
+    is_get: bool,
     query: &str,
     body: &[u8],
 ) -> Result<Response, StorageError> {
-    if query
-        .split('&')
-        .any(|part| part.eq_ignore_ascii_case("wsdl"))
+    if is_get
+        && query
+            .split('&')
+            .any(|part| part.split('=').next().is_some_and(|key| key == "wsdl"))
     {
-        return Ok(xml_response(StatusCode::OK, soap_wsdl(decision)));
+        return Ok(soap_xml_response(soap_wsdl(decision)));
     }
     let xml = std::str::from_utf8(body)
         .map_err(|error| StorageError::InvalidDocument(error.to_string()))?;
@@ -346,70 +355,68 @@ async fn execute_soap(
             "Invalid SOAP envelope".to_owned(),
         ));
     }
-    let operation = Regex::new(
-        r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(createItem|listItems|getItem|updateItem|deleteItem)\b",
-    )
-    .expect("static SOAP operation regex")
-    .captures(xml)
-    .and_then(|captures| captures.get(1))
-    .map(|value| value.as_str())
-    .ok_or_else(|| StorageError::InvalidDocument("Unknown SOAP CRUD operation".to_owned()))?;
+    // Python's CRUD SOAP handler implements only createItem and listItems;
+    // getItem is "not supported yet" and everything else is unknown.
+    static OPERATION: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(createItem|listItems)\b")
+            .expect("static SOAP operation regex")
+    });
+    let operation = OPERATION
+        .captures(xml)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str())
+        .ok_or_else(|| StorageError::InvalidDocument("Unknown SOAP CRUD operation".to_owned()))?;
     let (storage, collection) = storage_collection(state, decision)?;
-    let result = match operation {
-        "listItems" => Value::Array(storage.crud_list(collection).await?),
-        "getItem" => {
-            let id = xml_element(xml, "id")?;
-            storage
-                .crud_find_one(collection, &id)
-                .await?
-                .unwrap_or(Value::Null)
-        }
-        "createItem" => {
+    let (response_tag, result_xml) = match operation {
+        "listItems" => (
+            "listItemsResponse",
+            format!(
+                "<tns:items>{}</tns:items>",
+                python_json_dumps(&Value::Array(storage.crud_list(collection).await?))
+            ),
+        ),
+        _ => {
             let input = xml_element(xml, "input")?;
+            if input.is_empty() {
+                return Err(StorageError::InvalidDocument(
+                    "Missing input element or empty".to_owned(),
+                ));
+            }
             let mut input: Value = serde_json::from_str(&xml_unescape(&input))?;
+            if !input.is_object() {
+                return Err(StorageError::InvalidDocument(
+                    "SOAP CRUD input must be a JSON object".to_owned(),
+                ));
+            }
             validate_crud_schema(decision.crud_schema.as_ref(), &input, false)?;
             if input.get("_id").is_none() {
                 input["_id"] = Value::String(uuid::Uuid::new_v4().to_string());
             }
             storage.crud_insert(collection, &input).await?;
-            input
+            (
+                "createItemResponse",
+                format!("<tns:result>{}</tns:result>", python_json_dumps(&input)),
+            )
         }
-        "updateItem" => {
-            let id = xml_element(xml, "id")?;
-            let input = xml_element(xml, "input")?;
-            let input: Value = serde_json::from_str(&xml_unescape(&input))?;
-            validate_crud_schema(decision.crud_schema.as_ref(), &input, true)?;
-            storage
-                .crud_update(collection, &id, &input)
-                .await?
-                .unwrap_or(Value::Null)
-        }
-        "deleteItem" => {
-            let id = xml_element(xml, "id")?;
-            Value::Bool(storage.crud_delete(collection, &id).await?)
-        }
-        _ => unreachable!(),
     };
-    let response_tag = format!("{operation}Response");
-    let json = serde_json::to_string(&result)?;
-    Ok(xml_response(
-        StatusCode::OK,
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><tns:{response_tag} xmlns:tns=\"http://doorman.dev/crud\"><tns:result>{}</tns:result></tns:{response_tag}></soap:Body></soap:Envelope>",
-            xml_escape(&json)
-        ),
-    ))
+    let api_name = decision.api_name.as_deref().unwrap_or_default();
+    let tns = format!("http://doorman.dev/{}", xml_escape(api_name));
+    Ok(soap_xml_response(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:tns=\"{tns}\">\n    <soap:Body>\n        <tns:{response_tag}>\n            {result_xml}\n        </tns:{response_tag}>\n    </soap:Body>\n</soap:Envelope>"
+    )))
 }
 
 async fn execute_grpc(
     state: &AppState,
     decision: &PolicyDecision,
+    is_get: bool,
     query: &str,
     body: &[u8],
 ) -> Result<Response, StorageError> {
-    if query
-        .split('&')
-        .any(|part| part.eq_ignore_ascii_case("proto"))
+    if is_get
+        && query
+            .split('&')
+            .any(|part| part.split('=').next().is_some_and(|key| key == "proto"))
     {
         return Ok((
             StatusCode::OK,
@@ -497,9 +504,26 @@ fn storage_collection<'a>(
     Ok((storage, collection))
 }
 
+/// Patterns here are built from a small fixed set of operation and element
+/// names; compile each once instead of per request.
+fn cached_regex(pattern: String) -> Option<Regex> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
+        std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    if let Some(regex) = cache.get(&pattern) {
+        return Some(regex.clone());
+    }
+    let regex = Regex::new(&pattern).ok()?;
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(pattern, regex.clone());
+    Some(regex)
+}
+
 fn has_operation(query: &str, operation: &str) -> bool {
-    Regex::new(&format!(r"\b{}\b", regex::escape(operation)))
-        .is_ok_and(|regex| regex.is_match(query))
+    cached_regex(format!(r"\b{}\b", regex::escape(operation)))
+        .is_some_and(|regex| regex.is_match(query))
 }
 
 fn variable_string<'a>(
@@ -526,7 +550,7 @@ fn variable_object(
 }
 
 fn xml_element(xml: &str, name: &str) -> Result<String, StorageError> {
-    Regex::new(&format!(
+    cached_regex(format!(
         r"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?{0}\b[^>]*>(.*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?{0}\s*>",
         regex::escape(name)
     ))
@@ -565,17 +589,171 @@ fn xml_response(status: StatusCode, body: String) -> Response {
 }
 
 fn soap_wsdl(decision: &PolicyDecision) -> String {
-    let name = xml_escape(decision.api_name.as_deref().unwrap_or("Crud"));
+    let name = xml_escape(decision.api_name.as_deref().unwrap_or_default());
+    let tns = format!("http://doorman.dev/{name}");
     format!(
-        "<?xml version=\"1.0\"?><definitions xmlns=\"http://schemas.xmlsoap.org/wsdl/\" xmlns:soap=\"http://schemas.xmlsoap.org/wsdl/soap/\" name=\"{name}Service\"><portType name=\"{name}PortType\"><operation name=\"createItem\"/><operation name=\"listItems\"/><operation name=\"getItem\"/><operation name=\"updateItem\"/><operation name=\"deleteItem\"/></portType></definitions>"
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"
+             xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+             xmlns:tns="{tns}"
+             xmlns:xs="http://www.w3.org/2001/XMLSchema"
+             name="{name}Service"
+             targetNamespace="{tns}">
+             
+    <types>
+        <xs:schema targetNamespace="{tns}" elementFormDefault="qualified">
+            <xs:element name="createItem">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="input" type="xs:string"/> <!-- Simplified: Pass JSON string for now or generate fields -->
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+            <xs:element name="createItemResponse">
+                <xs:complexType>
+                    <xs:sequence>
+                       <xs:element name="result" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+             <xs:element name="listItems">
+                <xs:complexType/>
+            </xs:element>
+            <xs:element name="listItemsResponse">
+                <xs:complexType>
+                     <xs:sequence>
+                        <xs:element name="items" type="xs:string"/>
+                     </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>
+    </types>
+
+    <message name="createItemRequest">
+        <part name="parameters" element="tns:createItem"/>
+    </message>
+    <message name="createItemResponse">
+        <part name="parameters" element="tns:createItemResponse"/>
+    </message>
+    <message name="listItemsRequest">
+        <part name="parameters" element="tns:listItems"/>
+    </message>
+    <message name="listItemsResponse">
+        <part name="parameters" element="tns:listItemsResponse"/>
+    </message>
+
+    <portType name="{name}PortType">
+        <operation name="createItem">
+            <input message="tns:createItemRequest"/>
+            <output message="tns:createItemResponse"/>
+        </operation>
+        <operation name="listItems">
+             <input message="tns:listItemsRequest"/>
+             <output message="tns:listItemsResponse"/>
+        </operation>
+    </portType>
+
+    <binding name="{name}Binding" type="tns:{name}PortType">
+        <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+        <operation name="createItem">
+            <soap:operation soapAction="{tns}/createItem"/>
+            <input><soap:body use="literal"/></input>
+            <output><soap:body use="literal"/></output>
+        </operation>
+        <operation name="listItems">
+            <soap:operation soapAction="{tns}/listItems"/>
+            <input><soap:body use="literal"/></input>
+            <output><soap:body use="literal"/></output>
+        </operation>
+    </binding>
+
+    <service name="{name}Service">
+        <port name="{name}Port" binding="tns:{name}Binding">
+            <soap:address location="http://localhost:8080/api/soap/{name}"/>
+        </port>
+    </service>
+</definitions>
+        "#
     )
 }
 
+/// `text/xml` response carrying the raw body, as Python's SOAP CRUD returns it.
+fn soap_xml_response(body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], body).into_response()
+}
+
+/// What `process_soap_response` renders for the CRUD handler's 500 fault.
+fn soap_python_fault() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, "text/xml")],
+        "<message>An unknown error occurred in SOAP response</message>",
+    )
+        .into_response()
+}
+
+/// Python `json.dumps` defaults: `", "` / `": "` separators and ASCII escaping.
+fn python_json_dumps(value: &Value) -> String {
+    fn dump(value: &Value, out: &mut String) {
+        match value {
+            Value::Null => out.push_str("null"),
+            Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            Value::Number(number) => out.push_str(&number.to_string()),
+            Value::String(text) => dump_string(text, out),
+            Value::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    dump(item, out);
+                }
+                out.push(']');
+            }
+            Value::Object(map) => {
+                out.push('{');
+                for (index, (key, item)) in map.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    dump_string(key, out);
+                    out.push_str(": ");
+                    dump(item, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+    fn dump_string(text: &str, out: &mut String) {
+        out.push('"');
+        for character in text.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                character if (' '..='~').contains(&character) => out.push(character),
+                character => {
+                    let mut units = [0u16; 2];
+                    for unit in character.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+        }
+        out.push('"');
+    }
+    let mut out = String::new();
+    dump(value, &mut out);
+    out
+}
+
 fn crud_proto(decision: &PolicyDecision) -> String {
-    let mut package = decision
-        .api_name
-        .as_deref()
-        .unwrap_or("crud")
+    let raw = decision.api_name.as_deref().unwrap_or_default();
+    let mut package = raw
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {
@@ -585,13 +763,42 @@ fn crud_proto(decision: &PolicyDecision) -> String {
             }
         })
         .collect::<String>();
-    if package.is_empty() {
-        package.push_str("crud");
-    } else if package.starts_with(|character: char| character.is_ascii_digit()) {
+    let mut service = package.chars();
+    let service = service
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + &service.as_str().to_lowercase())
+        .unwrap_or_default();
+    if package.starts_with(|character: char| character.is_ascii_digit()) {
         package.insert(0, '_');
     }
+    let type_map = |declared: &str| match declared {
+        "number" => "double",
+        "integer" => "int32",
+        "boolean" => "bool",
+        "array" => "repeated string",
+        _ => "string",
+    };
+    let fields = decision
+        .crud_schema
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|schema| {
+            schema
+                .iter()
+                .enumerate()
+                .map(|(index, (field, rules))| {
+                    let declared = rules
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string");
+                    format!("  {} {field} = {};", type_map(declared), index + 1)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     format!(
-        "syntax = \"proto3\";\npackage {package};\nservice CrudService {{ rpc CreateItem (CrudRequest) returns (CrudReply); rpc ListItems (CrudRequest) returns (CrudReply); rpc GetItem (CrudRequest) returns (CrudReply); rpc UpdateItem (CrudRequest) returns (CrudReply); rpc DeleteItem (CrudRequest) returns (CrudReply); }}\nmessage CrudRequest {{ string id = 1; string input = 2; }}\nmessage CrudReply {{ string result = 1; bool ok = 2; }}\n"
+        "syntax = \"proto3\";\n\npackage {package};\n\nservice {service}Service {{\n  rpc CreateItem (CreateItemRequest) returns (CreateItemResponse);\n  rpc ListItems (ListItemsRequest) returns (ListItemsResponse);\n}}\n\nmessage CreateItemRequest {{\n{fields}\n}}\n\nmessage CreateItemResponse {{\n  string result = 1; // JSON string of created object\n}}\n\nmessage ListItemsRequest {{}}\n\nmessage ListItemsResponse {{\n  string items = 1; // JSON string of list\n}}\n"
     )
 }
 
@@ -633,32 +840,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_all_crud_operations() {
+    fn discovery_documents_match_python_templates() {
         let decision = PolicyDecision {
             api_name: Some("customer-api".to_owned()),
+            crud_schema: Some(serde_json::json!({
+                "name": {"type": "string"}, "age": {"type": "integer"},
+                "score": {"type": "number"}, "ok": {"type": "boolean"},
+                "tags": {"type": "array"}, "meta": {"type": "object"}
+            })),
             ..Default::default()
         };
         let wsdl = soap_wsdl(&decision);
-        let proto = crud_proto(&decision);
-        for operation in [
-            "createItem",
-            "listItems",
-            "getItem",
-            "updateItem",
-            "deleteItem",
-        ] {
-            assert!(wsdl.contains(operation));
-        }
-        for operation in [
-            "CreateItem",
-            "ListItems",
-            "GetItem",
-            "UpdateItem",
-            "DeleteItem",
-        ] {
-            assert!(proto.contains(operation));
-        }
-        assert!(proto.contains("package customer_api;"));
+        assert!(
+            wsdl.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<definitions xmlns=")
+        );
+        assert!(wsdl.contains(
+            "targetNamespace=\"http://doorman.dev/customer-api\">\n             \n    <types>"
+        ));
+        assert!(wsdl.contains("location=\"http://localhost:8080/api/soap/customer-api\""));
+        assert!(wsdl.ends_with("</definitions>\n        "));
+        assert!(!wsdl.contains("getItem"));
+        assert_eq!(
+            crud_proto(&decision),
+            include_str!("../../tests/fixtures/crud_customer_api.proto")
+        );
+    }
+
+    #[test]
+    fn python_json_dumps_matches_json_dumps_defaults() {
+        let value =
+            serde_json::json!({"a": [1, 2.5, null, true], "n": "caf\u{e9} \u{1f600}\n\"q\""});
+        assert_eq!(
+            python_json_dumps(&value),
+            r#"{"a": [1, 2.5, null, true], "n": "caf\u00e9 \ud83d\ude00\n\"q\""}"#
+        );
     }
 
     #[test]

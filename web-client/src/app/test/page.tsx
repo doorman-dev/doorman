@@ -37,7 +37,7 @@ export default function TestPage() {
   }, [])
 
   return (
-    <div className="p-8">
+    <main className="p-8">
       <h1 className="text-2xl font-bold mb-4">Authentication Test</h1>
 
       <div className="mb-4">
@@ -89,6 +89,6 @@ export default function TestPage() {
           {cookies || 'No cookies found'}
         </pre>
       </div>
-    </div>
+    </main>
   )
 }

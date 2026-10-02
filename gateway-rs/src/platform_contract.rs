@@ -46,8 +46,9 @@ const BOOL_FIELDS: &[&str] = &[
     "api_graphql_subscriptions",
     "api_grpc_web_enabled",
     "api_is_crud",
-    "enforce_admin_subscription",
 ];
+
+const RUST_EXTENSION_BOOL_FIELDS: &[&str] = &["enforce_admin_subscription"];
 
 const INT_FIELDS: &[&str] = &["api_allowed_retry_count", "api_graphql_max_depth"];
 
@@ -59,6 +60,9 @@ const OBJECT_FIELDS: &[&str] = &[
 ];
 
 const RUST_EXTENSION_FIELDS: &[&str] = &[
+    "api_client_tls_policy",
+    "api_upstream_tls_profile",
+    "api_upstream_tls_profiles",
     "api_wsdl_content",
     "api_openapi_schema",
     "api_graphql_schema",
@@ -106,7 +110,15 @@ pub fn normalize_create_api(payload: &Value) -> Result<Value, Vec<Value>> {
 pub fn normalize_update_api(payload: &Value) -> Result<Value, Vec<Value>> {
     let mut normalized = normalize_api_fields(payload, true)?;
     if let Some(values) = normalized.as_object_mut() {
-        values.retain(|_, value| !value.is_null());
+        values.retain(|field, value| {
+            !value.is_null()
+                || matches!(
+                    field.as_str(),
+                    "api_client_tls_policy"
+                        | "api_upstream_tls_profile"
+                        | "api_upstream_tls_profiles"
+                )
+        });
     }
     Ok(normalized)
 }
@@ -175,6 +187,9 @@ fn normalize_api_fields(payload: &Value, update: bool) -> Result<Value, Vec<Valu
         );
     }
     for field in BOOL_FIELDS {
+        normalize_optional(input, &mut output, &mut errors, field, coerce_bool, "bool");
+    }
+    for field in RUST_EXTENSION_BOOL_FIELDS {
         normalize_optional(input, &mut output, &mut errors, field, coerce_bool, "bool");
     }
     for field in INT_FIELDS {
@@ -386,7 +401,19 @@ mod tests {
         assert_eq!(value["api_allowed_roles"], json!([]));
         assert_eq!(value["api_auth_required"], true);
         assert_eq!(value["api_description"], Value::Null);
+        assert!(value.get("enforce_admin_subscription").is_none());
         assert!(value.get("unknown").is_none());
+    }
+
+    #[test]
+    fn rust_extension_bool_is_coerced_without_becoming_a_python_default() {
+        let value = normalize_create_api(&json!({
+            "api_name": "orders",
+            "api_version": "v1",
+            "enforce_admin_subscription": "yes"
+        }))
+        .unwrap();
+        assert_eq!(value["enforce_admin_subscription"], true);
     }
 
     #[test]
@@ -394,10 +421,16 @@ mod tests {
         let value = normalize_update_api(&json!({
             "api_name": 123,
             "api_public": "yes",
-            "api_description": null
+            "api_description": null,
+            "api_client_tls_policy": null,
+            "api_upstream_tls_profile": null
         }))
         .unwrap();
-        assert_eq!(value, json!({"api_name": "123", "api_public": true}));
+        assert_eq!(
+            value,
+            json!({"api_name": "123", "api_public": true,
+            "api_client_tls_policy": null, "api_upstream_tls_profile": null})
+        );
     }
 
     #[test]

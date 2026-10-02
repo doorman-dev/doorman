@@ -135,7 +135,7 @@ async fn parity_test_user_onboarding_and_auth_flows() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/platform/users")
+                .uri("/platform/user")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -158,7 +158,7 @@ async fn parity_test_user_onboarding_and_auth_flows() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/platform/users")
+                .uri("/platform/user")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -227,9 +227,8 @@ async fn parity_test_developer_tools_chaos_and_simulator() {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
+                        "backend": "redis",
                         "enabled": true,
-                        "latency_ms": 10,
-                        "error_status": 503
                     })
                     .to_string(),
                 ))
@@ -254,7 +253,7 @@ async fn parity_test_developer_tools_chaos_and_simulator() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["enabled"], true);
+    assert_eq!(body["redis_outage"], true);
 
     let response = app
         .clone()

@@ -46,6 +46,7 @@ impl MemoryStorage {
             "user_tier_assignments",
             "rate_limit_rules",
             "config_snapshots",
+            "tls_profiles",
         ] {
             collections.insert(name.to_owned(), Vec::new());
         }

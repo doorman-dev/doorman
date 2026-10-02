@@ -79,6 +79,18 @@ pub async fn track_active_requests(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0.ip().to_string());
+    let user_agent = request
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    // Python's SecurityAuditMiddleware._should_audit: every modification
+    // method anywhere, plus every /platform/* request (its own comment notes
+    // the narrower vault/auth/tiers checks are already subsumed by this
+    // catch-all, since those paths all start with /platform/ too).
+    let should_audit_platform_request =
+        matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH")
+            || path.starts_with("/platform/");
     let record_analytics = path.starts_with("/api/") || path.starts_with("/grpc-web/");
     let bytes_in = estimated_request_size(&request);
     let is_test = test_request(request.headers());
@@ -106,8 +118,24 @@ pub async fn track_active_requests(
         .active_requests
         .fetch_sub(1, Ordering::Relaxed);
     observe_request(&state.runtime, elapsed, status);
-    let fallback_api = api_key(&path);
+    // Only fall back to a path-derived API key for a response the gateway
+    // actually handled. A bare 404 means the route never resolved to a real
+    // API (context.api was never set), so recording analytics for it would
+    // fabricate a data point Python never produces -- its equivalent crashes
+    // deep in the service before any metrics are recorded for an unknown API.
+    let fallback_api = (status != 404).then(|| api_key(&path)).flatten();
     let effective_api = context.api.as_deref().or(fallback_api.as_deref());
+
+    if should_audit_platform_request {
+        crate::observability::audit::platform_request(
+            context.username.as_deref().unwrap_or("anonymous"),
+            &method,
+            &path,
+            status,
+            elapsed.as_secs_f64() * 1000.0,
+            user_agent.as_deref(),
+        );
+    }
 
     if record_analytics {
         state
@@ -137,8 +165,11 @@ pub async fn track_active_requests(
                 .as_secs()
                 / 60
                 * 60;
-            if let Err(error) = storage
-                .record_gateway_metric(GatewayMetric {
+            // Analytics are best-effort: never hold the response on a slow or
+            // unreachable store.
+            let recorded = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                storage.record_gateway_metric(GatewayMetric {
                     minute_start,
                     status,
                     duration_micros: elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -148,15 +179,23 @@ pub async fn track_active_requests(
                     username: context.username.as_deref(),
                     endpoint: context.endpoint.as_deref().or(Some(path.as_str())),
                     is_test,
-                })
-                .await
-            {
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::storage::runtime::StorageError::InvalidDocument(
+                    "analytics store timed out".to_owned(),
+                ))
+            });
+            if let Err(error) = recorded {
                 tracing::warn!(error = %error, "failed to persist gateway analytics bucket");
             }
         }
     }
 
-    if let Some(logs_dir) = state.config.logs_dir.as_deref() {
+    if state.config.logs_enabled
+        && let Some(logs_dir) = state.config.logs_dir.as_deref()
+    {
         let endpoint = context.endpoint.as_deref().unwrap_or(&path);
         let upstream = context
             .upstream

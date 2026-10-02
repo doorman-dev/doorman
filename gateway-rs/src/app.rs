@@ -4,20 +4,25 @@ use axum::{
     routing::{any, get},
 };
 use http::StatusCode;
+use std::any::Any;
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove},
+    compression::{
+        CompressionLayer, CompressionLevel,
+        predicate::{Predicate, SizeAbove},
+    },
     trace::TraceLayer,
 };
 
 use crate::{
     middleware::{
         activity::track_active_requests,
-        chaos::chaos_middleware,
+        chaos::{chaos_middleware, latency_injection},
         platform_cors::{force_platform_vary, platform_cors},
         request_id::request_id,
         response_compat::response_compat,
         security_headers::security_headers,
+        websocket_reject::reject_disabled_websockets,
     },
     policy::PolicyErrorBody,
     routes::{
@@ -25,7 +30,7 @@ use crate::{
         grpc::grpc_policy_then_execute,
         grpc_web::grpc_web_policy_then_execute,
         metrics::metrics,
-        operations::{caches, health, status},
+        operations::{caches, features, health, status},
         platform::platform_dispatch,
         rest::rest_policy_then_proxy,
         soap::soap_policy_then_execute,
@@ -43,16 +48,29 @@ pub fn build_router(state: AppState) -> Router {
         // Starlette treats the legacy gateway responses as streaming and emits
         // gzip whenever the client accepts it, even below its configured size.
         // Preserve that observed public wire contract during the Rust cutover.
-        .compress_when(SizeAbove::new(1));
+        .compress_when(SizeAbove::new(1).and(
+            |_: http::StatusCode,
+             _: http::Version,
+             _: &http::HeaderMap,
+             extensions: &http::Extensions| {
+                extensions
+                    .get::<crate::middleware::body_limit::NoCompression>()
+                    .is_none()
+            },
+        ));
     let api = Router::new()
         .route("/rest/{*path}", any(rest_policy_then_proxy))
         .route("/graphql/{*path}", any(graphql_policy_then_execute))
         .route("/soap/{*path}", any(soap_policy_then_execute))
         .route("/grpc/{*path}", any(grpc_policy_then_execute))
         .route("/health", any(health))
+        .route("/features", get(features))
         .route("/status", any(status))
         .route("/caches", any(caches))
         .fallback(gateway_route_not_found)
+        .layer(axum_middleware::from_fn(
+            crate::routes::platform::gateway_route_guard,
+        ))
         .layer(axum_middleware::from_fn(chaos_middleware))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -84,7 +102,7 @@ pub fn build_router(state: AppState) -> Router {
                     .collect::<std::sync::Arc<[_]>>(),
             ),
         )
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::custom(handle_panic));
     let platform = Router::new()
         .route("/", any(platform_dispatch))
         .route("/{*path}", any(platform_dispatch))
@@ -119,20 +137,45 @@ pub fn build_router(state: AppState) -> Router {
                     .collect::<std::sync::Arc<[_]>>(),
             ),
         )
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::custom(handle_panic));
 
-    Router::new()
-        .nest("/api", api)
-        .nest("/platform", platform)
+    // gRPC-Web shares the data-plane guard and response headers.
+    let grpc_web = Router::new()
         .route(
             "/grpc-web/{api_name}/{service}/{method}",
             any(grpc_web_policy_then_execute),
         )
+        .layer(axum_middleware::from_fn(
+            crate::routes::platform::gateway_route_guard,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
+        .layer(axum_middleware::from_fn(request_id));
+    Router::new()
+        .nest("/api", api)
+        .nest("/platform", platform)
+        .merge(grpc_web)
         .route("/metrics", get(metrics))
-        .fallback(not_found)
+        // Unknown paths still carry the platform response headers.
+        .fallback_service(
+            Router::new()
+                .fallback(not_found)
+                .layer(axum_middleware::from_fn_with_state(
+                    state.clone(),
+                    security_headers,
+                ))
+                .with_state(state.clone()),
+        )
+        .layer(axum_middleware::from_fn(latency_injection))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             track_active_requests,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            reject_disabled_websockets,
         ))
         .layer(compression)
         .layer(axum_middleware::from_fn(force_platform_vary))
@@ -145,6 +188,17 @@ async fn gateway_route_not_found() -> Response {
         Json(PolicyErrorBody {
             error_code: "GTW003".to_owned(),
             error_message: "Gateway route does not exist".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn handle_panic(_panic: Box<dyn Any + Send + 'static>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(PolicyErrorBody {
+            error_code: "ISE001".to_owned(),
+            error_message: "Internal Server Error".to_owned(),
         }),
     )
         .into_response()
@@ -173,6 +227,22 @@ async fn not_found(request: axum::extract::Request) -> Response {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[tokio::test]
+    async fn panic_handler_matches_python_internal_error_envelope() {
+        use http_body_util::BodyExt;
+
+        let response = handle_panic(Box::new("boom"));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error_code": "ISE001",
+                "error_message": "Internal Server Error"
+            })
+        );
+    }
 
     use axum::{
         body::{Body, to_bytes},

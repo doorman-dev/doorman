@@ -45,6 +45,10 @@ function buildRemotePatterns() {
 const nextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
+  // Gateway paths are proxied verbatim: some platform routes are registered
+  // with a trailing slash (e.g. /platform/tiers/) and the gateway redirects
+  // the unslashed form, so stripping the slash here would loop forever.
+  skipTrailingSlashRedirect: true,
   // Harden Next/Image to mitigate known issues around the optimization route
   images: {
     // Allow remote image hosts via env: NEXT_IMAGE_DOMAINS=cdn.example.com,images.example.org
@@ -66,7 +70,10 @@ const nextConfig = {
   },
   async rewrites() {
     return [
+      // Keep a trailing slash: the gateway distinguishes /platform/tiers/.
+      { source: '/platform/:path*/', destination: `${gatewayTarget}/platform/:path*/` },
       { source: '/platform/:path*', destination: `${gatewayTarget}/platform/:path*` },
+      { source: '/api/:path*/', destination: `${gatewayTarget}/api/:path*/` },
       { source: '/api/:path*', destination: `${gatewayTarget}/api/:path*` },
     ]
   },

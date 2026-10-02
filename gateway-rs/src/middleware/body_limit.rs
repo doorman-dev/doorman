@@ -1,5 +1,8 @@
 use std::env;
 
+#[derive(Clone, Copy, Debug)]
+pub struct NoCompression;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BodyLimits {
     pub default: usize,
@@ -64,9 +67,10 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// A negative limit (accepted by the pinned `int()` parse) rejects every body.
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .map_or(default, |value| usize::try_from(value).unwrap_or(0))
 }

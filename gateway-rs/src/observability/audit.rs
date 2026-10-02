@@ -28,6 +28,19 @@ static SENSITIVE_LOG_AUTH_SCHEME: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/-]+={0,2}")
         .expect("sensitive authorization scheme expression is valid")
 });
+static SENSITIVE_VALUE: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+    [
+        r"^eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+$",
+        r"(?i)^Bearer\s+",
+        r"(?i)^Basic\s+[a-zA-Z0-9+/=]+$",
+        r"^sk-[a-zA-Z0-9]{32,}$",
+        r"^[a-fA-F0-9]{32,}$",
+        r"(?s)^-----BEGIN[A-Z\s]+PRIVATE KEY-----",
+    ]
+    .into_iter()
+    .map(|pattern| regex::Regex::new(pattern).expect("sensitive value expression is valid"))
+    .collect()
+});
 
 /// Sanitize a free-form log message before it reaches a non-structured sink.
 /// Structured audit records should use `redacted_headers` or `redacted_value` instead.
@@ -56,6 +69,9 @@ pub fn redact_record(value: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Array(values) => values.iter_mut().for_each(redact_record),
+        serde_json::Value::String(raw) if is_sensitive_value(raw) => {
+            *raw = REDACTED.to_owned();
+        }
         _ => {}
     }
 }
@@ -107,6 +123,34 @@ pub fn management_mutation(actor: &str, action: &str, target: &str, status: &str
     );
 }
 
+/// Mirrors Python's `SecurityAuditMiddleware`: a generic audit event for
+/// every modification request and every `/platform/*` request (including
+/// reads), independent of the specific named `management_mutation` events
+/// application code already emits for successful mutations -- Python's own
+/// middleware runs unconditionally alongside those, so this is intentionally
+/// additional coverage, not a replacement.
+pub fn platform_request(
+    actor: &str,
+    method: &str,
+    path: &str,
+    status_code: u16,
+    duration_ms: f64,
+    user_agent: Option<&str>,
+) {
+    tracing::info!(
+        actor = %redacted_value("actor", actor),
+        action = %format!("{method} {path}"),
+        target = "platform",
+        status = if status_code < 400 { "success" } else { "failure" },
+        method,
+        path,
+        status_code,
+        duration_ms,
+        user_agent,
+        "platform audit event"
+    );
+}
+
 pub fn global_ip_deny(target: &str, reason: &str, source_ip: Option<&str>) {
     tracing::info!(
         action = "ip.global_deny",
@@ -123,23 +167,35 @@ pub fn config_export(actor: &str, section: Option<&str>) {
 }
 
 fn is_sensitive_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    if matches!(
+        normalized.as_str(),
+        "api_authorization_field_swap" | "authorization_field_swap"
+    ) {
+        return false;
+    }
     matches!(
         normalized.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+        "authorization" | "proxy_authorization" | "cookie" | "set_cookie"
     ) || normalized.contains("password")
         || normalized.contains("secret")
         || normalized.contains("token")
-        || normalized.contains("api-key")
+        || normalized.contains("key")
         || normalized.contains("apikey")
-        || normalized.contains("credential")
+        || normalized.contains("auth")
+}
+
+fn is_sensitive_value(value: &str) -> bool {
+    SENSITIVE_VALUE
+        .iter()
+        .any(|pattern| pattern.is_match(value))
 }
 
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue, header};
 
-    use super::{REDACTED, redacted_headers, redacted_log_message, redacted_value};
+    use super::{REDACTED, redact_record, redacted_headers, redacted_log_message, redacted_value};
 
     #[test]
     fn audit_header_redaction_never_exposes_credentials() {
@@ -187,5 +243,85 @@ mod tests {
         ] {
             assert!(redacted.contains(expected), "{redacted}");
         }
+    }
+
+    #[test]
+    fn structured_records_match_python_key_and_value_redaction() {
+        let mut record = serde_json::json!({
+            "signing_key": "secret",
+            "api_authorization_field_swap": "x-auth",
+            "nested": ["Bearer secret", "safe"]
+        });
+        redact_record(&mut record);
+        assert_eq!(record["signing_key"], REDACTED);
+        assert_eq!(record["api_authorization_field_swap"], "x-auth");
+        assert_eq!(record["nested"][0], REDACTED);
+        assert_eq!(record["nested"][1], "safe");
+    }
+
+    #[test]
+    fn platform_request_emits_pythons_middleware_shaped_audit_event() {
+        use std::{
+            io,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for CapturedLog {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'writer> MakeWriter<'writer> for CapturedLog {
+            type Writer = Self;
+            fn make_writer(&'writer self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::platform_request(
+                "alice",
+                "GET",
+                "/platform/user",
+                200,
+                12.5,
+                Some("test-agent"),
+            );
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(event["fields"]["actor"], "alice");
+        assert_eq!(event["fields"]["action"], "GET /platform/user");
+        assert_eq!(event["fields"]["target"], "platform");
+        assert_eq!(event["fields"]["status"], "success");
+        assert_eq!(event["fields"]["status_code"], 200);
+
+        // A failing status (>= 400) maps to Python's status='failure'.
+        let capture = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::platform_request("bob", "DELETE", "/platform/user/bob", 403, 1.0, None);
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(event["fields"]["status"], "failure");
     }
 }

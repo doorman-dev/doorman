@@ -1,4 +1,517 @@
 {
   "schema_version": 1,
-  "approvals": []
+  "approvals": [
+    {
+      "scenario_id": "operation::[A-Z]+::/platform/.*::(anonymous|expired_token|malformed_token|wrong_audience|revoked_token|invalidated_token|disabled_user|invalid_transition)",
+      "signature": {
+        "candidate": {
+          "status": 401
+        },
+        "oracle": {
+          "status": 500
+        }
+      },
+      "rationale": "The pinned routes call auth_required inside a broad `except Exception`, so its 401 HTTPException is swallowed and rendered as a 500 (GTW999, ISE001, or a route-specific *999 code). The candidate returns the intended 401. Verified by anonymous requests to every frozen operation against the pinned server.",
+      "issue": "MIG-101",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::[A-Z]+::[^:]+::wrong_issuer",
+      "signature": {
+        "candidate": {
+          "status": 401
+        }
+      },
+      "rationale": "The pinned server has no JWT_ISSUER support and accepts a correctly signed token from any issuer; the candidate enforces the configured issuer claim (JWT_ISSUER, a release-required setting).",
+      "issue": "MIG-102",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/demo/seed::.*",
+      "signature": {
+        "candidate": {
+          "status": {
+            "one_of": [
+              200,
+              400
+            ]
+          }
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "DEMO999"
+        }
+      },
+      "rationale": "The pinned seeder crashes on every call: seed_metrics calls MinuteBucket.add(dur, status) without the required username/api_key arguments (TypeError, confirmed by live traceback). The candidate seeder succeeds in memory mode and refuses with 400 DEMO002 in external mode, where seeding shared storage with demo data is not allowed.",
+      "issue": "MIG-092",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::[A-Z]+::/api/(rest|soap|graphql)/\\{path\\}::(boundary_value|missing_resource|incorrect_path)",
+      "signature": {
+        "candidate": {
+          "status": 404
+        },
+        "oracle": {
+          "status": 500
+        }
+      },
+      "rationale": "For an unknown API the pinned gateway raises inside api_util.get_api (unpacking a path without a version, confirmed by live traceback) and returns 500 GTW006; the candidate returns 404 for the unmatched API.",
+      "issue": "MIG-090",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::(GET|POST)::/platform/config/(current|reload|reloadable-keys)::.*",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 200,
+          "keys": [
+            "error_code",
+            "error_message",
+            "message",
+            "response",
+            "response_headers",
+            "status_code"
+          ]
+        }
+      },
+      "rationale": "The pinned hot-reload routes build ResponseModel(data=...), but ResponseModel has no `data` field, so Pydantic drops the payload and every call returns an empty envelope with `response: null`. The candidate returns the configuration data the routes were written to return.",
+      "issue": "MIG-103",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/config/rollback::.*",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 500
+        }
+      },
+      "rationale": "Once a snapshot exists the pinned rollback always fails in memory mode: its InMemoryCollection has no delete_many ('InMemoryCollection' object has no attribute 'delete_many', from the live log). The candidate restores the snapshot.",
+      "issue": "MIG-104",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/credit/\\{username\\}::.*",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 400,
+          "error_code": "CRD014"
+        }
+      },
+      "rationale": "The pinned add_user_credits handler overwrites the path `username` with the caller's token subject, so credits are written to the caller and the body/path check rejects any request that names another user (CRD014). The candidate credits the user named in the path.",
+      "issue": "MIG-105",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/openapi/parse::.*",
+      "signature": {
+        "oracle": {
+          "status": 500,
+          "error_code": "OPENAPI999"
+        }
+      },
+      "rationale": "The pinned parser calls request.json() without guarding a body-less, non-JSON or malformed request, so it raises inside its broad except and returns 500 OPENAPI999; the candidate answers the request (200, or 400 OPENAPI004 for an unparseable spec). With a valid JSON body both servers agree.",
+      "issue": "MIG-093",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::(PUT|POST)::/platform/proto/\\{api_name\\}/\\{api_version\\}::.*",
+      "signature": {
+        "oracle": {
+          "status": 599
+        }
+      },
+      "rationale": "The pinned server never answers a multipart proto PUT, or a POST whose Content-Type header is missing: its body-size middleware consumes the request stream and the handler then fails with 'Stream consumed' while the connection hangs (the executor records a 599 timeout). There is no oracle response to compare against.",
+      "issue": "MIG-106",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/rate-limits/bulk/(enable|disable)::.*",
+      "signature": {
+        "oracle": {
+          "status": 404,
+          "keys": [
+            "detail"
+          ]
+        }
+      },
+      "rationale": "The pinned router registers /rate-limits/{rule_id}/enable|disable before the bulk routes, so every bulk call is captured as rule 'bulk' and answered 404 'Rule bulk not found'; the bulk endpoints are unreachable in the pinned server. The candidate serves them.",
+      "issue": "MIG-107",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::DELETE::/platform/(group|role|routing|api)/[^:]+::(lifecycle|duplicate_resource|idempotent_repeat|conflict|invalid_transition)",
+      "signature": {
+        "candidate": {
+          "status": 400
+        },
+        "oracle": {
+          "status": 200
+        }
+      },
+      "rationale": "After a delete the pinned server keeps the entity in its cache, so a second delete of the same entity reports success again. The candidate reports that the entity no longer exists (the same 400 code Python uses for a missing entity).",
+      "issue": "MIG-108",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::(POST|GET)::/platform/tiers/(compare|statistics/all)::.*",
+      "signature": {
+        "candidate": {
+          "status": 200,
+          "body_class": "array"
+        },
+        "oracle": {
+          "status": 200,
+          "keys": []
+        }
+      },
+      "rationale": "The pinned TierService returns a list, but these routes declare response_model=Dict[str, Any]; Pydantic v1 coerces the list through dict(), so the pinned server always answers {} (observed even with matching tiers present). The candidate returns the comparison/statistics list the service computes.",
+      "issue": "MIG-110",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::GET::/platform/monitor/(readiness|metrics)::.*",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 200
+        }
+      },
+      "rationale": "Additive observability: the candidate adds tls_certificates_valid to readiness and active_requests/total_errors/uptime_seconds to metrics, and does not disclose backend details (mongodb/redis/mode) in anonymous readiness responses. All pinned keys are present for authorised callers.",
+      "issue": "MIG-109",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/grpc-web/\\{api_name\\}/\\{service\\}/\\{method\\}::(anonymous|expired_token|malformed_token|wrong_audience|wrong_issuer|revoked_token|invalidated_token|disabled_user|invalid_transition|missing_permission|wrong_group|subscription_absent|lifecycle|duplicate_resource|conflict|idempotent_repeat)",
+      "signature": {
+        "oracle": {
+          "status": 200
+        }
+      },
+      "rationale": "The pinned gRPC-Web route is an unauthenticated stub: it performs no authentication, subscription, group or rate-limit checks and answers grpc-status 0 without calling the upstream. The candidate applies the same policy chain as every other gateway route (401/403/429), so unauthorised gRPC-Web calls are refused.",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::GET::/platform/analytics/(api|user)/.*::boundary_value",
+      "signature": {
+        "candidate": {
+          "status": 404
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "ANALYTICS999"
+        }
+      },
+      "rationale": "For an oversized unknown API/user name the pinned analytics routes raise inside their broad except and answer 500 ANALYTICS999; the candidate reports the resource as not found.",
+      "issue": "MIG-112",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/authorization(/register)?::wrong_scalar_type",
+      "signature": {
+        "candidate": {
+          "status": 400,
+          "error_code": "AUTH001"
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "GTW999"
+        }
+      },
+      "rationale": "The pinned login/register handlers call data.get() on the decoded body without checking it is an object, so a JSON array body crashes with AttributeError and 500 GTW999 (confirmed by live traceback); the candidate rejects it with 400 AUTH001.",
+      "issue": "MIG-113",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::(GET|POST)::/api/grpc/\\{path\\}::.*",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 501,
+          "error_code": "GTW006"
+        }
+      },
+      "rationale": "The pinned JSON gRPC gateway calls /<api>_<version>.<Service>/<Method> (its module base) instead of the package declared in the uploaded proto, so an upstream serving fixture.v1.Resource answers UNIMPLEMENTED ('Method not found!', confirmed in the oracle log). The candidate resolves the method's full name from the uploaded descriptor and reaches the upstream; api_grpc_package still overrides the package.",
+      "issue": "MIG-114",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/credit/rotate-key::.*",
+      "signature": {
+        "oracle": {
+          "status": 422,
+          "error_code": "VAL001"
+        }
+      },
+      "rationale": "The pinned router registers POST /credit/{username} before /credit/rotate-key, so every rotate-key call is captured as add_user_credits for user 'rotate-key' and validated against UserCreditModel (422 VAL001 for any rotate-key body, confirmed live). The rotate-key endpoint is unreachable in the pinned server; the candidate serves it.",
+      "issue": "MIG-115",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::DELETE::/platform/proto/\\{api_name\\}/\\{api_version\\}::boundary_value",
+      "signature": {
+        "candidate": {
+          "status": 400,
+          "error_code": "GTW013"
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "GTW999"
+        }
+      },
+      "rationale": "For an over-long API name the pinned delete handler lets the 400 path-validation HTTPException fall into its broad except and answers 500 GTW999; its upload/get/update handlers answer 400 GTW013 for the same name. The candidate answers 400 GTW013 consistently.",
+      "issue": "MIG-116",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::POST::/platform/authorization/admin/(disable|enable|revoke|unrevoke)/\\{username\\}::boundary_value",
+      "signature": {
+        "candidate": {
+          "status": 200
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "GTW999"
+        }
+      },
+      "rationale": "The pinned admin handlers embed the username in their success message; for a 300-character username ResponseModel.message exceeds its 255-character limit and the pydantic ValidationError becomes 500 GTW999 (confirmed by live traceback) after the action has already been applied. The candidate completes the same action and reports success.",
+      "issue": "MIG-117",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::(GET|POST)::/api/grpc/\\{path\\}::boundary_value",
+      "signature": {
+        "candidate": {
+          "status": 404,
+          "error_code": "GTW012"
+        },
+        "oracle": {
+          "status": 500,
+          "error_code": "GTW006"
+        }
+      },
+      "rationale": "For a 300-character API name the pinned gRPC gateway builds 'Proto file not found for API: <name>/<version>' and ResponseModel.error_message exceeds its 255-character limit, so the pydantic ValidationError becomes 500 GTW006 (confirmed by live traceback). The candidate returns the intended 404 GTW012.",
+      "issue": "MIG-118",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "setting::(GATEWAY_TIMEOUT|RETRY_ENABLED|RETRY_MAX_ATTEMPTS)::positive",
+      "signature": {},
+      "rationale": "The pinned server only lists GATEWAY_TIMEOUT, RETRY_ENABLED and RETRY_MAX_ATTEMPTS in its hot-reload configuration; no request path reads them (utils/hot_reload_config.py), so they have no effect. The candidate applies them as documented in user-docs/02-configuration.md.",
+      "issue": "MIG-119",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "setting::(CIRCUIT_BREAKER_TIMEOUT|HTTP_RETRY_BASE_DELAY|HTTP_RETRY_MAX_DELAY)::invalid",
+      "signature": {},
+      "rationale": "The pinned server calls float() on these values while handling each request (utils/http_client.py), so an unparseable value turns every upstream call into a 500. The candidate ignores the unparseable value and uses the documented default.",
+      "issue": "MIG-120",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "setting::JWT_KEYS::invalid",
+      "signature": {
+        "candidate": {
+          "started": false
+        }
+      },
+      "rationale": "With unparseable JWT_KEYS the pinned server silently falls back to JWT_SECRET_KEY. The candidate refuses to start so a broken key-rotation configuration cannot go unnoticed (fail closed).",
+      "issue": "MIG-121",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "setting::MEM_AUTO_SAVE_ENABLED::invalid",
+      "signature": {
+        "candidate": {
+          "probe": false
+        },
+        "oracle": {
+          "probe": true
+        }
+      },
+      "rationale": "The pinned auto-save loop ignores enable_auto_save and dumps memory whenever MEM_AUTO_SAVE_FREQ > 0, so memory is saved even when auto-save is off or the flag is unparseable. The candidate saves only when MEM_AUTO_SAVE_ENABLED is true. Memory-mode deployments that relied on the implicit dumps must set MEM_AUTO_SAVE_ENABLED=true (user-docs/02-configuration.md).",
+      "issue": "MIG-122",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": {
+            "one_of": [
+              401,
+              403,
+              404,
+              429
+            ]
+          }
+        },
+        "oracle": {
+          "status": 200,
+          "content_type": {
+            "one_of": [
+              "application/grpc-web",
+              "application/grpc-web+proto",
+              "application/grpc-web-text"
+            ]
+          }
+        }
+      },
+      "rationale": "Pairwise rows on the gRPC-Web profiles: the pinned gRPC-Web route is an unauthenticated stub that answers grpc-status 0 without applying authentication, subscription, group, tier or rate-limit policy (see MIG-111). The candidate applies the same policy chain as every other gateway route, so it refuses these rows.",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::[A-Z]+::/platform/(tiers|rate-limits)/.*::(anonymous|expired_token|malformed_token|wrong_audience|wrong_issuer|revoked_token|invalidated_token|disabled_user|missing_permission|wrong_group|invalid_transition)",
+      "signature": {
+        "candidate": {
+          "status": {
+            "one_of": [
+              401,
+              403
+            ]
+          }
+        }
+      },
+      "rationale": "Security fix. The pinned tier and rate-limit-rule routers declare no authentication, so any anonymous caller can create, delete or reassign tiers and rate-limit rules (including granting itself an unlimited tier). The candidate requires an authenticated caller with manage_tiers / manage_rate_limits (TIER001 / RATE002); /rate-limits/status stays available to any authenticated caller.",
+      "issue": "MIG-123",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "operation::GET::/platform/tiers/\\{tier_id\\}/users::.*",
+      "signature": {
+        "candidate": {
+          "status": 200,
+          "body_class": "array"
+        },
+        "oracle": {
+          "status": 500
+        }
+      },
+      "rationale": "The pinned list_users_in_tier builds UserTierAssignment(**document) from the raw store document, which carries '_id', so it raises TypeError and answers 500 'Failed to list users' whenever the tier has an assignment (confirmed in the oracle log). The candidate returns the assignments.",
+      "issue": "MIG-124",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": 413
+        },
+        "oracle": {
+          "status": 400,
+          "content_type": ""
+        }
+      },
+      "rationale": "Oversized gRPC-Web bodies: the pinned gRPC-Web route has no body-size limit and only rejects the 12 MiB payload later as invalid framing/base64 (bare 400). The candidate applies MAX_BODY_SIZE_BYTES_GRPC to gRPC-Web as to every gRPC request and answers 413 before buffering the body.",
+      "issue": "MIG-125",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::0014",
+      "signature": {
+        "candidate": {
+          "status": 413,
+          "error_code": "REQ001"
+        },
+        "oracle": {
+          "status": 200,
+          "content_type": "application/grpc-web"
+        }
+      },
+      "rationale": "The pinned gRPC-Web route accepts this oversized binary body without checking its size and emits a stub response. The candidate enforces MAX_BODY_SIZE_BYTES_GRPC before buffering the body, consistent with MIG-125.",
+      "issue": "MIG-125",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": 400,
+          "content_type": "text/plain"
+        },
+        "oracle": {
+          "status": 200,
+          "content_type": {
+            "one_of": [
+              "application/grpc-web",
+              "application/grpc-web+proto",
+              "application/grpc-web-text"
+            ]
+          }
+        }
+      },
+      "rationale": "gRPC-Web rows with an empty or unframed body: the pinned gRPC-Web route is a stub that never parses the request and always answers grpc-status 0 (MIG-111). The candidate proxies the call and rejects a body without a gRPC-Web data frame with 400.",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    },
+    {
+      "scenario_id": "pairwise::[0-9]{4}",
+      "signature": {
+        "candidate": {
+          "status": {
+            "one_of": [
+              401,
+              403,
+              404,
+              429
+            ]
+          }
+        },
+        "oracle": {
+          "status": 400,
+          "content_type": ""
+        }
+      },
+      "rationale": "gRPC-Web rows whose body the pinned stub rejects (bare 400 'Invalid base64 body') while the candidate first applies the gateway policy chain (IP policy, authentication, subscription, limits) that the pinned gRPC-Web route skips entirely (MIG-111).",
+      "issue": "MIG-111",
+      "owner": "doorman-maintainers",
+      "expires": "2027-03-31"
+    }
+  ]
 }

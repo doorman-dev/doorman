@@ -4,15 +4,26 @@ use serde_json::Value;
 use super::{PolicyFailure, PolicyStage};
 use crate::storage::models::{bool_field_default, string_field, string_list_field};
 
+/// The pinned `is_admin_role`: a role flagged `platform_admin`, or one named
+/// "admin" / "platform admin" (case-insensitive).
 pub fn is_admin_user(user: &Value, roles: &[Value]) -> bool {
     let role_name = string_field(user, "role").unwrap_or_default();
-    if role_name == "admin" {
-        return true;
+    let admin_name = |name: &str| {
+        matches!(
+            name.trim().to_lowercase().as_str(),
+            "admin" | "platform admin"
+        )
+    };
+    match roles
+        .iter()
+        .find(|role| string_field(role, "role_name") == Some(role_name))
+    {
+        Some(role) => {
+            bool_field_default(role, "platform_admin", false)
+                || admin_name(string_field(role, "role_name").unwrap_or_default())
+        }
+        None => admin_name(role_name),
     }
-    roles.iter().any(|role| {
-        string_field(role, "role_name") == Some(role_name)
-            && bool_field_default(role, "manage_gateway", false)
-    })
 }
 
 pub fn enforce_allowed_roles(api: &Value, user: &Value) -> Result<(), PolicyFailure> {

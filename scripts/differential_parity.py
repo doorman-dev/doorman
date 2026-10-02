@@ -83,6 +83,10 @@ def request(base_url: str, case: dict[str, Any], token: str | None = None) -> di
         response = urllib.request.urlopen(outgoing, timeout=10)
     except urllib.error.HTTPError as error:
         response = error
+    except (TimeoutError, urllib.error.URLError, ConnectionError) as error:
+        # A server that never answers is a result to compare, not a crash
+        # (e.g. the pinned server hangs on some multipart uploads).
+        return {"status": 599, "headers": {}, "body": f"no response: {type(error).__name__}"}
     raw = response.read()
     content_type = response.headers.get_content_type()
     if content_type == "application/json" and raw:

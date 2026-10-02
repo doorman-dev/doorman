@@ -3,7 +3,10 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{PolicyFailure, PolicyStage};
-use crate::storage::models::{bool_field_default, object_field, string_field, u64_field};
+use crate::storage::{
+    field_encryption::decrypt_value,
+    models::{bool_field_default, object_field, string_field, u64_field},
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CreditDecision {
@@ -18,8 +21,10 @@ pub fn credit_header_values(
     now: OffsetDateTime,
 ) -> Option<(String, Vec<String>)> {
     let header = string_field(definition, "api_key_header")?.to_owned();
-    let old = string_field(definition, "api_key").map(str::to_owned);
-    let new = string_field(definition, "api_key_new").map(str::to_owned);
+    let old_encrypted = string_field(definition, "api_key");
+    let old = decrypt_value(old_encrypted).or_else(|| old_encrypted.map(str::to_owned));
+    let new_encrypted = string_field(definition, "api_key_new");
+    let new = decrypt_value(new_encrypted).or_else(|| new_encrypted.map(str::to_owned));
     let expires = string_field(definition, "api_key_rotation_expires")
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
     let values = match (old, new, expires) {
@@ -83,7 +88,7 @@ pub fn evaluate_credits(
         .and_then(|doc| object_field(doc, "users_credits"))
         .and_then(|credits| credits.get(group))
         .and_then(|credit| string_field(credit, "user_api_key"))
-        .map(str::to_owned);
+        .and_then(|value| decrypt_value(Some(value)).or_else(|| Some(value.to_owned())));
 
     Ok(CreditDecision {
         required: true,

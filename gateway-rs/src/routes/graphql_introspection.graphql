@@ -1,0 +1,19 @@
+
+query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types {
+      kind
+      name
+      description
+      fields(includeDeprecated: true) {
+        name
+        description
+        args { name type { name kind } }
+        type { name kind ofType { name kind } }
+      }
+    }
+  }
+}

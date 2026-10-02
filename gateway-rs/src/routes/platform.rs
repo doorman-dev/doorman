@@ -6,7 +6,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     process::{Command, Stdio},
-    sync::{OnceLock, atomic::Ordering},
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +18,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -31,14 +32,13 @@ static PYTHON_OPENAPI: OnceLock<Value> = OnceLock::new();
 use crate::{
     middleware::{
         body_limit::BodyLimits,
-        chaos::{
-            CHAOS_ENABLED, CHAOS_ERROR_BUDGET_BURN, CHAOS_ERROR_STATUS, CHAOS_EVENTS_COUNT,
-            CHAOS_LATENCY_MS, CHAOS_MONGO_OUTAGE, CHAOS_REDIS_OUTAGE,
-        },
+        chaos::{CHAOS_ERROR_BUDGET_BURN, CHAOS_MONGO_OUTAGE, CHAOS_REDIS_OUTAGE},
         response_compat::MessageEnvelope,
     },
     observability::{
-        analytics_aggregator::{AggregatedPoint, EntityCounter, global_analytics},
+        analytics_aggregator::{
+            AggregatedPoint, EndpointEntity, EntityCounter, global_analytics, pooled_percentiles,
+        },
         audit::{self, global_ip_deny},
     },
     platform_contract::{normalize_create_api, normalize_update_api},
@@ -67,6 +67,17 @@ pub struct DescriptorBackfill {
 impl DescriptorBackfill {
     pub fn missing(&self) -> usize {
         self.errors.len()
+    }
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
     }
 }
 
@@ -113,25 +124,31 @@ impl Drop for ProtoCompileDirectory {
     }
 }
 
-const RBAC_PERMISSIONS: &[&str] = &[
-    "manage_users",
-    "manage_apis",
-    "manage_endpoints",
-    "manage_groups",
-    "manage_roles",
-    "manage_routings",
-    "manage_gateway",
-    "manage_subscriptions",
-    "manage_credits",
-    "manage_auth",
-    "manage_security",
-    "manage_tiers",
-    "manage_rate_limits",
-    "view_analytics",
-    "view_logs",
-    "export_logs",
-    "ui_access",
-];
+/// Percent-decode a request path as UTF-8, leaving invalid escapes intact.
+fn percent_decode_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) = (
+                bytes
+                    .get(index + 1)
+                    .and_then(|byte| (*byte as char).to_digit(16)),
+                bytes
+                    .get(index + 2)
+                    .and_then(|byte| (*byte as char).to_digit(16)),
+            )
+        {
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_owned())
+}
 
 pub async fn platform_dispatch(
     State(state): State<AppState>,
@@ -146,7 +163,11 @@ pub async fn platform_dispatch(
     let headers = request.headers().clone();
     let request_id = request_id_from(&headers);
     let query = parse_query(uri.query());
-    let path = uri.path().strip_prefix("/platform").unwrap_or(uri.path());
+    // Starlette routes on the percent-decoded path (e.g. `%40` in an email).
+    let decoded_path = percent_decode_path(uri.path());
+    let path = decoded_path
+        .strip_prefix("/platform")
+        .unwrap_or(decoded_path.as_str());
     if path != "/security/settings"
         && let Some(response) = platform_ip_filter(&state, &headers, direct_addr, &request_id).await
     {
@@ -164,21 +185,78 @@ pub async fn platform_dispatch(
             );
         }
     };
+    // Body-size middleware runs first; then Starlette resolves the route before
+    // any handler runs: an unknown path is
+    // a bare 404 and a known path with another method is a 405 naming the
+    // first registered route's method.
+    match python_route_match(path, &method) {
+        RouteMatch::Found => {}
+        RouteMatch::NotFound => {
+            // Starlette's redirect_slashes: when the path with its trailing
+            // slash toggled resolves (for any method), answer 307 to it.
+            let toggled = match uri.path().strip_suffix('/') {
+                Some(stripped) => stripped.to_owned(),
+                None => format!("{}/", uri.path()),
+            };
+            let toggled_decoded = percent_decode_path(&toggled);
+            let toggled_path = toggled_decoded
+                .strip_prefix("/platform")
+                .unwrap_or(toggled_decoded.as_str());
+            if !matches!(
+                python_route_match(toggled_path, &method),
+                RouteMatch::NotFound
+            ) {
+                // A relative Location stays correct behind TLS termination.
+                let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+                if let Ok(value) = HeaderValue::from_str(&format!("{toggled}{query}")) {
+                    response.headers_mut().insert(header::LOCATION, value);
+                }
+                return response;
+            }
+            return json_response(
+                StatusCode::NOT_FOUND,
+                json!({"detail": "Not Found"}),
+                &request_id,
+            );
+        }
+        RouteMatch::MethodNotAllowed(allow) => {
+            let mut response = json_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                json!({"detail": "Method Not Allowed"}),
+                &request_id,
+            );
+            if let Ok(value) = HeaderValue::from_str(&allow) {
+                response.headers_mut().insert(header::ALLOW, value);
+            }
+            return response;
+        }
+    }
+    if rejects_non_json_body(path, &method, &headers, &body) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
     let parsed_payload = if body.is_empty() {
         Ok(Value::Object(Map::new()))
     } else {
         serde_json::from_slice(&body)
     };
-    if matches!(path, "/authorization" | "/authorization/register")
+    // Python rate-limits login/registration by IP before parsing the body, so
+    // the invalid-payload response is deferred until after that check.
+    let invalid_auth_payload = matches!(path, "/authorization" | "/authorization/register")
         && method == Method::POST
-        && parsed_payload.is_err()
-    {
-        return error(
+        && (parsed_payload.is_err() || body.is_empty());
+    let invalid_auth_response = || {
+        error(
             StatusCode::BAD_REQUEST,
             "AUTH004",
             "Invalid JSON payload",
             &request_id,
-        );
+        )
     };
     // FastAPI validates a typed JSON body before entering the route handler.
     // The shared entity routes model those typed Python endpoints, so malformed
@@ -187,7 +265,7 @@ pub async fn platform_dispatch(
     // and WSDL uploads retain their content-specific parsing behavior.
     if parsed_payload.is_err()
         && content_type_is_json(&headers)
-        && is_typed_json_mutation(path, &method)
+        && declares_json_body(path, &method)
     {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -196,7 +274,19 @@ pub async fn platform_dispatch(
             &request_id,
         );
     }
-    let payload = parsed_payload.unwrap_or(Value::Null);
+    let mut payload = parsed_payload.unwrap_or(Value::Null);
+    // FastAPI validates the declared body model before the handler runs.
+    if !body.is_empty()
+        && content_type_is_json(&headers)
+        && body_fails_declared_model(path, &method, &payload)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
     // SubscribeModel requires all three fields.  Keep this lightweight
     // compatibility check at dispatch time until the remaining typed model is
     // ported, so a missing field reaches FastAPI's global validation envelope
@@ -212,21 +302,95 @@ pub async fn platform_dispatch(
             &request_id,
         );
     }
-
-    if path == "/authorization" && method == Method::POST {
-        if let Some(response) = auth_account_rate_limit(
-            &state,
-            &payload,
-            "LOGIN_ACCOUNT_RATE_LIMIT",
-            10,
-            "LOGIN_ACCOUNT_RATE_WINDOW",
-            900,
+    if method == Method::PUT
+        && is_update_password_path(path)
+        && normalize_update_password_model(&mut payload).is_err()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
             &request_id,
-        )
-        .await
-        {
-            return response;
+        );
+    }
+    if (content_type_is_json(&headers) || body.is_empty())
+        && is_tier_typed_mutation(path, &method)
+        && normalize_tier_request(path, &method, &mut payload).is_err()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+    // Endpoint validation models are FastAPI body parameters, so an invalid
+    // body is rejected before the handler authenticates the caller.
+    let validation_create = method == Method::POST
+        && matches!(
+            path,
+            "/endpoint/validation" | "/endpoint/endpoint/validation"
+        );
+    let validation_update = method == Method::PUT
+        && ["/endpoint/validation/", "/endpoint/endpoint/validation/"]
+            .iter()
+            .any(|prefix| {
+                path.strip_prefix(prefix)
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            });
+    if (validation_create || validation_update)
+        && normalize_endpoint_validation_model(&mut payload.clone(), validation_create).is_err()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+    // A request with no body at all is a 422 for every route whose Python
+    // counterpart declares a required typed body parameter, regardless of
+    // Content-Type (see requires_nonempty_json_body).
+    if body.is_empty() && requires_nonempty_json_body(path, &method) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+    // Python's body: dict[str, Any] parameter has no default, so a request
+    // with no body at all is a 422 even though an explicit `{}` is valid.
+    if path == "/config/import"
+        && method == Method::POST
+        && (body.is_empty() || !payload.is_object())
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VAL001",
+            "Validation Error",
+            &request_id,
+        );
+    }
+
+    // FastAPI validates `limit: int = Query(ge=1, le=1000)` and
+    // `offset: int = Query(ge=0)` before the handler authenticates.
+    if path == "/logging/logs" && method == Method::GET {
+        let out_of_range = |field: &str, min: i64, max: i64| {
+            query
+                .get(field)
+                .is_some_and(|value| !value.parse::<i64>().is_ok_and(|n| (min..=max).contains(&n)))
+        };
+        if out_of_range("limit", 1, 1_000) || out_of_range("offset", 0, i64::MAX) {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VAL001",
+                "Validation Error",
+                &request_id,
+            );
         }
+    }
+    if path == "/authorization" && method == Method::POST {
         if let Some(response) = auth_ip_rate_limit(
             &state,
             &headers,
@@ -235,6 +399,22 @@ pub async fn platform_dispatch(
             5,
             "LOGIN_IP_RATE_WINDOW",
             300,
+            &request_id,
+        )
+        .await
+        {
+            return response;
+        }
+        if invalid_auth_payload {
+            return invalid_auth_response();
+        }
+        if let Some(response) = auth_account_rate_limit(
+            &state,
+            &payload,
+            "LOGIN_ACCOUNT_RATE_LIMIT",
+            10,
+            "LOGIN_ACCOUNT_RATE_WINDOW",
+            900,
             &request_id,
         )
         .await
@@ -258,6 +438,9 @@ pub async fn platform_dispatch(
         {
             return response;
         }
+        if invalid_auth_payload {
+            return invalid_auth_response();
+        }
         if let Some(response) = auth_account_rate_limit(
             &state,
             &payload,
@@ -277,7 +460,7 @@ pub async fn platform_dispatch(
         return success(StatusCode::OK, json!({"status": "alive"}), &request_id);
     }
     if path == "/monitor/readiness" && method == Method::GET {
-        let privileged = match authorize(&state, &headers, path, &request_id).await {
+        let privileged = match authorize(&state, &headers, &method, path, &request_id).await {
             Ok(claims) => {
                 let username = claims.sub.as_deref().unwrap_or_default();
                 has_permission(&state, username, "manage_gateway").await
@@ -287,32 +470,30 @@ pub async fn platform_dispatch(
         return readiness(&state, privileged, &request_id).await;
     }
 
-    // The pinned rate-limit-rule router has no authentication dependency for
-    // its management endpoints. Its status endpoint is the lone exception
-    // (it depends on the authenticated subject). Dispatch the public slice
-    // before the platform-wide authorization gate, retaining the reference's
-    // intentionally permissive surface.
-    if path == "/rate-limits" || path == "/rate-limits/" || path.starts_with("/rate-limits/") {
-        if let Some(response) = dispatch_core_entities(
-            &state,
-            path,
-            &method,
-            payload.clone(),
-            &query,
-            "",
-            &request_id,
-        )
-        .await
-        {
-            return response;
-        }
-    }
-
-    let claims = match authorize(&state, &headers, path, &request_id).await {
+    // The pinned tier and rate-limit-rule routers have no authentication at
+    // all, so anyone could create, delete or assign tiers and limits.  The
+    // candidate requires an authenticated caller with the management
+    // permission instead (approved divergence MIG-123).
+    let claims = match authorize(&state, &headers, &method, path, &request_id).await {
         Ok(claims) => claims,
         Err(response) => return response,
     };
     let username = claims.sub.clone().unwrap_or_default();
+
+    if path == "/tls" || path.starts_with("/tls/") {
+        let response = if has_permission(&state, &username, "manage_security").await {
+            crate::routes::tls_admin::dispatch(&state, path, &method, payload, &request_id).await
+        } else {
+            error(
+                StatusCode::FORBIDDEN,
+                "TLSA001",
+                "manage_security is required",
+                &request_id,
+            )
+        };
+        audit_management_request(&username, &method, path, &response);
+        return with_platform_activity_context(response, &username, path);
+    }
 
     if path.starts_with("/authorization") {
         let response = authorization_routes(
@@ -375,13 +556,8 @@ pub async fn platform_dispatch(
         (Method::POST, "/memory/restore") => {
             memory_restore(&state, payload, &username, &request_id).await
         }
-        (Method::GET, "/dashboard") => {
-            if !has_permission(&state, &username, "view_analytics").await {
-                analytics_denied(&request_id)
-            } else {
-                dashboard(&state, &request_id).await
-            }
-        }
+        // The pinned dashboard only requires authentication.
+        (Method::GET, "/dashboard") => dashboard(&state, &request_id).await,
         (Method::GET, "/monitor/metrics") => {
             if !has_permission(&state, &username, "manage_gateway").await {
                 error(
@@ -391,7 +567,7 @@ pub async fn platform_dispatch(
                     &request_id,
                 )
             } else {
-                monitor_metrics(&state, &request_id).await
+                monitor_metrics(&state, &query, &request_id).await
             }
         }
         (Method::GET, "/monitor/report") => {
@@ -407,57 +583,77 @@ pub async fn platform_dispatch(
             }
         }
         (Method::GET, "/analytics/overview") => {
-            analytics_overview(&state, &username, &query, &request_id).await
+            if let Some(response) = analytics_query_error(&query, false, &request_id) {
+                response
+            } else {
+                analytics_overview(&state, &username, &query, &request_id).await
+            }
         }
         (Method::GET, "/analytics/timeseries") => {
-            if !has_permission(&state, &username, "view_analytics").await {
+            if let Some(response) = analytics_query_error(&query, false, &request_id) {
+                response
+            } else if !has_permission(&state, &username, "view_analytics").await {
                 analytics_denied(&request_id)
             } else {
                 analytics_timeseries(&query, &request_id)
             }
         }
         (Method::GET, "/analytics/top-apis") => {
-            if !has_permission(&state, &username, "view_analytics").await {
+            if let Some(response) = analytics_query_error(&query, true, &request_id) {
+                response
+            } else if !has_permission(&state, &username, "view_analytics").await {
                 analytics_denied(&request_id)
             } else {
                 analytics_top("api", &query, &request_id)
             }
         }
         (Method::GET, "/analytics/top-users") => {
-            if !has_permission(&state, &username, "view_analytics").await {
+            if let Some(response) = analytics_query_error(&query, true, &request_id) {
+                response
+            } else if !has_permission(&state, &username, "view_analytics").await {
                 analytics_denied(&request_id)
             } else {
                 analytics_top("user", &query, &request_id)
             }
         }
         (Method::GET, "/analytics/top-endpoints") => {
-            if !has_permission(&state, &username, "view_analytics").await {
+            if let Some(response) = analytics_query_error(&query, true, &request_id) {
+                response
+            } else if !has_permission(&state, &username, "view_analytics").await {
                 analytics_denied(&request_id)
             } else {
                 analytics_top("endpoint", &query, &request_id)
             }
         }
         (Method::GET, detail) if detail.starts_with("/analytics/api/") => {
-            analytics_detail(
-                &state,
-                &username,
-                "api",
-                detail.trim_start_matches("/analytics/api/"),
-                &query,
-                &request_id,
-            )
-            .await
+            if let Some(response) = analytics_query_error(&query, false, &request_id) {
+                response
+            } else {
+                analytics_detail(
+                    &state,
+                    &username,
+                    "api",
+                    detail.trim_start_matches("/analytics/api/"),
+                    &query,
+                    &request_id,
+                )
+                .await
+            }
         }
         (Method::GET, detail) if detail.starts_with("/analytics/user/") => {
-            analytics_detail(
-                &state,
-                &username,
-                "user",
-                detail.trim_start_matches("/analytics/user/"),
-                &query,
-                &request_id,
-            )
-            .await
+            if let Some(response) = analytics_query_error(&query, false, &request_id) {
+                response
+            } else {
+                analytics_detail(
+                    &state,
+                    &username,
+                    "user",
+                    detail.trim_start_matches("/analytics/user/"),
+                    &query,
+                    &request_id,
+                )
+                .await
+            }
         }
         (Method::GET, "/security/settings") => {
             if !has_permission(&state, &username, "manage_security").await {
@@ -542,28 +738,21 @@ pub async fn platform_dispatch(
             }
         }
         (Method::GET, "/config/reloadable-keys") => {
-            if !has_permission(&state, &username, "manage_gateway").await {
-                http_detail(
-                    StatusCode::FORBIDDEN,
-                    "Insufficient permissions: manage_gateway required",
-                    &request_id,
-                )
-            } else {
-                success(
-                    StatusCode::OK,
-                    json!({
-                        "reloadable_keys": active_reloadable_keys(),
-                        "total": 3,
-                        "restart_required_keys": restart_required_keys(),
-                        "notes": [
-                            "Environment variables always override config file values",
-                            "GATEWAY_TIMEOUT, RETRY_ENABLED, and RETRY_MAX_ATTEMPTS apply to the next REST, GraphQL, or SOAP request",
-                            "All other listed settings require a controlled restart or rolling deployment"
-                        ]
-                    }),
-                    &request_id,
-                )
-            }
+            // The pinned route only requires authentication (no role check).
+            success(
+                StatusCode::OK,
+                json!({
+                    "reloadable_keys": active_reloadable_keys(),
+                    "total": 3,
+                    "restart_required_keys": restart_required_keys(),
+                    "notes": [
+                        "Environment variables always override config file values",
+                        "GATEWAY_TIMEOUT, RETRY_ENABLED, and RETRY_MAX_ATTEMPTS apply to the next REST, GraphQL, or SOAP request",
+                        "All other listed settings require a controlled restart or rolling deployment"
+                    ]
+                }),
+                &request_id,
+            )
         }
         (Method::POST, "/config/reload") => {
             if !has_permission(&state, &username, "manage_gateway").await {
@@ -596,7 +785,7 @@ pub async fn platform_dispatch(
                 }
             }
         }
-        (Method::POST, "/demo/seed") => demo_seed(&state, &username, &request_id).await,
+        (Method::POST, "/demo/seed") => demo_seed(&state, &username, &query, &request_id).await,
         (Method::POST, "/tools/cors/check") => {
             if !has_permission(&state, &username, "manage_security").await {
                 error(
@@ -649,7 +838,11 @@ pub async fn platform_dispatch(
                     "You do not have permission to use tools",
                     &request_id,
                 )
-            } else if let Some(backend) = payload.get("backend").and_then(Value::as_str) {
+            } else {
+                let (backend, enabled, duration_ms) = match normalize_chaos_toggle(&payload) {
+                    Ok(values) => values,
+                    Err(errors) => return validation_errors(errors, &request_id),
+                };
                 let backend = backend.trim().to_ascii_lowercase();
                 let target = match backend.as_str() {
                     "redis" => &CHAOS_REDIS_OUTAGE,
@@ -663,24 +856,11 @@ pub async fn platform_dispatch(
                         );
                     }
                 };
-                let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
-                    return validation_errors(
-                        vec![json!({
-                            "loc": ["body", "enabled"],
-                            "msg": "field required",
-                            "type": "value_error.missing"
-                        })],
-                        &request_id,
-                    );
-                };
-                let duration_ms = payload
-                    .get("duration_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
                 if duration_ms > 0 {
                     target.store(true, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(duration_ms as u64))
+                            .await;
                         target.store(false, std::sync::atomic::Ordering::Relaxed);
                     });
                 } else {
@@ -691,32 +871,6 @@ pub async fn platform_dispatch(
                     json!({
                         "backend": backend,
                         "enabled": target.load(std::sync::atomic::Ordering::Relaxed)
-                    }),
-                    &request_id,
-                )
-            } else {
-                // Retain the additive v2 latency/error injection extension.
-                let enabled = payload
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let latency = payload
-                    .get("latency_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let error_status = payload
-                    .get("error_status")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
-                CHAOS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-                CHAOS_LATENCY_MS.store(latency, std::sync::atomic::Ordering::Relaxed);
-                CHAOS_ERROR_STATUS.store(error_status, std::sync::atomic::Ordering::Relaxed);
-                success(
-                    StatusCode::OK,
-                    json!({
-                        "enabled": enabled,
-                        "latency_ms": latency,
-                        "error_status": error_status
                     }),
                     &request_id,
                 )
@@ -736,11 +890,7 @@ pub async fn platform_dispatch(
                     json!({
                         "redis_outage": CHAOS_REDIS_OUTAGE.load(std::sync::atomic::Ordering::Relaxed),
                         "mongo_outage": CHAOS_MONGO_OUTAGE.load(std::sync::atomic::Ordering::Relaxed),
-                        "error_budget_burn": CHAOS_ERROR_BUDGET_BURN.load(std::sync::atomic::Ordering::Relaxed),
-                        "enabled": CHAOS_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                        "latency_ms": CHAOS_LATENCY_MS.load(std::sync::atomic::Ordering::Relaxed),
-                        "error_status": CHAOS_ERROR_STATUS.load(std::sync::atomic::Ordering::Relaxed),
-                        "events": CHAOS_EVENTS_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                        "error_budget_burn": CHAOS_ERROR_BUDGET_BURN.load(std::sync::atomic::Ordering::Relaxed)
                     }),
                     &request_id,
                 )
@@ -788,7 +938,16 @@ pub async fn platform_dispatch(
             if path.starts_with("/subscription") {
                 subscription_routes(&state, path, &method, payload, &username, &request_id).await
             } else if path.starts_with("/credit") {
-                credit_routes(&state, path, &method, payload, &username, &request_id).await
+                credit_routes(
+                    &state,
+                    path,
+                    &method,
+                    payload,
+                    &query,
+                    &username,
+                    &request_id,
+                )
+                .await
             } else if path.starts_with("/vault") {
                 vault_routes(&state, path, &method, payload, &username, &request_id).await
             } else if path.starts_with("/quota") {
@@ -884,13 +1043,22 @@ async fn dispatch_core_entities(
     request_id: &str,
 ) -> Option<Response> {
     if path == "/tiers" || path == "/tiers/" || path.starts_with("/tiers/") {
+        if !has_permission(state, username, "manage_tiers").await {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "TIER001",
+                "You do not have permission to manage tiers",
+                request_id,
+            ));
+        }
         let suffix = path.trim_start_matches("/tiers").trim_matches('/');
         let basic = suffix.is_empty()
             || (!suffix.contains('/')
-                && !matches!(
-                    suffix,
-                    "upgrade" | "downgrade" | "temporary-upgrade" | "compare" | "assignments"
-                ));
+                && (method == Method::GET
+                    || !matches!(
+                        suffix,
+                        "upgrade" | "downgrade" | "temporary-upgrade" | "compare" | "assignments"
+                    )));
         if basic {
             return Some(
                 tier_crud_routes(state, path, method, payload, query, username, request_id).await,
@@ -902,6 +1070,15 @@ async fn dispatch_core_entities(
     }
     if path == "/rate-limits" || path == "/rate-limits/" || path.starts_with("/rate-limits/") {
         let suffix = path.trim_start_matches("/rate-limits").trim_matches('/');
+        // A caller may always read their own limit status.
+        if suffix != "status" && !has_permission(state, username, "manage_rate_limits").await {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "RATE002",
+                "You do not have permission to manage rate limits",
+                request_id,
+            ));
+        }
         let basic =
             suffix.is_empty() || (!suffix.contains('/') && !matches!(suffix, "search" | "status"));
         if basic {
@@ -930,7 +1107,7 @@ async fn dispatch_core_entities(
                 updated: "Group updated successfully",
                 deleted: "Group deleted successfully",
                 duplicate_code: "GRP001",
-                not_found_code: "GRP002",
+                not_found_code: "GRP003",
             },
         ),
         (
@@ -945,8 +1122,8 @@ async fn dispatch_core_entities(
                 created: "Role created successfully",
                 updated: "Role updated successfully",
                 deleted: "Role deleted successfully",
-                duplicate_code: "ROL001",
-                not_found_code: "ROL002",
+                duplicate_code: "ROLE001",
+                not_found_code: "ROLE004",
             },
         ),
         (
@@ -1014,17 +1191,9 @@ async fn dispatch_core_entities(
 async fn tier_delete_route(
     state: &AppState,
     tier_id: &str,
-    username: &str,
+    _username: &str,
     request_id: &str,
 ) -> Response {
-    if !has_permission(state, username, "manage_tiers").await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "TIER001",
-            "You do not have permission to manage tiers",
-            request_id,
-        );
-    }
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
@@ -1033,7 +1202,7 @@ async fn tier_delete_route(
         .await
     {
         Ok(assignments) => assignments.len(),
-        Err(_) => return unexpected(request_id),
+        Err(_) => return tier_detail_failure("delete", request_id),
     };
     if assigned > 0 {
         return http_detail(
@@ -1046,13 +1215,13 @@ async fn tier_delete_route(
         .delete_one("tiers", &json!({"tier_id": tier_id}))
         .await
     {
-        Ok(true) => message(StatusCode::OK, "Tier deleted", request_id),
+        Ok(true) => response_model_envelope("Tier deleted", request_id),
         Ok(false) => http_detail(
             StatusCode::NOT_FOUND,
             &format!("Tier {tier_id} not found"),
             request_id,
         ),
-        Err(_) => unexpected(request_id),
+        Err(_) => tier_detail_failure("delete", request_id),
     }
 }
 
@@ -1065,7 +1234,11 @@ async fn tier_crud_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
-    if !has_permission(state, username, "manage_tiers").await {
+    let suffix = path.trim_start_matches("/tiers").trim_matches('/');
+    if suffix.is_empty()
+        && method == Method::GET
+        && !has_permission(state, username, "manage_tiers").await
+    {
         return error(
             StatusCode::FORBIDDEN,
             "TIER001",
@@ -1076,7 +1249,6 @@ async fn tier_crud_routes(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let suffix = path.trim_start_matches("/tiers").trim_matches('/');
     if suffix.is_empty() && method == Method::GET {
         let skip = match tier_pagination(query, "skip", 0, 0, usize::MAX) {
             Ok(value) => value,
@@ -1086,9 +1258,13 @@ async fn tier_crud_routes(
             Ok(value) => value,
             Err(()) => return tier_pagination_error("limit", request_id),
         };
-        let enabled_only = query
-            .get("enabled_only")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let enabled_only = match query.get("enabled_only") {
+            Some(value) => match pydantic_bool_string(value) {
+                Some(value) => value,
+                None => return tier_pagination_error("enabled_only", request_id),
+            },
+            None => false,
+        };
         let search = query
             .get("search")
             .map(|value| value.to_ascii_lowercase())
@@ -1147,14 +1323,10 @@ async fn tier_crud_routes(
                 request_id,
             );
         };
-        let Some(name) = payload
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "free" | "pro" | "enterprise" | "custom"))
-        else {
+        let Some(name) = payload.get("name").and_then(Value::as_str) else {
             return validation_errors(
                 vec![
-                    json!({"loc": ["body", "name"], "msg": "value is not a valid enumeration member", "type": "type_error.enum"}),
+                    json!({"loc": ["body", "name"], "msg": "field required", "type": "value_error.missing"}),
                 ],
                 request_id,
             );
@@ -1175,10 +1347,34 @@ async fn tier_crud_routes(
                 request_id,
             );
         };
-        if let Ok(Some(existing)) = storage
+        let fallback = || {
+            success(
+                StatusCode::CREATED,
+                tier_response(json!({
+                    "tier_id": tier_id, "name": name, "display_name": display_name,
+                    "description": payload.get("description").cloned().unwrap_or(Value::Null),
+                    "limits": tier_limits_response(limits),
+                    "price_monthly": payload.get("price_monthly").cloned().unwrap_or(Value::Null),
+                    "price_yearly": payload.get("price_yearly").cloned().unwrap_or(Value::Null),
+                    "features": payload.get("features").cloned().unwrap_or_else(|| json!([])),
+                    "is_default": payload.get("is_default").cloned().unwrap_or_else(|| json!(false)),
+                    "enabled": payload.get("enabled").cloned().unwrap_or_else(|| json!(true)),
+                    "created_at": Value::Null, "updated_at": Value::Null,
+                })),
+                request_id,
+            )
+        };
+        if !matches!(name, "free" | "pro" | "enterprise" | "custom") {
+            return fallback();
+        }
+        let existing = match storage
             .find_one("tiers", &json!({"tier_id": tier_id}))
             .await
         {
+            Ok(existing) => existing,
+            Err(_) => return fallback(),
+        };
+        if let Some(existing) = existing {
             return success(StatusCode::CREATED, tier_response(existing), request_id);
         }
         let now = timestamp_now_naive();
@@ -1198,7 +1394,7 @@ async fn tier_crud_routes(
         });
         return match storage.insert_one("tiers", tier.clone()).await {
             Ok(_) => success(StatusCode::CREATED, tier_response(tier), request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => fallback(),
         };
     }
     if suffix.is_empty() {
@@ -1220,7 +1416,7 @@ async fn tier_crud_routes(
                 &format!("Tier {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("get", request_id),
         };
     }
     if method == Method::PUT {
@@ -1252,7 +1448,7 @@ async fn tier_crud_routes(
                 &format!("Tier {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("update", request_id),
         };
     }
     error(
@@ -1284,6 +1480,414 @@ fn tier_pagination_error(field: &str, request_id: &str) -> Response {
         vec![json!({"loc": ["query", field], "msg": "value is not valid", "type": "value_error"})],
         request_id,
     )
+}
+
+fn tier_detail_failure(operation: &str, request_id: &str) -> Response {
+    let detail = match operation {
+        "get" => "Failed to get tier",
+        "update" => "Failed to update tier",
+        "delete" => "Failed to delete tier",
+        "assign" => "Failed to assign user",
+        "get_assignment" => "Failed to get assignment",
+        "get_user_tier" => "Failed to get user tier",
+        "remove_assignment" => "Failed to remove assignment",
+        "list_users" => "Failed to list users",
+        "upgrade" => "Failed to upgrade tier",
+        "downgrade" => "Failed to downgrade tier",
+        "temporary-upgrade" => "Failed to create temporary upgrade",
+        "trial/start" => "Failed to start trial",
+        "payment/failure" => "Failed to handle payment failure",
+        "compare" => "Failed to compare tiers",
+        _ => "An unexpected error occurred",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
+}
+
+fn tier_statistics_failure(request_id: &str) -> Response {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "TIER999",
+        "Failed to get statistics",
+        request_id,
+    )
+}
+
+fn pydantic_bool_string(value: &str) -> Option<bool> {
+    security_setting_bool(&Value::String(value.to_owned()))
+}
+
+fn is_tier_typed_mutation(path: &str, method: &Method) -> bool {
+    if method == Method::POST {
+        return matches!(
+            path,
+            "/tiers"
+                | "/tiers/"
+                | "/tiers/assignments"
+                | "/tiers/upgrade"
+                | "/tiers/downgrade"
+                | "/tiers/temporary-upgrade"
+                | "/tiers/trial/start"
+                | "/tiers/payment/failure"
+                | "/tiers/compare"
+        );
+    }
+    method == Method::PUT
+        && path
+            .strip_prefix("/tiers/")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/'))
+}
+
+fn tier_model_string(value: Option<&Value>, required: bool) -> Result<Option<Value>, ()> {
+    match value {
+        Some(Value::Null) if !required => Ok(None),
+        Some(value) => security_setting_string(value)
+            .map(|value| Some(Value::String(value)))
+            .ok_or(()),
+        None if !required => Ok(None),
+        None => Err(()),
+    }
+}
+
+fn tier_model_integer(value: Option<&Value>, default: Option<i64>) -> Result<Option<Value>, ()> {
+    match value {
+        Some(Value::Null) if default.is_none() => Ok(Some(Value::Null)),
+        Some(value) => rate_rule_integer(value)
+            .map(|value| Some(json!(value)))
+            .ok_or(()),
+        None => Ok(default.map(|value| json!(value))),
+    }
+}
+
+fn tier_model_float(value: Option<&Value>) -> Result<Option<Value>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let parsed = match value {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.parse::<f64>().ok(),
+        Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+    .ok_or(())?;
+    serde_json::Number::from_f64(parsed)
+        .map(Value::Number)
+        .map(Some)
+        .ok_or(())
+}
+
+fn tier_model_datetime(value: &Value) -> Option<Value> {
+    let numeric = match value {
+        Value::Number(value) => value.as_f64(),
+        Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    if let Some(mut seconds) = numeric {
+        if seconds.is_nan() {
+            return None;
+        }
+        if seconds > 3e20 {
+            return Some(json!("9999-12-31T23:59:59.999999"));
+        }
+        if seconds < -3e20 {
+            return Some(json!("0001-01-01T00:00:00"));
+        }
+        while seconds.abs() > 2e10 {
+            seconds /= 1_000.0;
+        }
+        let micros = (seconds * 1_000_000.0).round_ties_even() as i128;
+        let datetime = time::OffsetDateTime::from_unix_timestamp_nanos(micros * 1_000).ok()?;
+        return Some(Value::String(format_tier_datetime(datetime, Some(0))));
+    }
+
+    static DATETIME: OnceLock<Regex> = OnceLock::new();
+    let value = value.as_str()?;
+    let captures = DATETIME
+        .get_or_init(|| {
+            Regex::new(
+                r"^(\d{4})-(\d{1,2})-(\d{1,2})[T ](\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,12}))?)?(Z|[+-]\d{2}(?::?\d{2})?)?$",
+            )
+            .expect("tier datetime regex")
+        })
+        .captures(value)?;
+    let number = |index| captures.get(index)?.as_str().parse::<u8>().ok();
+    let year = captures.get(1)?.as_str().parse::<i32>().ok()?;
+    let month = time::Month::try_from(number(2)?).ok()?;
+    let day = number(3)?;
+    let hour = number(4)?;
+    let minute = number(5)?;
+    let second = captures
+        .get(6)
+        .map_or(Some(0), |value| value.as_str().parse::<u8>().ok())?;
+    let micros = captures.get(7).map_or(Some(0), |value| {
+        let digits = value.as_str();
+        let padded = format!("{digits:0<6}");
+        padded[..6].parse::<u32>().ok()
+    })?;
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let time = time::Time::from_hms_micro(hour, minute, second, micros).ok()?;
+    let offset_minutes = match captures.get(8).map(|value| value.as_str()) {
+        None => None,
+        Some("Z") => Some(0),
+        Some(offset) => {
+            let sign = if offset.starts_with('-') { -1 } else { 1 };
+            let digits = &offset[1..];
+            let hours = digits.get(..2)?.parse::<i32>().ok()?;
+            let minutes = match digits.len() {
+                2 => 0,
+                4 => digits.get(2..)?.parse::<i32>().ok()?,
+                5 if digits.as_bytes().get(2) == Some(&b':') => {
+                    digits.get(3..)?.parse::<i32>().ok()?
+                }
+                _ => return None,
+            };
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            Some(sign * (hours * 60 + minutes))
+        }
+    };
+    let datetime = time::PrimitiveDateTime::new(date, time).assume_utc();
+    Some(Value::String(format_tier_datetime(
+        datetime,
+        offset_minutes,
+    )))
+}
+
+fn format_tier_datetime(datetime: time::OffsetDateTime, offset_minutes: Option<i32>) -> String {
+    let mut value = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        datetime.year(),
+        u8::from(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+    );
+    if datetime.microsecond() != 0 {
+        write!(value, ".{:06}", datetime.microsecond()).expect("write to string");
+    }
+    if let Some(minutes) = offset_minutes {
+        let sign = if minutes < 0 { '-' } else { '+' };
+        let minutes = minutes.abs();
+        write!(value, "{sign}{:02}:{:02}", minutes / 60, minutes % 60).expect("write to string");
+    }
+    value
+}
+
+fn normalize_tier_limits(value: &Value) -> Result<Value, ()> {
+    let input = value.as_object().ok_or(())?;
+    let mut output = Map::new();
+    for field in [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "requests_per_day",
+        "requests_per_month",
+        "monthly_request_quota",
+        "daily_request_quota",
+        "monthly_bandwidth_quota",
+    ] {
+        if let Some(value) = tier_model_integer(input.get(field), None)? {
+            output.insert(field.to_owned(), value);
+        }
+    }
+    for (field, default) in [
+        ("burst_per_second", 0),
+        ("burst_per_minute", 0),
+        ("burst_per_hour", 0),
+        ("max_queue_time_ms", 5_000),
+    ] {
+        output.insert(
+            field.to_owned(),
+            tier_model_integer(input.get(field), Some(default))?.ok_or(())?,
+        );
+    }
+    output.insert(
+        "enable_throttling".to_owned(),
+        json!(match input.get("enable_throttling") {
+            Some(value) => security_setting_bool(value).ok_or(())?,
+            None => false,
+        }),
+    );
+    Ok(Value::Object(output))
+}
+
+fn tier_model_features(value: Option<&Value>, default: bool) -> Result<Option<Value>, ()> {
+    let Some(value) = value else {
+        return Ok(default.then(|| json!([])));
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value.as_array().ok_or(())?;
+    let values = values
+        .iter()
+        .map(|value| security_setting_string(value).map(Value::String).ok_or(()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Value::Array(values)))
+}
+
+fn insert_tier_optional(output: &mut Map<String, Value>, field: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        output.insert(field.to_owned(), value);
+    }
+}
+
+fn normalize_tier_create_or_update(payload: &Value, create: bool) -> Result<Value, ()> {
+    let input = payload.as_object().ok_or(())?;
+    let mut output = Map::new();
+    for field in ["tier_id", "name", "display_name"] {
+        if create || input.contains_key(field) {
+            insert_tier_optional(
+                &mut output,
+                field,
+                tier_model_string(input.get(field), create)?,
+            );
+        }
+    }
+    if let Some(value) = tier_model_string(input.get("description"), false)? {
+        output.insert("description".to_owned(), value);
+    }
+    if create || input.contains_key("limits") {
+        match input.get("limits") {
+            Some(Value::Null) if !create => {}
+            Some(value) => {
+                output.insert("limits".to_owned(), normalize_tier_limits(value)?);
+            }
+            None if create => return Err(()),
+            None => {}
+        }
+    }
+    for field in ["price_monthly", "price_yearly"] {
+        insert_tier_optional(&mut output, field, tier_model_float(input.get(field))?);
+    }
+    insert_tier_optional(
+        &mut output,
+        "features",
+        tier_model_features(input.get("features"), create)?,
+    );
+    for (field, default) in [("is_default", false), ("enabled", true)] {
+        match input.get(field) {
+            Some(Value::Null) if !create => {}
+            Some(value) => {
+                output.insert(
+                    field.to_owned(),
+                    json!(security_setting_bool(value).ok_or(())?),
+                );
+            }
+            None if create => {
+                output.insert(field.to_owned(), json!(default));
+            }
+            None => {}
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn tier_action_string(
+    input: &Map<String, Value>,
+    output: &mut Map<String, Value>,
+    field: &str,
+    required: bool,
+) -> Result<(), ()> {
+    insert_tier_optional(
+        output,
+        field,
+        tier_model_string(input.get(field), required)?,
+    );
+    Ok(())
+}
+
+fn normalize_tier_request(path: &str, method: &Method, payload: &mut Value) -> Result<(), ()> {
+    if path == "/tiers/compare" {
+        let input = payload.as_array().ok_or(())?;
+        *payload = Value::Array(
+            input
+                .iter()
+                .map(|value| security_setting_string(value).map(Value::String).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        return Ok(());
+    }
+    if matches!(path, "/tiers" | "/tiers/") {
+        *payload = normalize_tier_create_or_update(payload, true)?;
+        return Ok(());
+    }
+    if method == Method::PUT {
+        *payload = normalize_tier_create_or_update(payload, false)?;
+        return Ok(());
+    }
+
+    let input = payload.as_object().ok_or(())?;
+    let mut output = Map::new();
+    tier_action_string(input, &mut output, "user_id", true)?;
+    match path {
+        "/tiers/assignments" => {
+            tier_action_string(input, &mut output, "tier_id", true)?;
+            for field in ["effective_from", "effective_until"] {
+                if let Some(value) = input.get(field).filter(|value| !value.is_null()) {
+                    output.insert(field.to_owned(), tier_model_datetime(value).ok_or(())?);
+                }
+            }
+            if let Some(value) = input
+                .get("override_limits")
+                .filter(|value| !value.is_null())
+            {
+                output.insert("override_limits".to_owned(), normalize_tier_limits(value)?);
+            }
+            tier_action_string(input, &mut output, "notes", false)?;
+        }
+        "/tiers/upgrade" => {
+            tier_action_string(input, &mut output, "new_tier_id", true)?;
+            output.insert(
+                "immediate".to_owned(),
+                json!(match input.get("immediate") {
+                    Some(value) => security_setting_bool(value).ok_or(())?,
+                    None => true,
+                }),
+            );
+            if let Some(value) = input.get("scheduled_date").filter(|value| !value.is_null()) {
+                output.insert(
+                    "scheduled_date".to_owned(),
+                    tier_model_datetime(value).ok_or(())?,
+                );
+            }
+        }
+        "/tiers/downgrade" => {
+            tier_action_string(input, &mut output, "new_tier_id", true)?;
+            output.insert(
+                "grace_period_days".to_owned(),
+                tier_model_integer(input.get("grace_period_days"), Some(0))?.ok_or(())?,
+            );
+        }
+        "/tiers/temporary-upgrade" => {
+            tier_action_string(input, &mut output, "temp_tier_id", true)?;
+            let duration = input
+                .get("duration_days")
+                .filter(|value| !value.is_null())
+                .and_then(rate_rule_integer)
+                .ok_or(())?;
+            output.insert("duration_days".to_owned(), json!(duration));
+        }
+        "/tiers/trial/start" => {
+            tier_action_string(input, &mut output, "tier_id", true)?;
+            output.insert(
+                "days".to_owned(),
+                tier_model_integer(input.get("days"), Some(14))?.ok_or(())?,
+            );
+        }
+        "/tiers/payment/failure" => {
+            tier_action_string(input, &mut output, "reason", false)?;
+        }
+        _ => return Err(()),
+    }
+    *payload = Value::Object(output);
+    Ok(())
 }
 
 fn tier_limits_response(limits: &Value) -> Value {
@@ -1333,6 +1937,19 @@ fn tier_response(tier: Value) -> Value {
     })
 }
 
+fn tier_assignment_response(assignment: Value) -> Value {
+    json!({
+        "user_id": assignment.get("user_id").cloned().unwrap_or(Value::Null),
+        "tier_id": assignment.get("tier_id").cloned().unwrap_or(Value::Null),
+        "override_limits": assignment.get("override_limits").cloned().unwrap_or(Value::Null),
+        "effective_from": assignment.get("effective_from").cloned().unwrap_or(Value::Null),
+        "effective_until": assignment.get("effective_until").cloned().unwrap_or(Value::Null),
+        "assigned_at": assignment.get("assigned_at").cloned().unwrap_or(Value::Null),
+        "assigned_by": assignment.get("assigned_by").cloned().unwrap_or(Value::Null),
+        "notes": assignment.get("notes").cloned().unwrap_or(Value::Null),
+    })
+}
+
 async fn tier_management_routes(
     state: &AppState,
     path: &str,
@@ -1342,7 +1959,10 @@ async fn tier_management_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
-    if !has_permission(state, username, "manage_tiers").await {
+    let suffix = path.trim_start_matches("/tiers/");
+    let protected_statistics =
+        method == Method::GET && (suffix == "statistics/all" || suffix.ends_with("/statistics"));
+    if protected_statistics && !has_permission(state, username, "manage_tiers").await {
         return error(
             StatusCode::FORBIDDEN,
             "TIER001",
@@ -1353,7 +1973,6 @@ async fn tier_management_routes(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let suffix = path.trim_start_matches("/tiers/");
     if suffix == "assignments" && method == Method::GET {
         let items = storage
             .find_many("user_tier_assignments", &json!({}))
@@ -1383,13 +2002,14 @@ async fn tier_management_routes(
                 request_id,
             );
         }
-        if storage
+        let tier_exists = match storage
             .find_one("tiers", &json!({"tier_id": &tier_id}))
             .await
-            .ok()
-            .flatten()
-            .is_none()
         {
+            Ok(tier) => tier.is_some(),
+            Err(_) => return tier_detail_failure("assign", request_id),
+        };
+        if !tier_exists {
             // Oracle: tier_service.assign_user_to_tier raises ValueError here,
             // which the FastAPI route exposes as a 400 detail response.
             return http_detail(
@@ -1398,11 +2018,13 @@ async fn tier_management_routes(
                 request_id,
             );
         }
-        let existing = storage
+        let existing = match storage
             .find_one("user_tier_assignments", &json!({"user_id": &user_id}))
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(existing) => existing,
+            Err(_) => return tier_detail_failure("assign", request_id),
+        };
         // Match UserTierAssignment.to_dict(), including explicit nulls.  In
         // particular, this is a replacement on reassignment: fields omitted
         // from the new request must not survive from the previous assignment.
@@ -1433,7 +2055,7 @@ async fn tier_management_routes(
         };
         return match result {
             Ok(()) => success(StatusCode::CREATED, assignment, request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => tier_detail_failure("assign", request_id),
         };
     }
     if let Some(rest) = suffix.strip_prefix("assignments/") {
@@ -1443,20 +2065,32 @@ async fn tier_management_routes(
                 .delete_one("user_tier_assignments", &json!({"user_id": user_id}))
                 .await
             {
-                Ok(true) => message(StatusCode::OK, "Assignment removed", request_id),
-                _ => http_detail(
+                Ok(true) => response_model_envelope("Assignment removed", request_id),
+                Ok(false) => http_detail(
                     StatusCode::NOT_FOUND,
                     &format!("No assignment found for user {user_id}"),
                     request_id,
                 ),
+                Err(_) => tier_detail_failure("remove_assignment", request_id),
             };
         }
         if method == Method::GET {
-            let assignment = storage
+            let assignment = match storage
                 .find_one("user_tier_assignments", &json!({"user_id": user_id}))
                 .await
-                .ok()
-                .flatten();
+            {
+                Ok(assignment) => assignment,
+                Err(_) => {
+                    return tier_detail_failure(
+                        if rest.ends_with("/tier") {
+                            "get_user_tier"
+                        } else {
+                            "get_assignment"
+                        },
+                        request_id,
+                    );
+                }
+            };
             if rest.ends_with("/tier") {
                 // UserTierAssignment.to_dict serializes datetimes, while the
                 // pinned dataclass loader leaves those strings unparsed.
@@ -1491,20 +2125,20 @@ async fn tier_management_routes(
                         .await
                 };
                 return match tier {
-                    Ok(Some(tier)) => success(StatusCode::OK, strip_internal(tier), request_id),
-                    _ => http_detail(
+                    Ok(Some(tier)) => success(StatusCode::OK, tier_response(tier), request_id),
+                    Ok(None) => http_detail(
                         StatusCode::NOT_FOUND,
                         &format!("No tier found for user {user_id}"),
                         request_id,
                     ),
+                    Err(_) => tier_detail_failure("get_user_tier", request_id),
                 };
             }
             return match assignment {
-                Some(value) => success(StatusCode::OK, strip_internal(value), request_id),
-                None => error(
+                Some(value) => success(StatusCode::OK, tier_assignment_response(value), request_id),
+                None => http_detail(
                     StatusCode::NOT_FOUND,
-                    "TIER404",
-                    "Assignment not found",
+                    &format!("No assignment found for user {user_id}"),
                     request_id,
                 ),
             };
@@ -1512,34 +2146,37 @@ async fn tier_management_routes(
     }
     if suffix.ends_with("/users") && method == Method::GET {
         let tier_id = suffix.trim_end_matches("/users");
-        let skip = query
-            .get("skip")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = query
-            .get("limit")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(100);
-        let users = storage
+        let skip = match tier_pagination(query, "skip", 0, 0, usize::MAX) {
+            Ok(value) => value,
+            Err(()) => return tier_pagination_error("skip", request_id),
+        };
+        let limit = match tier_pagination(query, "limit", 100, 1, 1_000) {
+            Ok(value) => value,
+            Err(()) => return tier_pagination_error("limit", request_id),
+        };
+        let users = match storage
             .find_many("user_tier_assignments", &json!({"tier_id": tier_id}))
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .skip(skip)
-            .take(limit)
-            .map(strip_internal)
-            .collect::<Vec<_>>();
+        {
+            Ok(users) => users,
+            Err(_) => return tier_detail_failure("list_users", request_id),
+        }
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(tier_assignment_response)
+        .collect::<Vec<_>>();
         return success(StatusCode::OK, json!(users), request_id);
     }
     if suffix == "statistics/all" && method == Method::GET {
-        let tiers = storage
-            .find_many("tiers", &json!({}))
-            .await
-            .unwrap_or_default();
-        let assignments = storage
-            .find_many("user_tier_assignments", &json!({}))
-            .await
-            .unwrap_or_default();
+        let tiers = match storage.find_many("tiers", &json!({})).await {
+            Ok(tiers) => tiers,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
+        let assignments = match storage.find_many("user_tier_assignments", &json!({})).await {
+            Ok(assignments) => assignments,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
         let result: Vec<Value> = tiers
             .into_iter()
             .map(|tier| {
@@ -1576,10 +2213,13 @@ async fn tier_management_routes(
     }
     if suffix.ends_with("/statistics") && method == Method::GET {
         let tier_id = suffix.trim_end_matches("/statistics");
-        let assignments = storage
+        let assignments = match storage
             .find_many("user_tier_assignments", &json!({"tier_id": tier_id}))
             .await
-            .unwrap_or_default();
+        {
+            Ok(assignments) => assignments,
+            Err(_) => return tier_statistics_failure(request_id),
+        };
         let total_users = assignments.len();
         let active_users = assignments
             .iter()
@@ -1599,23 +2239,20 @@ async fn tier_management_routes(
         );
     }
     if suffix == "compare" && method == Method::POST {
-        let ids = payload
-            .as_array()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .get("tier_ids")
-                    .or_else(|| payload.get("tiers"))
-                    .and_then(Value::as_array)
-                    .cloned()
+        let ids = payload.as_array().cloned().unwrap_or_default();
+        let stored = match storage.find_many("tiers", &json!({})).await {
+            Ok(tiers) => tiers,
+            Err(_) => return tier_detail_failure("compare", request_id),
+        };
+        // TierService loops over the requested identifiers, so input order and
+        // duplicates are observable and must not be replaced by collection order.
+        let tiers = ids
+            .iter()
+            .filter_map(|tier_id| {
+                stored
+                    .iter()
+                    .find(|tier| tier.get("tier_id") == Some(tier_id))
             })
-            .unwrap_or_default();
-        let tiers = storage
-            .find_many("tiers", &json!({}))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|tier| ids.contains(tier.get("tier_id").unwrap_or(&Value::Null)))
             .map(|tier| {
                 json!({
                     "tier_id": tier.get("tier_id").cloned().unwrap_or(Value::Null),
@@ -1649,7 +2286,7 @@ async fn tier_management_routes(
             let serialized_effective_dates =
                 match tier_assignment_has_serialized_effective_dates(storage, user_id).await {
                     Ok(value) => value,
-                    Err(_) => return unexpected(request_id),
+                    Err(_) => return tier_detail_failure(suffix, request_id),
                 };
             if serialized_effective_dates {
                 let detail = match suffix {
@@ -1661,6 +2298,14 @@ async fn tier_management_routes(
                 return http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id);
             }
         }
+        let current_tier_id = if matches!(suffix, "upgrade" | "downgrade" | "payment/failure") {
+            match tier_action_current_tier_id(storage, user_id).await {
+                Ok(tier_id) => tier_id.unwrap_or_else(|| "default".to_owned()),
+                Err(_) => return tier_detail_failure(suffix, request_id),
+            }
+        } else {
+            "default".to_owned()
+        };
         let (tier_id, effective_from, effective_until, notes, assigned_by, missing_status) =
             match suffix {
                 "upgrade" => {
@@ -1688,14 +2333,7 @@ async fn tier_management_routes(
                         tier_id.to_owned(),
                         effective_from,
                         Value::Null,
-                        format!(
-                            "Upgraded from {}",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
-                        ),
+                        format!("Upgraded from {current_tier_id}"),
                         Value::Null,
                         StatusCode::BAD_REQUEST,
                     )
@@ -1719,12 +2357,7 @@ async fn tier_management_routes(
                         Value::String(effective_from),
                         Value::Null,
                         format!(
-                            "Downgraded from {} with {grace_days} day grace period",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
+                            "Downgraded from {current_tier_id} with {grace_days} day grace period"
                         ),
                         Value::Null,
                         StatusCode::BAD_REQUEST,
@@ -1778,7 +2411,7 @@ async fn tier_management_routes(
                                 request_id,
                             );
                         }
-                        Err(_) => return unexpected(request_id),
+                        Err(_) => return tier_detail_failure(suffix, request_id),
                     };
                     let Some(tier_id) = default_tier.get("tier_id").and_then(Value::as_str) else {
                         return http_detail(
@@ -1791,14 +2424,7 @@ async fn tier_management_routes(
                         tier_id.to_owned(),
                         Value::String(timestamp_after_days(0)),
                         Value::Null,
-                        format!(
-                            "Downgraded from {} with 0 day grace period",
-                            tier_action_current_tier_id(storage, user_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "default".to_owned())
-                        ),
+                        format!("Downgraded from {current_tier_id} with 0 day grace period"),
                         json!("system:payment_failure"),
                         StatusCode::BAD_REQUEST,
                     )
@@ -1817,9 +2443,9 @@ async fn tier_management_routes(
                     request_id,
                 );
             }
-            Err(_) => return unexpected(request_id),
+            Err(_) => return tier_detail_failure(suffix, request_id),
         };
-        let _ = tier;
+        let notification_effective_from = effective_from.clone();
         return match replace_tier_assignment(
             storage,
             user_id,
@@ -1834,8 +2460,18 @@ async fn tier_management_routes(
         )
         .await
         {
-            Ok(assignment) => success(StatusCode::OK, assignment, request_id),
-            Err(_) => unexpected(request_id),
+            Ok(assignment) => {
+                send_tier_notification(
+                    suffix,
+                    user_id,
+                    &tier,
+                    &notification_effective_from,
+                    &payload,
+                )
+                .await;
+                success(StatusCode::OK, assignment, request_id)
+            }
+            Err(_) => tier_detail_failure(suffix, request_id),
         };
     }
     error(
@@ -1844,6 +2480,62 @@ async fn tier_management_routes(
         "Platform route does not exist",
         request_id,
     )
+}
+
+async fn send_tier_notification(
+    action: &str,
+    user_id: &str,
+    tier: &Value,
+    effective_from: &Value,
+    payload: &Value,
+) {
+    let display_name = tier
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let effective = effective_from.as_str().unwrap_or_default();
+    let recipient = format!("{user_id}@example.com");
+    let (subject, body) = match action {
+        "upgrade" => (
+            "Tier Upgrade Notification",
+            format!("You have been upgraded to the {display_name} plan.\nEffective: {effective}"),
+        ),
+        "downgrade" => (
+            "Tier Downgrade Notification",
+            format!("You have been downgraded to the {display_name} plan.\nEffective: {effective}"),
+        ),
+        "temporary-upgrade" | "trial/start" => {
+            let days = payload
+                .get(if action == "temporary-upgrade" {
+                    "duration_days"
+                } else {
+                    "days"
+                })
+                .and_then(Value::as_i64)
+                .unwrap_or(if action == "temporary-upgrade" { 0 } else { 14 });
+            (
+                "Trial Activated",
+                format!("You have been given a temporary trial of {display_name} for {days} days."),
+            )
+        }
+        "payment/failure" => (
+            "Tier Downgrade Notification",
+            format!("You have been downgraded to the {display_name} plan.\nEffective: {effective}"),
+        ),
+        _ => return,
+    };
+    crate::observability::email::send_email(&recipient, subject, &body, None).await;
+    if action == "payment/failure" {
+        crate::observability::email::send_email(
+            &recipient,
+            "Payment Failure - Account Downgraded",
+            &format!(
+                "We could not process your payment. Your account has been downgraded to {display_name}."
+            ),
+            None,
+        )
+        .await;
+    }
 }
 
 async fn tier_action_current_tier_id(
@@ -1929,7 +2621,7 @@ async fn rate_limit_management_routes(
         return http_detail(StatusCode::NOT_FOUND, "Rule status not found", request_id);
     }
     if suffix == "search" && method == Method::GET {
-        let Some(term) = query.get("q").map(|value| value.to_ascii_lowercase()) else {
+        let Some(term) = query.get("q") else {
             return rate_rule_validation("q", "field required", "value_error.missing", request_id);
         };
         // The pinned async in-memory backend does not evaluate the Mongo
@@ -1938,6 +2630,13 @@ async fn rate_limit_management_routes(
         if storage.is_memory() {
             return success(StatusCode::OK, json!([]), request_id);
         }
+        let pattern = match regex::RegexBuilder::new(term)
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(pattern) => pattern,
+            Err(_) => return rate_rule_failure("search", request_id),
+        };
         let mut rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
             Err(_) => {
@@ -1955,7 +2654,7 @@ async fn rate_limit_management_routes(
             ["rule_id", "description", "target_identifier"]
                 .iter()
                 .filter_map(|field| rule.get(*field).and_then(Value::as_str))
-                .any(|field| field.to_ascii_lowercase().contains(&term))
+                .any(|field| pattern.is_match(field))
         });
         rules.sort_by_key(|rule| {
             std::cmp::Reverse(rule.get("priority").and_then(Value::as_i64).unwrap_or(0))
@@ -1969,11 +2668,11 @@ async fn rate_limit_management_routes(
     if suffix == "statistics/summary" && method == Method::GET {
         let rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return rate_rule_failure("statistics", request_id),
         };
         let enabled = rules
             .iter()
-            .filter(|rule| rule.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+            .filter(|rule| rule.get("enabled").and_then(Value::as_bool) == Some(true))
             .count();
         let rule_types = [
             "per_user",
@@ -2016,14 +2715,53 @@ async fn rate_limit_management_routes(
         && matches!(operation, "delete" | "enable" | "disable")
     {
         // The pinned Python app's bulk routes are internally inconsistent:
-        // `/bulk/enable` and `/bulk/disable` are shadowed by `{rule_id}` and
-        // fail as a missing rule, while its delete service raises a 500.
-        // Preserve the observed wire behavior instead of implementing the
-        // advertised OpenAPI success responses.
+        // `/bulk/enable` and `/bulk/disable` are shadowed by `{rule_id}`. The
+        // in-memory backend lacks delete_many, so non-empty bulk deletes fail;
+        // its early empty-list return and external-storage success remain live.
         return if operation == "delete" {
-            http_detail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to delete rules",
+            let Some(rule_ids) = payload.get("rule_ids").and_then(Value::as_array) else {
+                return rate_rule_validation(
+                    "rule_ids",
+                    "field required",
+                    "value_error.missing",
+                    request_id,
+                );
+            };
+            let rule_ids = match rule_ids
+                .iter()
+                .map(|value| security_setting_string(value).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(rule_ids) => rule_ids,
+                Err(()) => {
+                    return rate_rule_validation(
+                        "rule_ids",
+                        "str type expected",
+                        "type_error.str",
+                        request_id,
+                    );
+                }
+            };
+            if rule_ids.is_empty() {
+                return success(StatusCode::OK, json!({"deleted_count": 0}), request_id);
+            }
+            if storage.is_memory() {
+                return rate_rule_failure("bulk/delete", request_id);
+            }
+            let mut deleted_count = 0;
+            for rule_id in rule_ids {
+                match storage
+                    .delete_one("rate_limit_rules", &json!({"rule_id": rule_id}))
+                    .await
+                {
+                    Ok(true) => deleted_count += 1,
+                    Ok(false) => {}
+                    Err(_) => return rate_rule_failure("bulk/delete", request_id),
+                }
+            }
+            success(
+                StatusCode::OK,
+                json!({"deleted_count": deleted_count}),
                 request_id,
             )
         } else {
@@ -2051,46 +2789,46 @@ async fn rate_limit_management_routes(
                     &format!("Rule {id} not found"),
                     request_id,
                 ),
-                Err(_) => unexpected(request_id),
+                Err(_) => rate_rule_failure(parts[1], request_id),
             };
         }
         if parts[1] == "duplicate" {
-            let Some(mut rule) = storage
+            let mut rule = match storage
                 .find_one("rate_limit_rules", &json!({"rule_id": id}))
                 .await
-                .ok()
-                .flatten()
+            {
+                Ok(Some(rule)) => rule,
+                Ok(None) => {
+                    return http_detail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Source rule {id} not found"),
+                        request_id,
+                    );
+                }
+                Err(_) => return rate_rule_failure("duplicate", request_id),
+            };
+            let Some(new_rule_id) = payload.get("new_rule_id").and_then(security_setting_string)
             else {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "RATE404",
-                    "Rule not found",
+                return rate_rule_validation(
+                    "new_rule_id",
+                    "field required",
+                    "value_error.missing",
                     request_id,
                 );
             };
-            let Some(new_rule_id) = payload
-                .get("new_rule_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
-                return validation_errors(
-                    vec![
-                        json!({"loc": ["body", "new_rule_id"], "msg": "field required", "type": "value_error.missing"}),
-                    ],
-                    request_id,
-                );
-            };
-            if matches!(
-                storage
-                    .find_one("rate_limit_rules", &json!({"rule_id": new_rule_id}))
-                    .await,
-                Ok(Some(_))
-            ) {
-                return http_detail(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Rule with ID {new_rule_id} already exists"),
-                    request_id,
-                );
+            match storage
+                .find_one("rate_limit_rules", &json!({"rule_id": new_rule_id}))
+                .await
+            {
+                Ok(Some(_)) => {
+                    return http_detail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Rule with ID {new_rule_id} already exists"),
+                        request_id,
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => return rate_rule_failure("duplicate", request_id),
             }
             rule["rule_id"] = json!(new_rule_id);
             rule["description"] = json!(format!("Copy of {id}"));
@@ -2101,7 +2839,7 @@ async fn rate_limit_management_routes(
             }
             return match storage.insert_one("rate_limit_rules", rule).await {
                 Ok(rule) => success(StatusCode::CREATED, rate_rule_response(rule), request_id),
-                Err(_) => unexpected(request_id),
+                Err(_) => rate_rule_failure("duplicate", request_id),
             };
         }
     }
@@ -2129,11 +2867,25 @@ async fn rate_limit_crud_routes(
     if suffix.is_empty() && method == Method::GET {
         let skip = match tier_pagination(query, "skip", 0, 0, usize::MAX) {
             Ok(value) => value,
-            Err(()) => return tier_pagination_error("skip", request_id),
+            Err(()) => {
+                return rate_rule_validation(
+                    "skip",
+                    "value is not valid",
+                    "value_error",
+                    request_id,
+                );
+            }
         };
         let limit = match tier_pagination(query, "limit", 100, 1, 1_000) {
             Ok(value) => value,
-            Err(()) => return tier_pagination_error("limit", request_id),
+            Err(()) => {
+                return rate_rule_validation(
+                    "limit",
+                    "value is not valid",
+                    "value_error",
+                    request_id,
+                );
+            }
         };
         let rule_type = query.get("rule_type").map(String::as_str);
         if rule_type.is_some_and(|rule_type| {
@@ -2154,12 +2906,23 @@ async fn rate_limit_crud_routes(
                 request_id,
             );
         }
-        let enabled_only = query
-            .get("enabled_only")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let enabled_only = match query.get("enabled_only") {
+            Some(value) => match security_setting_bool(&json!(value)) {
+                Some(value) => value,
+                None => {
+                    return rate_rule_validation(
+                        "enabled_only",
+                        "value could not be parsed to a boolean",
+                        "type_error.bool",
+                        request_id,
+                    );
+                }
+            },
+            None => false,
+        };
         let mut rules = match storage.find_many("rate_limit_rules", &json!({})).await {
             Ok(rules) => rules,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return rate_rule_failure("list", request_id),
         };
         rules.sort_by_key(|rule| {
             std::cmp::Reverse(rule.get("priority").and_then(Value::as_i64).unwrap_or(0))
@@ -2178,11 +2941,15 @@ async fn rate_limit_crud_routes(
         return success(StatusCode::OK, json!(rules), request_id);
     }
     if suffix.is_empty() && method == Method::POST {
-        let Some(rule_id) = payload
-            .get("rule_id")
-            .and_then(security_setting_string)
-            .filter(|value| !value.is_empty())
-        else {
+        if !payload.is_object() {
+            return rate_rule_validation(
+                "body",
+                "value is not a valid dict",
+                "type_error.dict",
+                request_id,
+            );
+        }
+        let Some(rule_id) = payload.get("rule_id").and_then(security_setting_string) else {
             return rate_rule_validation(
                 "rule_id",
                 "field required",
@@ -2335,17 +3102,19 @@ async fn rate_limit_crud_routes(
                 request_id,
             );
         }
-        if matches!(
-            storage
-                .find_one("rate_limit_rules", &json!({"rule_id": rule_id}))
-                .await,
-            Ok(Some(_))
-        ) {
-            return http_detail(
-                StatusCode::BAD_REQUEST,
-                &format!("Rule with ID {rule_id} already exists"),
-                request_id,
-            );
+        match storage
+            .find_one("rate_limit_rules", &json!({"rule_id": rule_id}))
+            .await
+        {
+            Ok(Some(_)) => {
+                return http_detail(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Rule with ID {rule_id} already exists"),
+                    request_id,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => return rate_rule_failure("create", request_id),
         }
         let rule = json!({
             "rule_id": rule_id,
@@ -2362,7 +3131,7 @@ async fn rate_limit_crud_routes(
         });
         return match storage.insert_one("rate_limit_rules", rule.clone()).await {
             Ok(_) => success(StatusCode::CREATED, rate_rule_response(rule), request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("create", request_id),
         };
     }
     if suffix.is_empty() {
@@ -2384,10 +3153,18 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("get", request_id),
         };
     }
     if method == Method::PUT {
+        if !payload.is_object() {
+            return rate_rule_validation(
+                "body",
+                "value is not a valid dict",
+                "type_error.dict",
+                request_id,
+            );
+        }
         let mut updates = Value::Object(Map::new());
         if let Some(value) = payload.get("limit").filter(|value| !value.is_null()) {
             let Some(value) = rate_rule_integer(value).filter(|value| *value > 0) else {
@@ -2472,7 +3249,7 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("update", request_id),
         };
     }
     if method == Method::DELETE {
@@ -2490,7 +3267,7 @@ async fn rate_limit_crud_routes(
                 &format!("Rule {suffix} not found"),
                 request_id,
             ),
-            Err(_) => unexpected(request_id),
+            Err(_) => rate_rule_failure("delete", request_id),
         };
     }
     error(
@@ -2515,6 +3292,27 @@ fn rate_rule_validation(
         "Validation Error",
         request_id,
     )
+}
+
+fn rate_rule_failure(operation: &str, request_id: &str) -> Response {
+    let detail = match operation {
+        "create" => "Failed to create rule",
+        "list" => "Failed to list rules",
+        "search" => "Failed to search rules",
+        "get" => "Failed to get rule",
+        "update" => "Failed to update rule",
+        "delete" => "Failed to delete rule",
+        "enable" => "Failed to enable rule",
+        "disable" => "Failed to disable rule",
+        "bulk/delete" => "Failed to delete rules",
+        "bulk/enable" => "Failed to enable rules",
+        "bulk/disable" => "Failed to disable rules",
+        "duplicate" => "Failed to duplicate rule",
+        "statistics" => "Failed to get statistics",
+        "status" => "Failed to get rate limit status",
+        _ => "An unexpected error occurred",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
 }
 
 fn rate_rule_integer(value: &Value) -> Option<i64> {
@@ -2579,40 +3377,111 @@ async fn entity_routes(
                 request_id,
             );
         }
-        if method == Method::PUT && payload.as_object().is_some_and(|object| object.is_empty()) {
-            let (code, message_text) = match spec.collection {
-                "roles" => ("ROLE007", "No data to update"),
-                "groups" => ("GRP006", "No data to update"),
-                "routings" => ("RTG007", "No data to update"),
-                _ => ("VAL001", "No data to update"),
-            };
-            return error(StatusCode::BAD_REQUEST, code, message_text, request_id);
-        }
     }
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
-        if !has_permission(state, username, spec.permission).await {
+        // The pinned get_groups only authenticates; get_routings requires
+        // manage_routings (RTG012).
+        if spec.collection == "routings" && !has_permission(state, username, spec.permission).await
+        {
             return error(
                 StatusCode::FORBIDDEN,
-                spec.permission_code,
-                "Insufficient permissions",
+                "RTG012",
+                "You do not have permission to get routings",
                 request_id,
             );
         }
-        if let Err(message_text) = validate_pagination(query) {
-            return error(StatusCode::BAD_REQUEST, "PAG001", message_text, request_id);
+        if spec.collection != "roles" {
+            // Python's `get_groups`/`get_routings` type `page`/`page_size` as
+            // typed FastAPI query params (a non-numeric value never reaches the
+            // handler and produces FastAPI's own 422), matching roles above.
+            if let Some(response) =
+                int_query_validation_error(query, &["page", "page_size"], request_id)
+            {
+                return response;
+            }
+            if let Err(message_text) = validate_pagination(query) {
+                return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
+            }
         }
-        let items = match storage.find_many(spec.collection, &json!({})).await {
+        let mut items = match storage.find_many(spec.collection, &json!({})).await {
             Ok(items) => items.into_iter().map(strip_internal).collect::<Vec<_>>(),
             Err(_) => return unexpected(request_id),
         };
-        let items = if spec.collection == "roles" && !is_admin_user(state, username).await {
-            items
-                .into_iter()
-                .filter(|role| role.get("role_name").and_then(Value::as_str) != Some("admin"))
-                .collect()
-        } else {
-            items
-        };
+        if matches!(spec.collection, "roles" | "groups" | "routings") {
+            // Python's `get_roles(page: int = ..., page_size: int = ...)` are
+            // typed FastAPI query params: a non-numeric value never reaches the
+            // handler and instead produces FastAPI's own 422 validation body.
+            // Unlike the other collections above, this branch previously parsed
+            // page/page_size with `.unwrap_or(1)`, silently accepting garbage.
+            if let Some(response) =
+                int_query_validation_error(query, &["page", "page_size"], request_id)
+            {
+                return response;
+            }
+            if spec.collection == "roles" {
+                items.sort_by_key(|role| {
+                    role.get("role_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+            }
+            let page = query
+                .get("page")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1);
+            let page_size = query
+                .get("page_size")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(10);
+            let maximum = env::var("MAX_PAGE_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(200);
+            if page == 0 || page_size == 0 {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "PAG001",
+                    "Invalid page or page size",
+                    request_id,
+                );
+            }
+            if page_size > maximum {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "PAG001",
+                    "Page size exceeds maximum limit",
+                    request_id,
+                );
+            }
+            let total = items.len();
+            let start = (page - 1).saturating_mul(page_size);
+            items = items.into_iter().skip(start).take(page_size).collect();
+            if spec.collection == "roles" && !is_admin_user(state, username).await {
+                let mut visible = Vec::new();
+                for mut role in items {
+                    let role_name = role
+                        .get("role_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if is_admin_role(state, role_name).await {
+                        continue;
+                    }
+                    role.as_object_mut()
+                        .map(|role| role.remove("platform_admin"));
+                    visible.push(role);
+                }
+                // The pinned route replaces the page with just the filtered roles.
+                return success(StatusCode::OK, json!({"roles": visible}), request_id);
+            }
+            return success(
+                StatusCode::OK,
+                json!({spec.collection: items, "page": page, "page_size": page_size,
+                    "has_next": total > start.saturating_add(page_size), "total": total}),
+                request_id,
+            );
+        }
         let payload = match spec.list_key {
             Some(list_key) => paginate_named(items, query, list_key),
             None => paginate(items, query),
@@ -2628,7 +3497,11 @@ async fn entity_routes(
                 } else {
                     spec.permission_code
                 },
-                "Insufficient permissions",
+                if spec.collection == "roles" {
+                    "You do not have permission to create roles"
+                } else {
+                    "Insufficient permissions"
+                },
                 request_id,
             );
         }
@@ -2647,11 +3520,17 @@ async fn entity_routes(
                 request_id,
             );
         };
-        if spec.collection == "roles" && key == "admin" && !is_admin_user(state, username).await {
+        if spec.collection == "roles"
+            && matches!(
+                key.trim().to_ascii_lowercase().as_str(),
+                "admin" | "platform admin"
+            )
+            && !is_admin_user(state, username).await
+        {
             return error(
                 StatusCode::FORBIDDEN,
-                "ROLE009",
-                "Only an administrator can create the administrator role",
+                "ROLE013",
+                "Only admin may create the admin role",
                 request_id,
             );
         }
@@ -2664,17 +3543,11 @@ async fn entity_routes(
             return error(
                 StatusCode::BAD_REQUEST,
                 spec.duplicate_code,
-                "Resource already exists",
-                request_id,
-            );
-        }
-        if spec.collection == "roles"
-            && !role_permissions_within_actor(state, username, &payload).await
-        {
-            return error(
-                StatusCode::FORBIDDEN,
-                "ROLE009",
-                "Roles cannot grant permissions you do not hold",
+                if spec.collection == "roles" {
+                    "Role already exists"
+                } else {
+                    "Resource already exists"
+                },
                 request_id,
             );
         }
@@ -2708,7 +3581,11 @@ async fn entity_routes(
             Err(duplicate_error) if duplicate_error.is_duplicate_key() => error(
                 StatusCode::BAD_REQUEST,
                 spec.duplicate_code,
-                "Resource already exists",
+                if spec.collection == "roles" {
+                    "Role already exists"
+                } else {
+                    "Resource already exists"
+                },
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -2725,32 +3602,44 @@ async fn entity_routes(
     }
     let filter = json!({spec.key: key});
     if method == Method::GET {
-        if !has_permission(state, username, spec.permission).await {
+        // The pinned get_group only authenticates; get_routing needs manage_routings.
+        if spec.collection == "routings" && !has_permission(state, username, spec.permission).await
+        {
             return error(
                 StatusCode::FORBIDDEN,
-                if spec.collection == "routings" {
-                    "RTG013"
-                } else {
-                    spec.permission_code
-                },
-                "Insufficient permissions",
+                "RTG013",
+                "You do not have permission to get routings",
                 request_id,
             );
         }
-        if spec.collection == "roles" && key == "admin" && !is_admin_user(state, username).await {
-            return error(
+        if spec.collection == "roles"
+            && is_admin_role(state, key).await
+            && !is_admin_user(state, username).await
+        {
+            return json_response(
                 StatusCode::NOT_FOUND,
-                spec.not_found_code,
-                "Resource not found",
+                json!({"error_message": "Role not found"}),
                 request_id,
             );
         }
         return match storage.find_one(spec.collection, &filter).await {
-            Ok(Some(item)) => success(StatusCode::OK, strip_internal(item), request_id),
+            Ok(Some(mut item)) => {
+                if spec.collection == "roles" && !is_admin_user(state, username).await {
+                    item.as_object_mut()
+                        .map(|role| role.remove("platform_admin"));
+                }
+                success(StatusCode::OK, strip_internal(item), request_id)
+            }
             Ok(None) => error(
-                StatusCode::NOT_FOUND,
+                // Python's routing retrieval also returns 400 (RTG004) for a
+                // missing client_key, unlike groups/roles which use 404 here.
+                if spec.collection == "routings" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                },
                 spec.not_found_code,
-                "Resource not found",
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -2765,45 +3654,83 @@ async fn entity_routes(
                 } else {
                     "RTG011"
                 }
+            } else if spec.collection == "roles" {
+                if method == Method::PUT {
+                    "ROLE010"
+                } else {
+                    "ROLE011"
+                }
+            } else if spec.collection == "groups" {
+                if method == Method::PUT {
+                    "GRP009"
+                } else {
+                    "GRP010"
+                }
             } else {
                 "AUTH006"
             },
-            "Insufficient permissions",
+            match (spec.collection, method == Method::PUT) {
+                ("roles", true) => "You do not have permission to update roles",
+                ("roles", false) => "You do not have permission to delete roles",
+                ("groups", true) => "You do not have permission to update groups",
+                ("groups", false) => "You do not have permission to delete groups",
+                _ => "Insufficient permissions",
+            },
+            request_id,
+        );
+    }
+    // Python's update/delete service methods for groups and routings return
+    // 400 (not 404) when the target doesn't exist, matching the roles
+    // convention below rather than the generic 404 used elsewhere.
+    if matches!(spec.collection, "groups" | "routings")
+        && matches!(storage.find_one(spec.collection, &filter).await, Ok(None))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            spec.not_found_code,
+            not_found_message(spec.collection),
             request_id,
         );
     }
     if spec.collection == "roles" {
-        let existing = match storage.find_one(spec.collection, &filter).await {
-            Ok(Some(role)) => role,
+        match storage.find_one(spec.collection, &filter).await {
+            Ok(Some(_)) => {}
             Ok(None) => {
                 return error(
-                    StatusCode::NOT_FOUND,
+                    StatusCode::BAD_REQUEST,
                     spec.not_found_code,
-                    "Resource not found",
+                    "Role does not exist",
                     request_id,
                 );
             }
             Err(_) => return unexpected(request_id),
-        };
-        let actor_is_admin = is_admin_user(state, username).await;
-        let bootstrap_admin_restores_manage_users = key == "admin"
-            && actor_is_admin
-            && payload.as_object().is_some_and(|updates| {
-                updates.len() == 1
-                    && updates.get("manage_users").and_then(Value::as_bool) == Some(true)
-            });
-        let actor_can_modify = actor_is_admin
-            || bootstrap_admin_restores_manage_users
-            || (role_permissions_within_actor(state, username, &existing).await
-                && role_permissions_within_actor(state, username, &payload).await);
-        if (key == "admin" && !actor_is_admin) || !actor_can_modify {
+        }
+        if is_admin_role(state, key).await && !is_admin_user(state, username).await {
             return error(
                 StatusCode::FORBIDDEN,
-                "ROLE009",
-                "Roles cannot grant or modify permissions you do not hold",
+                if method == Method::PUT {
+                    "ROLE014"
+                } else {
+                    "ROLE016"
+                },
+                if method == Method::PUT {
+                    "Only admin may modify the admin role"
+                } else {
+                    "Only admin may delete the admin role"
+                },
                 request_id,
             );
         }
+    }
+    // The service rejects an empty update only after its existence check.
+    if method == Method::PUT && payload.as_object().is_some_and(|object| object.is_empty()) {
+        let (code, message_text) = match spec.collection {
+            "roles" => ("ROLE007", "No data to update"),
+            "groups" => ("GRP006", "No data to update"),
+            "routings" => ("RTG007", "No data to update"),
+            _ => ("VAL001", "No data to update"),
+        };
+        return error(StatusCode::BAD_REQUEST, code, message_text, request_id);
     }
     if method == Method::PUT {
         if spec.collection == "routings" {
@@ -2849,8 +3776,16 @@ async fn entity_routes(
         {
             return error(
                 StatusCode::BAD_REQUEST,
-                "VAL001",
-                "Resource identifier cannot be updated",
+                if spec.collection == "roles" {
+                    "ROLE005"
+                } else {
+                    "VAL001"
+                },
+                if spec.collection == "roles" {
+                    "Role name cannot be changed"
+                } else {
+                    "Resource identifier cannot be updated"
+                },
                 request_id,
             );
         }
@@ -2878,40 +3813,20 @@ async fn entity_routes(
                 }
             }
             Ok(None) => error(
-                StatusCode::NOT_FOUND,
+                if spec.collection == "roles" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                },
                 spec.not_found_code,
-                "Resource not found",
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
         };
     }
     if method == Method::DELETE {
-        if spec.collection == "roles" {
-            let existing = match storage.find_one(spec.collection, &filter).await {
-                Ok(Some(role)) => role,
-                Ok(None) => {
-                    return error(
-                        StatusCode::NOT_FOUND,
-                        spec.not_found_code,
-                        "Resource not found",
-                        request_id,
-                    );
-                }
-                Err(_) => return unexpected(request_id),
-            };
-            if !role_permissions_within_actor(state, username, &existing).await {
-                return error(
-                    StatusCode::FORBIDDEN,
-                    "ROLE009",
-                    "Roles cannot be deleted when they include permissions you do not hold",
-                    request_id,
-                );
-            }
-        }
-        if (spec.collection == "roles" || spec.collection == "groups")
-            && (key == "admin" || key == "ALL")
-        {
+        if spec.collection == "groups" && key == "ALL" {
             return error(
                 StatusCode::BAD_REQUEST,
                 "AUTH900",
@@ -2930,9 +3845,13 @@ async fn entity_routes(
                 message(StatusCode::OK, spec.deleted, request_id)
             }
             Ok(false) => error(
-                StatusCode::NOT_FOUND,
+                if spec.collection == "roles" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                },
                 spec.not_found_code,
-                "Resource not found",
+                not_found_message(spec.collection),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -2944,6 +3863,26 @@ async fn entity_routes(
         "Method not allowed",
         request_id,
     )
+}
+
+/// Mirrors the pinned `sanitize_filename` checks on a proto path segment.
+fn proto_file_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Empty filename provided");
+    }
+    if name.contains("..") {
+        return Some("Path traversal detected: .. not allowed in filename");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some("Absolute paths not allowed in filename");
+    }
+    if name.as_bytes().get(1) == Some(&b':') {
+        return Some("Drive letters not allowed in filename");
+    }
+    if name.chars().count() > 255 {
+        return Some("Filename too long (max 255 characters)");
+    }
+    None
 }
 
 fn merge_proto_metadata(target: &mut Value, source: &Value) {
@@ -2963,6 +3902,36 @@ fn merge_proto_metadata(target: &mut Value, source: &Value) {
     }
 }
 
+async fn lock_tls_binding_mutation(
+    state: &AppState,
+    payload: &Value,
+    prefix: &str,
+) -> Result<Option<crate::storage::runtime::TlsMutationGuard>, ()> {
+    let has_binding = [
+        "client_tls_policy",
+        "upstream_tls_profile",
+        "upstream_tls_profiles",
+    ]
+    .iter()
+    .any(|field| {
+        payload
+            .get(format!("{prefix}_{field}"))
+            .is_some_and(|value| !value.is_null())
+    });
+    if !has_binding {
+        return Ok(None);
+    }
+    let guard = state
+        .storage
+        .as_ref()
+        .ok_or(())?
+        .tls_mutation_lock()
+        .await
+        .map_err(|_| ())?;
+    state.reload_tls_from_storage().await.map_err(|_| ())?;
+    Ok(Some(guard))
+}
+
 async fn api_routes(
     state: &AppState,
     path: &str,
@@ -2977,16 +3946,16 @@ async fn api_routes(
     };
     let suffix = path.strip_prefix("/api").unwrap_or("").trim_matches('/');
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
-        if !has_permission(state, username, "manage_apis").await {
-            return error(
-                StatusCode::FORBIDDEN,
-                "API008",
-                "You do not have permission to view APIs",
-                request_id,
-            );
+        // Python's `get_apis(page: int = ..., page_size: int = ...)` typed
+        // FastAPI query params: a non-numeric value produces a 422, not a
+        // silently-defaulted page or a custom 400 PAG001 body.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
         }
         if let Err(message_text) = validate_pagination(query) {
-            return error(StatusCode::BAD_REQUEST, "PAG001", message_text, request_id);
+            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
         }
         return match storage.find_many("apis", &json!({})).await {
             Ok(items) => success(
@@ -3017,6 +3986,50 @@ async fn api_routes(
             Ok(payload) => payload,
             Err(errors) => return validation_errors(errors, request_id),
         };
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
+            Ok(guard) => guard,
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
+        };
+        if let Some(policy) = payload
+            .get("api_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "api",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "TLS004",
+                "Invalid upstream TLS binding",
+                request_id,
+            );
+        }
         let name = payload["api_name"]
             .as_str()
             .expect("validated API name")
@@ -3099,18 +4112,10 @@ async fn api_routes(
     }
     let filter = json!({"api_name": parts[0], "api_version": parts[1]});
     if method == Method::GET {
-        if !has_permission(state, username, "manage_apis").await {
-            return error(
-                StatusCode::FORBIDDEN,
-                "API008",
-                "You do not have permission to view APIs",
-                request_id,
-            );
-        }
         return match storage.find_one("apis", &filter).await {
             Ok(Some(api)) => success(StatusCode::OK, strip_internal(api), request_id),
             Ok(None) => error(
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_REQUEST,
                 "API003",
                 "API does not exist for the requested name and version",
                 request_id,
@@ -3118,30 +4123,66 @@ async fn api_routes(
             Err(_) => unexpected(request_id),
         };
     }
-    if !has_permission(state, username, "manage_apis").await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "API008",
-            "You do not have permission to update APIs",
-            request_id,
-        );
-    }
     if method == Method::PUT {
+        if !has_permission(state, username, "manage_apis").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "API008",
+                "You do not have permission to update APIs",
+                request_id,
+            );
+        }
         payload = match normalize_update_api(&payload) {
             Ok(payload) => payload,
             Err(errors) => return validation_errors(errors, request_id),
         };
-        let Some(updates) = payload.as_object() else {
-            return unexpected(request_id);
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
+            Ok(guard) => guard,
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
         };
-        if updates.is_empty() {
+        if let Some(policy) = payload
+            .get("api_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "api",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
             return error(
                 StatusCode::BAD_REQUEST,
-                "API006",
-                "No data to update",
+                "TLS004",
+                "Invalid upstream TLS binding",
                 request_id,
             );
         }
+        let Some(updates) = payload.as_object() else {
+            return unexpected(request_id);
+        };
         for key in ["api_name", "api_version", "api_path"] {
             if payload.get(key).is_some() {
                 let expected = if key == "api_name" {
@@ -3173,6 +4214,15 @@ async fn api_routes(
             }
             Err(_) => return unexpected(request_id),
         };
+        // The pinned service checks the rename guard and existence first.
+        if updates.is_empty() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "API006",
+                "No data to update",
+                request_id,
+            );
+        }
         let desired_public = payload
             .get("api_public")
             .and_then(Value::as_bool)
@@ -3222,8 +4272,18 @@ async fn api_routes(
         };
     }
     if method == Method::DELETE {
+        let existing = storage.find_one("apis", &filter).await.ok().flatten();
         return match storage.delete_one("apis", &filter).await {
             Ok(true) => {
+                // The pinned proto file outlives its API; keep the upload so a
+                // re-created API picks it up again.
+                if let Some(existing) = existing
+                    .filter(|api| api.get("api_grpc_proto_source").is_some_and(python_truthy))
+                {
+                    let mut pending = filter.clone();
+                    merge_proto_metadata(&mut pending, &existing);
+                    let _ = storage.insert_one("grpc_proto_uploads", pending).await;
+                }
                 audit::management_mutation(
                     username,
                     "api.delete",
@@ -3267,16 +4327,15 @@ async fn user_routes(
         .unwrap_or("")
         .trim_matches('/');
     if method == Method::GET && (suffix.is_empty() || suffix == "all") {
-        if !has_permission(state, active_user, "manage_users").await {
-            return error(
-                StatusCode::FORBIDDEN,
-                "USR008",
-                "Unable to retrieve users",
-                request_id,
-            );
+        // Python's `get_users(page: int = ..., page_size: int = ...)` typed
+        // FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
         }
         if let Err(message_text) = validate_pagination(query) {
-            return error(StatusCode::BAD_REQUEST, "PAG001", message_text, request_id);
+            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
         }
         return match storage.find_many("users", &json!({})).await {
             Ok(items) => {
@@ -3290,7 +4349,7 @@ async fn user_routes(
                     .collect();
                 success(
                     StatusCode::OK,
-                    paginate_named(items, query, "users"),
+                    json!({"users": paginate_items(items, query)}),
                     request_id,
                 )
             }
@@ -3315,7 +4374,7 @@ async fn user_routes(
             return error(
                 StatusCode::FORBIDDEN,
                 "USR006",
-                "You do not have permission to create users",
+                "Can only update your own information",
                 request_id,
             );
         }
@@ -3333,15 +4392,19 @@ async fn user_routes(
     if method == Method::GET {
         return user_by(state, "username", target, active_user, request_id).await;
     }
-    if active_user != target && !has_permission(state, active_user, "manage_users").await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "USR008",
-            "Unable to update user",
-            request_id,
-        );
-    }
     if method == Method::PUT {
+        if active_user != target && !has_permission(state, active_user, "manage_users").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "USR006",
+                if suffix.ends_with("/update-password") {
+                    "Can only update your own password"
+                } else {
+                    "Can only update your own information"
+                },
+                request_id,
+            );
+        }
         if !suffix.ends_with("/update-password")
             && normalize_update_user_model(&mut payload).is_err()
         {
@@ -3356,7 +4419,7 @@ async fn user_routes(
             return error(
                 StatusCode::FORBIDDEN,
                 "USR022",
-                "Super admin password cannot be changed via the API",
+                "Super admin password cannot be changed via UI",
                 request_id,
             );
         }
@@ -3368,16 +4431,19 @@ async fn user_routes(
                 request_id,
             );
         }
-        if active_user == target
-            && !has_permission(state, active_user, "manage_users").await
-            && !self_update_fields_are_safe(&payload)
-        {
-            return error(
-                StatusCode::FORBIDDEN,
-                "USR023",
-                "Users without manage_users may not update restricted fields",
-                request_id,
-            );
+        if active_user == target && !has_permission(state, active_user, "manage_users").await {
+            let attempted = restricted_self_update_fields(&payload);
+            if !attempted.is_empty() {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "USR023",
+                    &format!(
+                        "Cannot modify restricted fields without manage_users permission: {}",
+                        attempted.join(", ")
+                    ),
+                    request_id,
+                );
+            }
         }
         let existing = match storage
             .find_one("users", &json!({"username": target}))
@@ -3399,8 +4465,8 @@ async fn user_routes(
         {
             return error(
                 StatusCode::FORBIDDEN,
-                "USR008",
-                "Only an administrator can modify an administrator account",
+                "USR012",
+                "Only admin may modify admin users",
                 request_id,
             );
         }
@@ -3423,7 +4489,7 @@ async fn user_routes(
                 return error(
                     StatusCode::FORBIDDEN,
                     "USR013",
-                    "Only an administrator can assign the administrator role",
+                    "Only admin may change admin role assignments",
                     request_id,
                 );
             }
@@ -3489,15 +4555,7 @@ async fn user_routes(
                     target,
                     "success",
                 );
-                message(
-                    StatusCode::OK,
-                    if password_update {
-                        "Password updated successfully"
-                    } else {
-                        "User updated successfully"
-                    },
-                    request_id,
-                )
+                message(StatusCode::OK, "User updated successfully", request_id)
             }
             Ok(None) => error(
                 StatusCode::NOT_FOUND,
@@ -3509,6 +4567,22 @@ async fn user_routes(
         };
     }
     if method == Method::DELETE {
+        if target == "admin" {
+            return error(
+                StatusCode::FORBIDDEN,
+                "USR021",
+                "Super admin user cannot be deleted",
+                request_id,
+            );
+        }
+        if active_user != target && !has_permission(state, active_user, "manage_users").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "USR007",
+                "Can only delete your own account",
+                request_id,
+            );
+        }
         let existing = match storage
             .find_one("users", &json!({"username": target}))
             .await
@@ -3529,16 +4603,8 @@ async fn user_routes(
         {
             return error(
                 StatusCode::FORBIDDEN,
-                "USR008",
-                "Only an administrator can delete an administrator account",
-                request_id,
-            );
-        }
-        if target == "admin" {
-            return error(
-                StatusCode::FORBIDDEN,
-                "USR021",
-                "Super admin user cannot be deleted",
+                "USR014",
+                "Only admin may delete admin users",
                 request_id,
             );
         }
@@ -3638,7 +4704,7 @@ async fn endpoint_routes(
     path: &str,
     method: &Method,
     mut payload: Value,
-    query: &HashMap<String, String>,
+    _query: &HashMap<String, String>,
     username: &str,
     request_id: &str,
 ) -> Response {
@@ -3651,38 +4717,172 @@ async fn endpoint_routes(
         .trim_matches('/');
     let validation_suffix = suffix
         .strip_prefix("endpoint/validation/")
-        .or_else(|| suffix.strip_prefix("validation/"));
+        .or_else(|| suffix.strip_prefix("validation/"))
+        // Deeper paths belong to the endpoint route registered before it.
+        .filter(|endpoint_id| !endpoint_id.contains('/'))
+        // GET /validation/{id} is shadowed by GET /{api_name}/{api_version}.
+        .filter(|_| !(method == Method::GET && suffix.starts_with("validation/")));
     if let Some(endpoint_id) = validation_suffix {
-        let filter = json!({"endpoint_id": endpoint_id});
-        return document_by_method(
-            state,
-            "endpoint_validations",
-            filter,
-            method,
-            payload,
-            username,
-            "manage_endpoints",
-            "Endpoint validation",
-            request_id,
-        )
-        .await;
-    }
-    if (suffix == "endpoint/validation" || suffix == "validation") && method == Method::POST {
-        if !has_permission(state, username, "manage_endpoints").await {
+        if method == Method::PUT
+            && normalize_endpoint_validation_model(&mut payload, false).is_err()
+        {
             return error(
-                StatusCode::FORBIDDEN,
-                "END010",
-                "Insufficient permissions",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VAL001",
+                "Validation Error",
                 request_id,
             );
         }
-        if payload.get("endpoint_id").is_none() {
+        if method != Method::GET && !has_permission(state, username, "manage_endpoints").await {
+            let (code, text) = if method == Method::PUT {
+                (
+                    "END014",
+                    "You do not have permission to update endpoint validations",
+                )
+            } else {
+                (
+                    "END015",
+                    "You do not have permission to delete endpoint validations",
+                )
+            };
+            return error(StatusCode::FORBIDDEN, code, text, request_id);
+        }
+        let filter = json!({"endpoint_id": endpoint_id});
+        if method == Method::GET {
+            return match storage.find_one("endpoint_validations", &filter).await {
+                Ok(Some(validation)) => {
+                    success(StatusCode::OK, strip_internal(validation), request_id)
+                }
+                Ok(None) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END018",
+                    "Endpoint validation does not exist",
+                    request_id,
+                ),
+                Err(_) => unexpected(request_id),
+            };
+        }
+        if method == Method::PUT {
+            if payload.get("validation_enabled") == Some(&Value::Bool(false)) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END020",
+                    "Validation enabled is required",
+                    request_id,
+                );
+            }
+            match storage
+                .find_one("endpoints", &json!({"endpoint_id": endpoint_id}))
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "END022",
+                        "Endpoint does not exist",
+                        request_id,
+                    );
+                }
+                Err(_) => return unexpected(request_id),
+            }
+            return match storage
+                .update_one("endpoint_validations", &filter, &payload)
+                .await
+            {
+                Ok(_) => message(
+                    StatusCode::OK,
+                    "Endpoint validation updated successfully",
+                    request_id,
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END023",
+                    "Unable to update endpoint validation",
+                    request_id,
+                ),
+            };
+        }
+        if method == Method::DELETE {
+            return match storage.delete_one("endpoint_validations", &filter).await {
+                Ok(_) => message(
+                    StatusCode::OK,
+                    "Endpoint validation deleted successfully",
+                    request_id,
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END019",
+                    "Unable to delete endpoint validation",
+                    request_id,
+                ),
+            };
+        }
+        return error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GTW004",
+            "Method not allowed",
+            request_id,
+        );
+    }
+    if (suffix == "endpoint/validation" || suffix == "validation") && method == Method::POST {
+        if normalize_endpoint_validation_model(&mut payload, true).is_err() {
             return error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 "VAL001",
-                "endpoint_id is required",
+                "Validation Error",
                 request_id,
             );
+        }
+        if !has_permission(state, username, "manage_endpoints").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "END013",
+                "You do not have permission to create endpoint validations",
+                request_id,
+            );
+        }
+        let endpoint_id = payload
+            .get("endpoint_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if endpoint_id.is_empty() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "END013",
+                "Endpoint ID is required",
+                request_id,
+            );
+        }
+        match storage
+            .find_one("endpoint_validations", &json!({"endpoint_id": endpoint_id}))
+            .await
+        {
+            Ok(Some(_)) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END017",
+                    "Endpoint validation already exists",
+                    request_id,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => return unexpected(request_id),
+        }
+        match storage
+            .find_one("endpoints", &json!({"endpoint_id": endpoint_id}))
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "END015",
+                    "Endpoint does not exist",
+                    request_id,
+                );
+            }
+            Err(_) => return unexpected(request_id),
         }
         return match storage.insert_one("endpoint_validations", payload).await {
             Ok(_) => {
@@ -3698,7 +4898,12 @@ async fn endpoint_routes(
                     request_id,
                 )
             }
-            Err(_) => unexpected(request_id),
+            Err(_) => error(
+                StatusCode::BAD_REQUEST,
+                "END016",
+                "Unable to create endpoint validation",
+                request_id,
+            ),
         };
     }
     if method == Method::POST && suffix.is_empty() {
@@ -3707,6 +4912,50 @@ async fn endpoint_routes(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "VAL001",
                 "Validation Error",
+                request_id,
+            );
+        }
+        let _tls_guard = match lock_tls_binding_mutation(state, &payload, "endpoint").await {
+            Ok(guard) => guard,
+            Err(()) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS004",
+                    "TLS profiles are unavailable",
+                    request_id,
+                );
+            }
+        };
+        if let Some(policy) = payload
+            .get("endpoint_client_tls_policy")
+            .filter(|value| !value.is_null())
+        {
+            if crate::tls::policy::ClientTlsPolicy::validate_value(
+                policy,
+                &state.tls_snapshot().profiles,
+                state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS003",
+                    "Invalid client TLS policy",
+                    request_id,
+                );
+            }
+        }
+        if crate::tls::profiles::validate_upstream_bindings(
+            &payload,
+            "endpoint",
+            &state.tls_snapshot().profiles,
+        )
+        .is_err()
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "TLS004",
+                "Invalid upstream TLS binding",
                 request_id,
             );
         }
@@ -3815,22 +5064,17 @@ async fn endpoint_routes(
                     request_id,
                 )
             }
-            Err(_) => unexpected(request_id),
+            Err(_) => error(
+                StatusCode::BAD_REQUEST,
+                "END003",
+                "Unable to insert endpoint",
+                request_id,
+            ),
         };
     }
     let parts = suffix.split('/').collect::<Vec<_>>();
+    // The pinned listing takes no pagination parameters.
     if method == Method::GET && parts.len() == 2 {
-        if !has_permission(state, username, "manage_endpoints").await {
-            return error(
-                StatusCode::FORBIDDEN,
-                "END010",
-                "You do not have permission to view endpoints",
-                request_id,
-            );
-        }
-        if let Err(message_text) = validate_pagination(query) {
-            return error(StatusCode::BAD_REQUEST, "PAG001", message_text, request_id);
-        }
         return match storage
             .find_many(
                 "endpoints",
@@ -3838,9 +5082,15 @@ async fn endpoint_routes(
             )
             .await
         {
+            Ok(items) if items.is_empty() => error(
+                StatusCode::BAD_REQUEST,
+                "END005",
+                "No endpoints found for the requested API name and version",
+                request_id,
+            ),
             Ok(items) => success(
                 StatusCode::OK,
-                paginate(items.into_iter().map(strip_internal).collect(), query),
+                json!({"endpoints": items.into_iter().map(strip_internal).collect::<Vec<_>>()}),
                 request_id,
             ),
             Err(_) => unexpected(request_id),
@@ -3855,9 +5105,67 @@ async fn endpoint_routes(
                 request_id,
             );
         }
+        let _tls_guard = if method == Method::PUT {
+            match lock_tls_binding_mutation(state, &payload, "endpoint").await {
+                Ok(guard) => guard,
+                Err(()) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "TLS004",
+                        "TLS profiles are unavailable",
+                        request_id,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if method == Method::PUT {
+            if let Some(policy) = payload
+                .get("endpoint_client_tls_policy")
+                .filter(|value| !value.is_null())
+            {
+                if crate::tls::policy::ClientTlsPolicy::validate_value(
+                    policy,
+                    &state.tls_snapshot().profiles,
+                    state.config.downstream_tls_mode == crate::config::DownstreamTlsMode::Native,
+                )
+                .is_err()
+                {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "TLS003",
+                        "Invalid client TLS policy",
+                        request_id,
+                    );
+                }
+            }
+            if crate::tls::profiles::validate_upstream_bindings(
+                &payload,
+                "endpoint",
+                &state.tls_snapshot().profiles,
+            )
+            .is_err()
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "TLS004",
+                    "Invalid upstream TLS binding",
+                    request_id,
+                );
+            }
+        }
         let uri = format!("/{}", parts[3..].join("/"));
         let filter = json!({"endpoint_method": parts[0], "api_name": parts[1], "api_version": parts[2], "endpoint_uri": uri});
         if method == Method::PUT {
+            if !has_permission(state, username, "manage_endpoints").await {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "END011",
+                    "You do not have permission to update endpoints",
+                    request_id,
+                );
+            }
             let existing = match storage.find_one("endpoints", &filter).await {
                 Ok(Some(endpoint)) => endpoint,
                 Ok(None) => {
@@ -3960,117 +5268,42 @@ async fn endpoint_routes(
                     "Endpoint does not exist for the requested API name, version and URI",
                     request_id,
                 ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END009",
+                    "Unable to delete endpoint",
+                    request_id,
+                ),
+            };
+        }
+        if method == Method::GET {
+            return match storage.find_one("endpoints", &filter).await {
+                Ok(Some(endpoint)) => success(StatusCode::OK, strip_internal(endpoint), request_id),
+                Ok(None) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END004",
+                    "Endpoint does not exist for the requested API name, version and URI",
+                    request_id,
+                ),
                 Err(_) => unexpected(request_id),
             };
         }
-        return document_by_method(
-            state,
-            "endpoints",
-            filter,
-            method,
-            payload,
-            username,
-            "manage_endpoints",
-            "Endpoint",
-            request_id,
-        )
-        .await;
+        if method == Method::PUT {
+            return match storage.update_one("endpoints", &filter, &payload).await {
+                Ok(Some(_)) => message(StatusCode::OK, "Endpoint updated successfully", request_id),
+                Ok(None) | Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "END003",
+                    "Unable to update endpoint",
+                    request_id,
+                ),
+            };
+        }
     }
     error(
         StatusCode::NOT_FOUND,
         "EPT002",
         "Endpoint not found",
-        request_id,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn document_by_method(
-    state: &AppState,
-    collection: &str,
-    filter: Value,
-    method: &Method,
-    payload: Value,
-    username: &str,
-    permission: &str,
-    label: &str,
-    request_id: &str,
-) -> Response {
-    let Some(storage) = &state.storage else {
-        return unexpected(request_id);
-    };
-    if method == Method::GET {
-        return match storage.find_one(collection, &filter).await {
-            Ok(Some(item)) => success(StatusCode::OK, strip_internal(item), request_id),
-            Ok(None) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    if !has_permission(state, username, permission).await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "END010",
-            "Insufficient permissions",
-            request_id,
-        );
-    }
-    if method == Method::PUT {
-        return match storage.update_one(collection, &filter, &payload).await {
-            Ok(Some(_)) => {
-                audit::management_mutation(
-                    username,
-                    &format!("{}.update", label.to_ascii_lowercase().replace(' ', "_")),
-                    &filter.to_string(),
-                    "success",
-                );
-                message(
-                    StatusCode::OK,
-                    &format!("{label} updated successfully"),
-                    request_id,
-                )
-            }
-            Ok(None) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    if method == Method::DELETE {
-        return match storage.delete_one(collection, &filter).await {
-            Ok(true) => {
-                audit::management_mutation(
-                    username,
-                    &format!("{}.delete", label.to_ascii_lowercase().replace(' ', "_")),
-                    &filter.to_string(),
-                    "success",
-                );
-                message(
-                    StatusCode::OK,
-                    &format!("{label} deleted successfully"),
-                    request_id,
-                )
-            }
-            Ok(false) => error(
-                StatusCode::NOT_FOUND,
-                "EPT002",
-                &format!("{label} not found"),
-                request_id,
-            ),
-            Err(_) => unexpected(request_id),
-        };
-    }
-    error(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "GTW004",
-        "Method not allowed",
         request_id,
     )
 }
@@ -4389,7 +5622,7 @@ fn normalize_role_model(payload: &mut Value, create: bool) -> Result<(), ()> {
             .get("role_name")
             .and_then(security_setting_string)
             .ok_or(())?;
-        if value.is_empty() || value.len() > 50 {
+        if value.is_empty() || value.chars().count() > 50 {
             return Err(());
         }
         object.insert("role_name".to_owned(), json!(value));
@@ -4397,7 +5630,7 @@ fn normalize_role_model(payload: &mut Value, create: bool) -> Result<(), ()> {
     match object.get("role_description") {
         Some(value) if !value.is_null() => {
             let value = security_setting_string(value).ok_or(())?;
-            if value.len() > 255 || (!create && value.is_empty()) {
+            if value.chars().count() > 255 || (!create && value.is_empty()) {
                 return Err(());
             }
             object.insert("role_description".to_owned(), json!(value));
@@ -4427,7 +5660,7 @@ fn normalize_group_model(payload: &mut Value, create: bool) -> Result<(), ()> {
             .get("group_name")
             .and_then(security_setting_string)
             .ok_or(())?;
-        if value.is_empty() || value.len() > 50 {
+        if value.is_empty() || value.chars().count() > 50 {
             return Err(());
         }
         object.insert("group_name".to_owned(), json!(value));
@@ -4435,7 +5668,7 @@ fn normalize_group_model(payload: &mut Value, create: bool) -> Result<(), ()> {
     match object.get("group_description") {
         Some(value) if !value.is_null() => {
             let value = security_setting_string(value).ok_or(())?;
-            if value.len() > 255 || (!create && value.is_empty()) {
+            if value.chars().count() > 255 || (!create && value.is_empty()) {
                 return Err(());
             }
             object.insert("group_description".to_owned(), json!(value));
@@ -4495,7 +5728,7 @@ fn normalize_routing_model(payload: &mut Value, create: bool) -> Result<(), ()> 
                 return Err(());
             }
             let value = security_setting_string(value).ok_or(())?;
-            if value.is_empty() || value.len() > 50 {
+            if value.is_empty() || value.chars().count() > 50 {
                 return Err(());
             }
             object.insert(field.to_owned(), json!(value));
@@ -4522,7 +5755,7 @@ fn normalize_routing_model(payload: &mut Value, create: bool) -> Result<(), ()> 
     match object.get("routing_description") {
         Some(value) if !value.is_null() => {
             let value = security_setting_string(value).ok_or(())?;
-            if value.len() > 255 {
+            if value.chars().count() > 255 {
                 return Err(());
             }
             object.insert("routing_description".to_owned(), json!(value));
@@ -4567,9 +5800,19 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
                 | "client_uri"
                 | "api_id"
                 | "endpoint_id"
-        ) && (create || !value.is_null())
+                | "endpoint_client_tls_policy"
+                | "endpoint_upstream_tls_profile"
+                | "endpoint_upstream_tls_profiles"
+        ) && (create
+            || !value.is_null()
+            || matches!(
+                field.as_str(),
+                "endpoint_client_tls_policy"
+                    | "endpoint_upstream_tls_profile"
+                    | "endpoint_upstream_tls_profiles"
+            ))
     });
-    for (field, minimum, maximum) in [
+    for (field, configured_minimum, configured_maximum) in [
         ("api_name", 1, 50),
         ("api_version", 1, 10),
         ("endpoint_method", 1, 10),
@@ -4579,6 +5822,11 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
         ("api_id", 1, 255),
         ("endpoint_id", 1, 255),
     ] {
+        let (minimum, maximum) = if create && matches!(field, "api_id" | "endpoint_id") {
+            (0, usize::MAX)
+        } else {
+            (configured_minimum, configured_maximum)
+        };
         if let Some(value) = object.get(field) {
             if value.is_null() {
                 if create && matches!(field, "client_uri" | "api_id" | "endpoint_id") {
@@ -4587,7 +5835,8 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
                 return Err(());
             }
             let value = security_setting_string(value).ok_or(())?;
-            if value.len() < minimum || value.len() > maximum {
+            let length = value.chars().count();
+            if length < minimum || length > maximum {
                 return Err(());
             }
             object.insert(field.to_owned(), json!(value));
@@ -4611,7 +5860,125 @@ fn normalize_endpoint_model(payload: &mut Value, create: bool) -> Result<(), ()>
         Some(_) => return Err(()),
         None => {}
     }
+    if create {
+        // Pydantic's `.dict()` persists unset optional fields as null.
+        for field in ["endpoint_servers", "client_uri"] {
+            object.entry(field).or_insert(Value::Null);
+        }
+    }
     Ok(())
+}
+
+fn normalize_endpoint_validation_model(payload: &mut Value, create: bool) -> Result<(), ()> {
+    let object = payload.as_object_mut().ok_or(())?;
+    object.retain(|field, _| {
+        matches!(
+            field.as_str(),
+            "endpoint_id" | "validation_enabled" | "validation_schema"
+        ) && (create || field != "endpoint_id")
+    });
+    if create {
+        let endpoint_id = object
+            .get("endpoint_id")
+            .and_then(security_setting_string)
+            .ok_or(())?;
+        object.insert("endpoint_id".to_owned(), json!(endpoint_id));
+    }
+    let enabled = object
+        .get("validation_enabled")
+        .and_then(security_setting_bool)
+        .ok_or(())?;
+    object.insert("validation_enabled".to_owned(), json!(enabled));
+    let schema = object
+        .get("validation_schema")
+        .and_then(normalize_validation_schema_model)
+        .ok_or(())?;
+    object.insert("validation_schema".to_owned(), schema);
+    Ok(())
+}
+
+fn normalize_validation_schema_model(value: &Value) -> Option<Value> {
+    let rules = value.as_object()?.get("validation_schema")?.as_object()?;
+    let mut normalized = Map::new();
+    for (path, rule) in rules {
+        normalized.insert(path.clone(), normalize_field_validation_model(rule)?);
+    }
+    Some(json!({"validation_schema": normalized}))
+}
+
+fn normalize_field_validation_model(value: &Value) -> Option<Value> {
+    let input = value.as_object()?;
+    let mut output = Map::new();
+    output.insert(
+        "required".to_owned(),
+        json!(security_setting_bool(input.get("required")?)?),
+    );
+    output.insert(
+        "type".to_owned(),
+        json!(security_setting_string(input.get("type")?)?),
+    );
+    for field in ["min", "max"] {
+        let value = match input.get(field) {
+            Some(Value::Null) | None => Value::Null,
+            Some(value) => validation_model_number(value)?,
+        };
+        output.insert(field.to_owned(), value);
+    }
+    for field in ["pattern", "format", "custom_validator"] {
+        let value = match input.get(field) {
+            Some(Value::Null) | None => Value::Null,
+            Some(value) => Value::String(security_setting_string(value)?),
+        };
+        output.insert(field.to_owned(), value);
+    }
+    let enum_values = match input.get("enum") {
+        Some(Value::Null) | None => Value::Null,
+        Some(Value::Array(values)) => Value::Array(values.clone()),
+        Some(_) => return None,
+    };
+    output.insert("enum".to_owned(), enum_values);
+    let nested = match input.get("nested_schema") {
+        Some(Value::Null) | None => Value::Null,
+        Some(Value::Object(fields)) => {
+            let mut normalized = Map::new();
+            for (name, rules) in fields {
+                normalized.insert(name.clone(), normalize_field_validation_model(rules)?);
+            }
+            Value::Object(normalized)
+        }
+        Some(_) => return None,
+    };
+    output.insert("nested_schema".to_owned(), nested);
+    let array_items = match input.get("array_items") {
+        Some(Value::Null) | None => Value::Null,
+        Some(value) => normalize_field_validation_model(value)?,
+    };
+    output.insert("array_items".to_owned(), array_items);
+    Some(Value::Object(output))
+}
+
+fn validation_model_number(value: &Value) -> Option<Value> {
+    match value {
+        Value::Bool(value) => Some(json!(i64::from(*value))),
+        Value::Number(value) if value.is_i64() || value.is_u64() => {
+            Some(Value::Number(value.clone()))
+        }
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(|value| json!(value as i64)),
+        Value::String(value) => crate::python_scalar::parse_model_integer(value)
+            .and_then(|value| i64::try_from(value).ok())
+            .map(|value| json!(value))
+            .or_else(|| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(|value| json!(value))
+            }),
+        _ => None,
+    }
 }
 
 fn normalize_subscription_model(payload: &mut Value) -> Result<(), ()> {
@@ -4626,7 +5993,8 @@ fn normalize_subscription_model(payload: &mut Value) -> Result<(), ()> {
             .get(field)
             .and_then(security_setting_string)
             .ok_or(())?;
-        if value.len() < minimum || value.len() > maximum {
+        let length = value.chars().count();
+        if length < minimum || length > maximum {
             return Err(());
         }
         object.insert(field.to_owned(), json!(value));
@@ -4652,7 +6020,7 @@ fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
             .get(field)
             .and_then(security_setting_string)
             .ok_or(())?;
-        if field == "api_credit_group" && (value.is_empty() || value.len() > 50) {
+        if field == "api_credit_group" && (value.is_empty() || value.chars().count() > 50) {
             return Err(());
         }
         object.insert(field.to_owned(), json!(value));
@@ -4665,8 +6033,14 @@ fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
                 }
                 continue;
             }
-            let value = security_setting_string(value).ok_or(())?;
-            object.insert(field.to_owned(), json!(value));
+            let value = if field == "api_key_rotation_expires" {
+                tier_model_datetime(value).ok_or(())?
+            } else {
+                json!(security_setting_string(value).ok_or(())?)
+            };
+            object.insert(field.to_owned(), value);
+        } else if create {
+            object.insert(field.to_owned(), Value::Null);
         }
     }
     let tiers = object
@@ -4687,7 +6061,7 @@ fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
                 .get(field)
                 .and_then(security_setting_string)
                 .ok_or(())?;
-            if field == "tier_name" && (value.is_empty() || value.len() > 50) {
+            if field == "tier_name" && (value.is_empty() || value.chars().count() > 50) {
                 return Err(());
             }
             tier.insert(field.to_owned(), json!(value));
@@ -4730,7 +6104,8 @@ fn normalize_user_credit_model(payload: &mut Value) -> Result<(), ()> {
         .get("username")
         .and_then(security_setting_string)
         .ok_or(())?;
-    if username.len() < 3 || username.len() > 50 {
+    let username_length = username.chars().count();
+    if !(3..=50).contains(&username_length) {
         return Err(());
     }
     object.insert("username".to_owned(), json!(username));
@@ -4750,7 +6125,7 @@ fn normalize_user_credit_model(payload: &mut Value) -> Result<(), ()> {
             .get("tier_name")
             .and_then(security_setting_string)
             .ok_or(())?;
-        if tier_name.is_empty() || tier_name.len() > 50 {
+        if tier_name.is_empty() || tier_name.chars().count() > 50 {
             return Err(());
         }
         credit.insert("tier_name".to_owned(), json!(tier_name));
@@ -4766,6 +6141,9 @@ fn normalize_user_credit_model(payload: &mut Value) -> Result<(), ()> {
                 }
                 let value = security_setting_string(value).ok_or(())?;
                 credit.insert(field.to_owned(), json!(value));
+            }
+            if !credit.contains_key(field) {
+                credit.insert(field.to_owned(), Value::Null);
             }
         }
     }
@@ -4813,14 +6191,15 @@ fn normalize_create_user_model(payload: &mut Value) -> Result<(), ()> {
             .get(field)
             .and_then(security_setting_string)
             .ok_or(())?;
-        if value.len() < minimum || value.len() > maximum {
+        let length = value.chars().count();
+        if length < minimum || length > maximum {
             return Err(());
         }
         object.insert(field.to_owned(), json!(value));
     }
 
     let groups = match object.get("groups") {
-        None | Some(Value::Null) => json!([]),
+        None => json!([]),
         Some(Value::Array(groups)) => Value::Array(
             groups
                 .iter()
@@ -4857,7 +6236,7 @@ fn normalize_create_user_model(payload: &mut Value) -> Result<(), ()> {
     ] {
         if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
             let value = security_setting_string(value).ok_or(())?;
-            if value.is_empty() || value.len() > maximum {
+            if value.is_empty() || value.chars().count() > maximum {
                 return Err(());
             }
             object.insert(field.to_owned(), json!(value));
@@ -4865,6 +6244,30 @@ fn normalize_create_user_model(payload: &mut Value) -> Result<(), ()> {
     }
     if !object.contains_key("bandwidth_limit_window") {
         object.insert("bandwidth_limit_window".to_owned(), json!("day"));
+    }
+    for field in [
+        "rate_limit_duration",
+        "rate_limit_duration_type",
+        "rate_limit_enabled",
+        "throttle_duration",
+        "throttle_duration_type",
+        "throttle_wait_duration",
+        "throttle_wait_duration_type",
+        "throttle_queue_limit",
+        "throttle_enabled",
+        "custom_attributes",
+        "bandwidth_limit_bytes",
+        "bandwidth_limit_enabled",
+    ] {
+        if !object.contains_key(field) {
+            object.insert(field.to_owned(), Value::Null);
+        }
+    }
+    if !object.contains_key("active") {
+        object.insert("active".to_owned(), json!(true));
+    }
+    if !object.contains_key("ui_access") {
+        object.insert("ui_access".to_owned(), json!(false));
     }
     for field in [
         "rate_limit_enabled",
@@ -4933,7 +6336,8 @@ fn normalize_update_user_model(payload: &mut Value) -> Result<(), ()> {
     ] {
         if let Some(value) = object.get(field) {
             let value = security_setting_string(value).ok_or(())?;
-            if value.len() < minimum || value.len() > maximum {
+            let length = value.chars().count();
+            if length < minimum || length > maximum {
                 return Err(());
             }
             object.insert(field.to_owned(), json!(value));
@@ -4983,7 +6387,7 @@ fn normalize_update_user_model(payload: &mut Value) -> Result<(), ()> {
     ] {
         if let Some(value) = object.get(field) {
             let value = security_setting_string(value).ok_or(())?;
-            if value.is_empty() || value.len() > maximum {
+            if value.is_empty() || value.chars().count() > maximum {
                 return Err(());
             }
             object.insert(field.to_owned(), json!(value));
@@ -5012,6 +6416,23 @@ fn normalize_update_user_model(payload: &mut Value) -> Result<(), ()> {
             return Err(());
         }
     }
+    Ok(())
+}
+
+/// FastAPI validates UpdatePasswordModel before authentication and route
+/// permissions. Pydantic v1 coerces JSON scalars to strings, ignores unknown
+/// fields, and measures string bounds in Unicode characters.
+fn normalize_update_password_model(payload: &mut Value) -> Result<(), ()> {
+    let object = payload.as_object_mut().ok_or(())?;
+    let password = object
+        .get("new_password")
+        .and_then(security_setting_string)
+        .ok_or(())?;
+    if !(6..=36).contains(&password.chars().count()) {
+        return Err(());
+    }
+    object.clear();
+    object.insert("new_password".to_owned(), json!(password));
     Ok(())
 }
 
@@ -5189,48 +6610,56 @@ async fn authorization_routes(
             }
         }
         audit::management_mutation(username, "authorization.invalidate", username, "success");
-        let mut response = message(StatusCode::OK, "Token invalidated successfully", request_id);
-        response.headers_mut().append(
-            header::SET_COOKIE,
-            HeaderValue::from_static("access_token_cookie=; Path=/; Max-Age=0; HttpOnly"),
+        let mut response = message(
+            StatusCode::OK,
+            "Your token has been invalidated",
+            request_id,
         );
+        // Python scopes the deleted cookie to COOKIE_DOMAIN unless the host is a
+        // local/dev host, and clears both the primary and dev cookie names.
+        let domain_attribute = cookie_domain(headers)
+            .map(|domain| format!("; Domain={domain}"))
+            .unwrap_or_default();
+        for cookie_name in ["access_token_cookie", "access_token_cookie_dev"] {
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&format!(
+                    "{cookie_name}=; Path=/; Max-Age=0; HttpOnly{domain_attribute}"
+                ))
+                .unwrap(),
+            );
+        }
         return response;
     }
     let parts = path
         .trim_start_matches("/authorization/admin/")
         .split('/')
         .collect::<Vec<_>>();
-    if parts.len() == 2 && has_permission(state, username, "manage_auth").await {
+    let admin_action = parts.len() == 2
+        && matches!(
+            (parts[0], &method),
+            ("status", &Method::GET)
+                | ("disable", &Method::POST)
+                | ("enable", &Method::POST)
+                | ("revoke", &Method::POST)
+                | ("unrevoke", &Method::POST)
+        );
+    if admin_action {
+        if !has_permission(state, username, "manage_auth").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "AUTH900",
+                "You do not have permission to manage auth",
+                request_id,
+            );
+        }
         let target = parts[1];
-        if matches!(
-            parts[0],
-            "status" | "disable" | "enable" | "revoke" | "unrevoke"
-        ) {
-            let Some(storage) = &state.storage else {
-                return unexpected(request_id);
-            };
-            let Some(target_user) = storage
-                .find_one("users", &json!({"username": target}))
-                .await
-                .ok()
-                .flatten()
-            else {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "USR002",
-                    "User not found",
-                    request_id,
-                );
-            };
-            let target_is_admin = target_user.get("role").and_then(Value::as_str) == Some("admin");
-            if target_is_admin && !is_admin_user(state, username).await {
-                return error(
-                    StatusCode::FORBIDDEN,
-                    "AUTH006",
-                    "Only an administrator can manage an administrator account",
-                    request_id,
-                );
-            }
+        if is_admin_user(state, target).await && !is_admin_user(state, username).await {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                json!({"error_message": "User not found"}),
+                request_id,
+            );
         }
         if parts[0] == "status" {
             let Some(storage) = &state.storage else {
@@ -5242,12 +6671,7 @@ async fn authorization_routes(
                 .ok()
                 .flatten()
             else {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "USR002",
-                    "User not found",
-                    request_id,
-                );
+                return unexpected(request_id);
             };
             let revoked = storage
                 .find_one(
@@ -5260,50 +6684,60 @@ async fn authorization_routes(
                 .is_some();
             return success(
                 StatusCode::OK,
-                json!({"username": target, "active": user.get("active").and_then(Value::as_bool).unwrap_or(true), "revoked": revoked}),
+                json!({"active": user.get("active").and_then(Value::as_bool).unwrap_or(false), "revoked": revoked}),
                 request_id,
             );
         }
         if parts[0] == "disable" || parts[0] == "enable" {
             let active = parts[0] == "enable";
             if let Some(storage) = &state.storage {
-                return match storage
+                let update = storage
                     .update_one(
                         "users",
                         &json!({"username": target}),
                         &json!({"active": active}),
                     )
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        audit::management_mutation(
-                            username,
-                            if active {
-                                "authorization.enable"
-                            } else {
-                                "authorization.disable"
-                            },
-                            target,
-                            "success",
-                        );
-                        message(
-                            StatusCode::OK,
-                            if active {
-                                "User enabled successfully"
-                            } else {
-                                "User disabled successfully"
-                            },
-                            request_id,
+                    .await;
+                if update.is_err() {
+                    return unexpected(request_id);
+                }
+                if !active {
+                    let _ = storage
+                        .delete_one(
+                            "revocations",
+                            &json!({"type": "revoke_all", "username": target}),
                         )
+                        .await;
+                    if let Err(error_value) = storage
+                        .insert_one(
+                            "revocations",
+                            json!({"type": "revoke_all", "username": target, "revoke_all": true, "revoked_at": unix_seconds()}),
+                        )
+                        .await
+                        && !error_value.is_duplicate_key()
+                    {
+                        return unexpected(request_id);
                     }
-                    Ok(None) => error(
-                        StatusCode::NOT_FOUND,
-                        "USR002",
-                        "User not found",
-                        request_id,
-                    ),
-                    Err(_) => unexpected(request_id),
-                };
+                }
+                audit::management_mutation(
+                    username,
+                    if active {
+                        "authorization.enable"
+                    } else {
+                        "authorization.disable"
+                    },
+                    target,
+                    "success",
+                );
+                return message(
+                    StatusCode::OK,
+                    &if active {
+                        format!("User {target} enabled")
+                    } else {
+                        format!("User {target} disabled and tokens revoked")
+                    },
+                    request_id,
+                );
             }
         }
         if parts[0] == "revoke" || parts[0] == "unrevoke" {
@@ -5350,10 +6784,10 @@ async fn authorization_routes(
             );
             return message(
                 StatusCode::OK,
-                if parts[0] == "revoke" {
-                    "All tokens revoked"
+                &if parts[0] == "revoke" {
+                    format!("All tokens revoked for {target}")
                 } else {
-                    "Token revocation cleared"
+                    format!("Token revocation cleared for {target}")
                 },
                 request_id,
             );
@@ -5496,6 +6930,542 @@ fn python_openapi_contract() -> Result<&'static Value, &'static str> {
         .ok_or("Failed to initialize embedded OpenAPI contract")
 }
 
+enum RouteMatch {
+    Found,
+    NotFound,
+    MethodNotAllowed(String),
+}
+
+/// Platform routes FastAPI serves outside the frozen schema
+/// (`include_in_schema=False` and framework docs) plus Rust-native additions.
+const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/platform/docs"),
+    ("GET", "/platform/redoc"),
+    ("GET", "/platform/openapi.json"),
+    ("GET", "/platform/monitor/report"),
+    ("GET", "/platform/logging/logs/download"),
+    ("POST", "/platform/tools/rate-limit-simulator"),
+];
+
+/// `Allow` answered by the pinned server for multi-route platform paths.
+/// Starlette names only the first registered route that matched the path, and
+/// the frozen OpenAPI does not preserve registration order, so these values
+/// were read from the pinned server with TRACE requests.
+const PYTHON_ALLOW: &[(&str, &str)] = &[
+    ("/platform/user", "POST"),
+    ("/platform/user/{username}", "PUT"),
+    ("/platform/api", "POST"),
+    ("/platform/api/{api_name}/{api_version}", "PUT"),
+    (
+        "/platform/endpoint/{endpoint_method}/{api_name}/{api_version}/{endpoint_uri}",
+        "PUT",
+    ),
+    (
+        "/platform/endpoint/endpoint/validation/{endpoint_id}",
+        "PUT",
+    ),
+    ("/platform/endpoint/validation/{endpoint_id}", "GET"),
+    ("/platform/group/{group_name}", "PUT"),
+    ("/platform/role", "POST"),
+    ("/platform/role/{role_name}", "PUT"),
+    ("/platform/routing/{client_key}", "PUT"),
+    ("/platform/proto/{api_name}/{api_version}", "POST"),
+    ("/platform/security/settings", "GET"),
+    ("/platform/credit/{api_credit_group}", "PUT"),
+    ("/platform/credit/{username}", "PUT"),
+    ("/platform/vault", "POST"),
+    ("/platform/vault/{key_name}", "GET"),
+    ("/platform/tiers/", "POST"),
+    ("/platform/tiers/{tier_id}", "GET"),
+    ("/platform/tiers/assignments/{user_id}", "GET"),
+    ("/platform/rate-limits/", "POST"),
+    ("/platform/rate-limits/{rule_id}", "GET"),
+];
+
+/// Route table in registration order: (matcher, methods).
+fn platform_route_table() -> &'static [(Regex, Vec<String>)] {
+    static TABLE: OnceLock<Vec<(Regex, Vec<String>)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table: Vec<(String, Vec<String>)> = Vec::new();
+        if let Ok(contract) = python_openapi_contract()
+            && let Some(paths) = contract.get("paths").and_then(Value::as_object)
+        {
+            for (template, item) in paths {
+                if !template.starts_with("/platform") {
+                    continue;
+                }
+                let mut methods: Vec<String> = item
+                    .as_object()
+                    .map(|item| {
+                        item.keys()
+                            .map(|method| method.to_ascii_uppercase())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Keep the pinned `Allow` method first; partial matches report it.
+                if let Some((_, allow)) = PYTHON_ALLOW.iter().find(|(path, _)| path == template) {
+                    methods.retain(|method| method != allow);
+                    methods.insert(0, (*allow).to_owned());
+                }
+                table.push((template.clone(), methods));
+            }
+        }
+        for (method, template) in UNLISTED_PLATFORM_ROUTES {
+            table.push(((*template).to_owned(), vec![(*method).to_owned()]));
+        }
+        table
+            .into_iter()
+            .filter_map(|(template, methods)| Some((template_regex(&template)?, methods)))
+            .collect()
+    })
+}
+
+/// Compile a Starlette path template: `{name}` is one segment, `{name:path}`
+/// is the remainder of the path.
+fn template_regex(template: &str) -> Option<Regex> {
+    static PARAM: OnceLock<Regex> = OnceLock::new();
+    // FastAPI omits `:path` converters from OpenAPI; the only platform route
+    // using one is the endpoint URI, which may contain slashes.
+    let param = PARAM.get_or_init(|| {
+        Regex::new(r"\{(?:endpoint_uri|[^}:]+(:path))\}|\{[^}:]+\}").expect("route param regex")
+    });
+    let mut pattern = String::from("^");
+    let mut last = 0;
+    for capture in param.captures_iter(template) {
+        let whole = capture.get(0)?;
+        pattern.push_str(&regex::escape(&template[last..whole.start()]));
+        let path_param = capture.get(1).is_some() || whole.as_str() == "{endpoint_uri}";
+        pattern.push_str(if path_param { ".*" } else { "[^/]+" });
+        last = whole.end();
+    }
+    pattern.push_str(&regex::escape(&template[last..]));
+    pattern.push('$');
+    Regex::new(&pattern).ok()
+}
+
+/// The pinned platform routes let FastAPI render an authentication failure as
+/// `{"detail": "Unauthorized"}`, except these, which wrap it in a route error
+/// code. Captured from the pinned server with anonymous requests to every
+/// frozen operation (routes where the pinned server instead crashes with a 500
+/// keep the 401 and are recorded as approved differences).
+const UNAUTHENTICATED_CODES: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/platform/api", "API_AUTH", "Unauthorized"),
+    ("GET", "/platform/api/all", "API_AUTH", "Unauthorized"),
+    (
+        "POST",
+        "/platform/authorization/invalidate",
+        "AUTH005",
+        "Unauthorized",
+    ),
+    (
+        "GET",
+        "/platform/authorization/status",
+        "AUTH005",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/authorization/refresh",
+        "AUTH003",
+        "Unable to validate credentials",
+    ),
+    ("GET", "/platform/user", "GTW998", "Unauthorized"),
+    ("GET", "/platform/user/all", "GTW998", "Unauthorized"),
+    ("GET", "/platform/user/me", "GTW998", "Unauthorized"),
+    (
+        "POST",
+        "/platform/proto/{api_name}/{api_version}",
+        "GTW013",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/subscription/subscribe",
+        "GEN001",
+        "Unauthorized",
+    ),
+    (
+        "POST",
+        "/platform/subscription/unsubscribe",
+        "GEN002",
+        "Unauthorized",
+    ),
+];
+
+fn unauthenticated(method: &Method, path: &str, _message: &str, request_id: &str) -> Response {
+    static CODES: OnceLock<Vec<(&'static str, Regex, &'static str, &'static str)>> =
+        OnceLock::new();
+    let codes = CODES.get_or_init(|| {
+        UNAUTHENTICATED_CODES
+            .iter()
+            .filter_map(|(method, template, code, text)| {
+                Some((*method, template_regex(template)?, *code, *text))
+            })
+            .collect()
+    });
+    let full = format!("/platform{path}");
+    // The backfill route is registered ahead of the proto upload template.
+    if let Some((_, _, code, text)) = codes
+        .iter()
+        .filter(|_| path != "/proto/descriptors/backfill")
+        .find(|(allowed, matcher, _, _)| *allowed == method.as_str() && matcher.is_match(&full))
+    {
+        return error(StatusCode::UNAUTHORIZED, code, text, request_id);
+    }
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        json!({"detail": "Unauthorized"}),
+        request_id,
+    )
+}
+
+/// Frozen operations whose FastAPI signature declares a JSON request model.
+fn json_body_operations() -> &'static [(Regex, String)] {
+    static TABLE: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(contract) = python_openapi_contract() else {
+            return Vec::new();
+        };
+        let Some(paths) = contract.get("paths").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut table = Vec::new();
+        for (template, item) in paths {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            for (method, operation) in item {
+                let json = operation
+                    .pointer("/requestBody/content")
+                    .and_then(Value::as_object)
+                    .is_some_and(|content| content.contains_key("application/json"));
+                if json && let Some(matcher) = template_regex(template) {
+                    table.push((matcher, method.to_ascii_uppercase()));
+                }
+            }
+        }
+        table
+    })
+}
+
+/// Every frozen operation in registration order with its JSON body schema.
+fn operation_body_schemas() -> &'static [(Regex, String, Option<Value>)] {
+    static TABLE: OnceLock<Vec<(Regex, String, Option<Value>)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(contract) = python_openapi_contract() else {
+            return Vec::new();
+        };
+        let Some(paths) = contract.get("paths").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut table = Vec::new();
+        for (template, item) in paths {
+            let (Some(item), Some(matcher)) = (item.as_object(), template_regex(template)) else {
+                continue;
+            };
+            for (method, operation) in item {
+                let schema = operation
+                    .pointer("/requestBody/content/application~1json/schema")
+                    .cloned();
+                table.push((matcher.clone(), method.to_ascii_uppercase(), schema));
+            }
+        }
+        table
+    })
+}
+
+/// FastAPI (pydantic v1) validation of a decoded JSON body against the model
+/// the resolved route declares; `true` when the request must fail with 422.
+fn body_fails_declared_model(path: &str, method: &Method, payload: &Value) -> bool {
+    let full = format!("/platform{path}");
+    let Some((_, _, Some(schema))) = operation_body_schemas()
+        .iter()
+        .find(|(matcher, allowed, _)| allowed == method.as_str() && matcher.is_match(&full))
+    else {
+        return false;
+    };
+    let Ok(contract) = python_openapi_contract() else {
+        return false;
+    };
+    !pydantic_accepts(contract, schema, payload, 0)
+}
+
+fn pydantic_accepts(contract: &Value, schema: &Value, value: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let pointer = reference.trim_start_matches('#');
+        return contract
+            .pointer(pointer)
+            .is_none_or(|resolved| pydantic_accepts(contract, resolved, value, depth + 1));
+    }
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
+        return value.is_null()
+            || options
+                .iter()
+                .any(|option| pydantic_accepts(contract, option, value, depth + 1));
+    }
+    if let Some(options) = schema.get("allOf").and_then(Value::as_array) {
+        return options
+            .iter()
+            .all(|option| pydantic_accepts(contract, option, value, depth + 1));
+    }
+    let kind = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if schema.get("properties").is_some() {
+                "object"
+            } else {
+                ""
+            }
+        });
+    let number = |value: &Value| -> Option<f64> {
+        match value {
+            Value::Number(number) => number.as_f64(),
+            Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
+            Value::String(text) => text.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let within_bounds = |amount: f64| {
+        let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
+        bound("minimum").is_none_or(|limit| amount >= limit)
+            && bound("maximum").is_none_or(|limit| amount <= limit)
+            && bound("exclusiveMinimum").is_none_or(|limit| amount > limit)
+            && bound("exclusiveMaximum").is_none_or(|limit| amount < limit)
+    };
+    match kind {
+        "object" => {
+            // pydantic v1 builds a dict from a list of key/value pairs too.
+            if let Some(pairs) = value.as_array() {
+                return schema.get("properties").is_none()
+                    && pairs
+                        .iter()
+                        .all(|pair| pair.as_array().is_some_and(|pair| pair.len() == 2));
+            }
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for name in required.iter().filter_map(Value::as_str) {
+                if object.get(name).is_none_or(Value::is_null) {
+                    return false;
+                }
+            }
+            if let Some(properties) = properties {
+                for (name, property) in properties {
+                    match object.get(name) {
+                        None | Some(Value::Null) => {}
+                        Some(item) => {
+                            if !pydantic_accepts(contract, property, item, depth + 1) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(additional) = schema.get("additionalProperties").filter(|v| v.is_object()) {
+                let known = properties.map(|map| map.keys().cloned().collect::<Vec<_>>());
+                for (name, item) in object {
+                    if known.as_ref().is_some_and(|known| known.contains(name)) || item.is_null() {
+                        continue;
+                    }
+                    if !pydantic_accepts(contract, additional, item, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        "array" => {
+            let Some(items) = value.as_array() else {
+                return false;
+            };
+            let count = items.len() as f64;
+            if schema
+                .get("minItems")
+                .and_then(Value::as_f64)
+                .is_some_and(|min| count < min)
+                || schema
+                    .get("maxItems")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|max| count > max)
+            {
+                return false;
+            }
+            schema.get("items").is_none_or(|item_schema| {
+                items.iter().all(|item| {
+                    item.is_null() || pydantic_accepts(contract, item_schema, item, depth + 1)
+                })
+            })
+        }
+        "string" => {
+            // pydantic v1 coerces numbers (and bools, an int subclass) to str.
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(flag) => if *flag { "True" } else { "False" }.to_owned(),
+                _ => return false,
+            };
+            let length = text.chars().count() as f64;
+            schema
+                .get("minLength")
+                .and_then(Value::as_f64)
+                .is_none_or(|min| length >= min)
+                && schema
+                    .get("maxLength")
+                    .and_then(Value::as_f64)
+                    .is_none_or(|max| length <= max)
+        }
+        "integer" => match value {
+            Value::String(text) => crate::python_scalar::parse_model_integer(text)
+                .is_some_and(|n| within_bounds(n as f64)),
+            other => number(other).is_some_and(|n| within_bounds(n.trunc())),
+        },
+        "number" => number(value).is_some_and(within_bounds),
+        "boolean" => match value {
+            Value::Bool(_) => true,
+            Value::Number(number) => matches!(number.as_f64(), Some(n) if n == 0.0 || n == 1.0),
+            Value::String(text) => matches!(
+                text.to_ascii_lowercase().as_str(),
+                "0" | "1" | "true" | "false" | "t" | "f" | "yes" | "no" | "y" | "n" | "on" | "off"
+            ),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+/// Whether the frozen operation declares a JSON request model (FastAPI then
+/// rejects an undecodable JSON body with 422 before the handler runs).
+fn declares_json_body(path: &str, method: &Method) -> bool {
+    let full = format!("/platform{path}");
+    json_body_operations()
+        .iter()
+        .any(|(matcher, allowed)| allowed == method.as_str() && matcher.is_match(&full))
+}
+
+/// FastAPI only decodes a declared JSON model from a JSON request; any other
+/// (or absent) Content-Type on a non-empty body fails validation with 422.
+fn rejects_non_json_body(path: &str, method: &Method, headers: &HeaderMap, body: &[u8]) -> bool {
+    if body.is_empty() || content_type_is_json(headers) {
+        return false;
+    }
+    let full = format!("/platform{path}");
+    json_body_operations()
+        .iter()
+        .any(|(matcher, allowed)| allowed == method.as_str() && matcher.is_match(&full))
+}
+
+/// Gateway routes in the pinned registration order, plus the Rust-native
+/// `/api/features` probe and gRPC-Web CORS preflight.
+const GATEWAY_ROUTES: &[(&str, &[&str])] = &[
+    ("/api/status", &["GET"]),
+    ("/api/health", &["GET"]),
+    ("/api/caches", &["DELETE"]),
+    ("/api/caches", &["OPTIONS"]),
+    (
+        "/api/rest/{path:path}",
+        &["PATCH", "DELETE", "GET", "POST", "PUT"],
+    ),
+    ("/api/rest/{path:path}", &["HEAD"]),
+    ("/api/rest/{path:path}", &["OPTIONS"]),
+    ("/api/soap/{path:path}", &["GET", "POST"]),
+    ("/api/grpc/{path:path}", &["GET", "POST"]),
+    ("/api/soap/{path:path}", &["OPTIONS"]),
+    ("/api/graphql/{path:path}", &["POST"]),
+    ("/api/graphql/{path:path}", &["OPTIONS"]),
+    ("/api/grpc/{path:path}", &["OPTIONS"]),
+    ("/api/features", &["GET"]),
+    // CORS preflights bypass this table, so only POST is a registered route.
+    ("/grpc-web/{api_name}/{service}/{method}", &["POST"]),
+];
+
+/// Starlette-style route resolution for the data plane: unknown paths are a
+/// bare 404 and known paths with other methods a 405 naming the first route.
+pub(crate) async fn gateway_route_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    static TABLE: OnceLock<Vec<(Regex, &'static [&'static str])>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        GATEWAY_ROUTES
+            .iter()
+            .filter_map(|(template, methods)| Some((template_regex(template)?, *methods)))
+            .collect()
+    });
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    // CORS preflights are answered by the CORS middleware ahead of routing.
+    if request.method() == Method::OPTIONS
+        && request.headers().contains_key(header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        return next.run(request).await;
+    }
+    let request_id = request_id_from(request.headers());
+    let mut partial = None;
+    for (matcher, methods) in table {
+        if !matcher.is_match(&path) {
+            continue;
+        }
+        if methods.contains(&request.method().as_str()) {
+            return next.run(request).await;
+        }
+        partial = partial.or(Some(*methods));
+    }
+    let Some(methods) = partial else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"detail": "Not Found"}),
+            &request_id,
+        );
+    };
+    let mut response = json_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        json!({"detail": "Method Not Allowed"}),
+        &request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&methods.join(", ")) {
+        response.headers_mut().insert(header::ALLOW, value);
+    }
+    response
+}
+
+fn python_route_match(path: &str, method: &Method) -> RouteMatch {
+    // The TLS administration surface is a Rust-native addition.
+    if path == "/tls" || path.starts_with("/tls/") {
+        return RouteMatch::Found;
+    }
+    let full = format!("/platform{path}");
+    let mut partial: Option<&str> = None;
+    for (matcher, methods) in platform_route_table() {
+        if !matcher.is_match(&full) {
+            continue;
+        }
+        if methods.iter().any(|allowed| allowed == method.as_str()) {
+            return RouteMatch::Found;
+        }
+        partial = partial.or(methods.first().map(String::as_str));
+    }
+    match partial {
+        Some(allow) => RouteMatch::MethodNotAllowed(allow.to_owned()),
+        None => RouteMatch::NotFound,
+    }
+}
+
 fn platform_docs(path: &str, request_id: &str) -> Response {
     let html = if path == "/redoc" {
         r#"<!doctype html><html><head><title>Doorman API</title><script src="https://cdn.jsdelivr.net/npm/redoc@2.5.2/bundles/redoc.standalone.js"></script></head><body><redoc spec-url="/platform/openapi.json"></redoc></body></html>"#
@@ -5513,17 +7483,12 @@ fn platform_docs(path: &str, request_id: &str) -> Response {
 async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
+    method: &Method,
     path: &str,
     request_id: &str,
 ) -> Result<AuthClaims, Response> {
-    let claims = verify_request_token(headers, &state.config.shared_storage).map_err(|_| {
-        error(
-            StatusCode::UNAUTHORIZED,
-            "AUTH003",
-            "Unauthorized",
-            request_id,
-        )
-    })?;
+    let claims = verify_request_token(headers, &state.config.shared_storage)
+        .map_err(|_| unauthenticated(method, path, "Unauthorized", request_id))?;
     let username = claims.sub.as_deref().unwrap_or("");
     let Some(storage) = &state.storage else {
         return Err(unexpected(request_id));
@@ -5541,25 +7506,19 @@ async fn authorize(
             request_id,
         ));
     }
-    if let Ok(Some(revocation)) = storage
+    if let Ok(Some(_revocation)) = storage
         .find_one(
             "revocations",
             &json!({"type": "revoke_all", "username": username}),
         )
         .await
     {
-        let revoked_at = revocation
-            .get("revoked_at")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX);
-        if (claims.iat.unwrap_or(0) as u64) <= revoked_at {
-            return Err(error(
-                StatusCode::UNAUTHORIZED,
-                "AUTH003",
-                "Token has been revoked",
-                request_id,
-            ));
-        }
+        return Err(unauthenticated(
+            method,
+            path,
+            "Token has been revoked",
+            request_id,
+        ));
     }
     if let Some(jti) = claims.jti.as_deref() {
         let filter = json!({"type": "jti", "username": username, "jti": jti});
@@ -5571,9 +7530,9 @@ async fn authorize(
             if expired {
                 let _ = storage.delete_one("revocations", &filter).await;
             } else {
-                return Err(error(
-                    StatusCode::UNAUTHORIZED,
-                    "AUTH003",
+                return Err(unauthenticated(
+                    method,
+                    path,
                     "Token has been revoked",
                     request_id,
                 ));
@@ -5585,9 +7544,9 @@ async fn authorize(
         .await
     {
         Ok(Some(user)) if user.get("active").and_then(Value::as_bool) != Some(false) => Ok(claims),
-        Ok(Some(_)) => Err(error(
-            StatusCode::UNAUTHORIZED,
-            "AUTH003",
+        Ok(Some(_)) => Err(unauthenticated(
+            method,
+            path,
             "User is inactive",
             request_id,
         )),
@@ -5620,21 +7579,33 @@ async fn is_admin_user(state: &AppState, username: &str) -> bool {
     let Some(storage) = &state.storage else {
         return false;
     };
-    matches!(
-        storage.find_one("users", &json!({"username": username})).await,
-        Ok(Some(user)) if user.get("role").and_then(Value::as_str) == Some("admin")
-    )
+    let Ok(Some(user)) = storage
+        .find_one("users", &json!({"username": username}))
+        .await
+    else {
+        return false;
+    };
+    let Some(role_name) = user.get("role").and_then(Value::as_str) else {
+        return false;
+    };
+    is_admin_role(state, role_name).await
 }
 
-async fn role_permissions_within_actor(state: &AppState, username: &str, role: &Value) -> bool {
-    for permission in RBAC_PERMISSIONS {
-        if role.get(*permission).and_then(Value::as_bool) == Some(true)
-            && !has_permission(state, username, permission).await
-        {
-            return false;
-        }
+async fn is_admin_role(state: &AppState, role_name: &str) -> bool {
+    if matches!(
+        role_name.trim().to_ascii_lowercase().as_str(),
+        "admin" | "platform admin"
+    ) {
+        return true;
     }
-    true
+    let Some(storage) = &state.storage else {
+        return false;
+    };
+    matches!(
+        storage.find_one("roles", &json!({"role_name": role_name})).await,
+        Ok(Some(role)) if role.get("platform_admin").and_then(Value::as_bool) == Some(true)
+            || role.get("role_name").and_then(Value::as_str).is_some_and(|name| matches!(name.trim().to_ascii_lowercase().as_str(), "admin" | "platform admin"))
+    )
 }
 
 async fn memory_dump(
@@ -5643,6 +7614,10 @@ async fn memory_dump(
     username: &str,
     request_id: &str,
 ) -> Response {
+    let path = match memory_request_path(&payload) {
+        Ok(path) => path,
+        Err(errors) => return validation_errors(errors, request_id),
+    };
     if !has_permission(state, username, "manage_security").await {
         return error(
             StatusCode::FORBIDDEN,
@@ -5662,8 +7637,7 @@ async fn memory_dump(
             request_id,
         );
     }
-    let path = payload.get("path").and_then(Value::as_str);
-    match crate::storage::snapshot::dump(storage, path).await {
+    match crate::storage::snapshot::dump(storage, path.as_deref()).await {
         Ok(path) => {
             audit::management_mutation(username, "memory.dump", "memory_snapshot", "success");
             success(
@@ -5700,6 +7674,10 @@ async fn memory_restore(
     username: &str,
     request_id: &str,
 ) -> Response {
+    let path = match memory_request_path(&payload) {
+        Ok(path) => path,
+        Err(errors) => return validation_errors(errors, request_id),
+    };
     if !has_permission(state, username, "manage_security").await {
         return error(
             StatusCode::FORBIDDEN,
@@ -5719,8 +7697,7 @@ async fn memory_restore(
             request_id,
         );
     }
-    let path = payload.get("path").and_then(Value::as_str);
-    match crate::storage::snapshot::restore(storage, path).await {
+    match crate::storage::snapshot::restore(storage, path.as_deref()).await {
         Ok((version, created_at)) => {
             audit::management_mutation(username, "memory.restore", "memory_snapshot", "success");
             success(
@@ -5758,6 +7735,29 @@ async fn memory_restore(
             )
         }
         Err(_) => unexpected(request_id),
+    }
+}
+
+fn memory_request_path(payload: &Value) -> Result<Option<String>, Vec<Value>> {
+    if payload.is_null() {
+        return Ok(None);
+    }
+    let Some(values) = payload.as_object() else {
+        return Err(vec![json!({
+            "loc": ["body"],
+            "msg": "value is not a valid dict",
+            "type": "type_error.dict"
+        })]);
+    };
+    match values.get("path") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => security_setting_string(value).map(Some).ok_or_else(|| {
+            vec![json!({
+                "loc": ["body", "path"],
+                "msg": "str type expected",
+                "type": "type_error.str"
+            })]
+        }),
     }
 }
 
@@ -5807,42 +7807,23 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
                 vec![json!({"error": "storage is unavailable"})],
             )
         };
-    let memory_snapshot_healthy = state
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    let tls_certificates_valid = state
         .runtime
-        .memory_snapshot_healthy
-        .load(Ordering::Relaxed);
-    let metrics_persistence_healthy = state
-        .runtime
-        .metrics_persistence_healthy
-        .load(Ordering::Relaxed);
-    let revocation_purge_healthy = state
-        .runtime
-        .revocation_purge_healthy
-        .load(Ordering::Relaxed);
-    let activity_log_healthy = state.runtime.activity_log_healthy.load(Ordering::Relaxed);
-    let security_audit_log_healthy = state
-        .runtime
-        .security_audit_log_healthy
-        .load(Ordering::Relaxed);
-    let ready = mongo_ok
-        && redis_ok
-        && missing_grpc_descriptors == 0
-        && memory_snapshot_healthy
-        && metrics_persistence_healthy
-        && revocation_purge_healthy
-        && activity_log_healthy
-        && security_audit_log_healthy;
+        .tls_certificate_expiries
+        .lock()
+        .map(|expiries| expiries.values().all(|expiry| *expiry > now))
+        .unwrap_or(false);
+    let ready = mongo_ok && redis_ok && missing_grpc_descriptors == 0 && tls_certificates_valid;
     let status = if ready { "ready" } else { "degraded" };
-    let status_code = if ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
     if !privileged {
-        return success(status_code, json!({"status": status}), request_id);
+        return success(StatusCode::OK, json!({"status": status}), request_id);
     }
     success(
-        status_code,
+        StatusCode::OK,
         json!({
             "status": status,
             "mongodb": mongo_ok,
@@ -5851,11 +7832,7 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
             "cache_backend": if memory_only { "memory" } else { "redis" },
             "missing_grpc_descriptors": missing_grpc_descriptors,
             "grpc_descriptor_errors": grpc_descriptor_errors,
-            "memory_snapshot_healthy": memory_snapshot_healthy,
-            "metrics_persistence_healthy": metrics_persistence_healthy,
-            "revocation_purge_healthy": revocation_purge_healthy,
-            "activity_log_healthy": activity_log_healthy,
-            "security_audit_log_healthy": security_audit_log_healthy
+            "tls_certificates_valid": tls_certificates_valid
         }),
         request_id,
     )
@@ -5975,19 +7952,140 @@ fn format_dashboard_count(value: u64) -> String {
     formatted
 }
 
-async fn monitor_metrics(state: &AppState, request_id: &str) -> Response {
+async fn monitor_metrics(
+    state: &AppState,
+    query: &HashMap<String, String>,
+    request_id: &str,
+) -> Response {
     let analytics = global_analytics();
-    let series = analytics.get_timeseries();
-    let total_requests = series.iter().map(|point| point.requests).sum::<u64>();
-    let total_errors = series.iter().map(|point| point.errors).sum::<u64>();
+    let minutes = match query.get("range").map(String::as_str).unwrap_or("24h") {
+        "1h" => 60,
+        "7d" => 60 * 24 * 7,
+        "30d" => 60 * 24 * 30,
+        _ => 60 * 24,
+    };
+    let points = analytics.get_timeseries();
+    let selected = points
+        .into_iter()
+        .rev()
+        .take(minutes)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let group_by_day = query
+        .get("group")
+        .is_some_and(|value| value.eq_ignore_ascii_case("day"));
+    let mut series = if group_by_day {
+        let mut days = std::collections::BTreeMap::<u64, AggregatedPoint>::new();
+        for point in &selected {
+            let day = (point.timestamp / 86_400) * 86_400;
+            let bucket = days.entry(day).or_insert_with(|| AggregatedPoint {
+                timestamp: day,
+                ..AggregatedPoint::default()
+            });
+            let prior = bucket.requests;
+            bucket.requests = bucket.requests.saturating_add(point.requests);
+            bucket.errors = bucket.errors.saturating_add(point.errors);
+            bucket.bytes_in = bucket.bytes_in.saturating_add(point.bytes_in);
+            bucket.bytes_out = bucket.bytes_out.saturating_add(point.bytes_out);
+            if bucket.requests > 0 {
+                bucket.latency_ms = ((bucket.latency_ms * prior as f64)
+                    + (point.latency_ms * point.requests as f64))
+                    / bucket.requests as f64;
+            }
+        }
+        days.into_values()
+            .map(|point| {
+                json!({
+                    "timestamp": point.timestamp,
+                    "count": point.requests,
+                    "error_count": point.errors,
+                    "avg_ms": point.latency_ms,
+                    "bytes_in": point.bytes_in,
+                    "bytes_out": point.bytes_out,
+                    "error_rate": if point.requests == 0 { 0.0 } else { point.errors as f64 / point.requests as f64 },
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        selected
+            .iter()
+            .map(|point| {
+                json!({
+                    "timestamp": point.timestamp,
+                    "count": point.requests,
+                    "test_count": 0,
+                    "error_count": point.errors,
+                    "avg_ms": point.latency_ms,
+                    "p95_ms": point.p95_ms(),
+                    "bytes_in": point.bytes_in,
+                    "bytes_out": point.bytes_out,
+                    "error_rate": if point.requests == 0 { 0.0 } else { point.errors as f64 / point.requests as f64 },
+                    "upstream_timeouts": 0,
+                    "retries": 0,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if query
+        .get("sort")
+        .is_some_and(|value| value.eq_ignore_ascii_case("desc"))
+    {
+        series.reverse();
+    }
+    let total_requests = selected.iter().map(|point| point.requests).sum::<u64>();
+    let total_errors = selected.iter().map(|point| point.errors).sum::<u64>();
     let average_response_ms = if total_requests == 0 {
         0.0
     } else {
-        series
+        selected
             .iter()
             .map(|point| point.latency_ms * point.requests as f64)
             .sum::<f64>()
             / total_requests as f64
+    };
+    // Python's MetricsStore.snapshot: top_apis/top_users/unique_users are
+    // aggregated only from the buckets in the selected range (with a
+    // documented global fallback when the range attributed no traffic),
+    // not from the process-global all-time counters.
+    let (range_start, range_end) = (
+        selected.first().map_or(0, |point| point.timestamp),
+        selected.last().map_or(u64::MAX, |point| point.timestamp),
+    );
+    let range_top_apis = analytics.get_top_apis_in_range(range_start, range_end, 10);
+    let top_apis: Vec<(String, u64)> = if range_top_apis.is_empty() {
+        analytics
+            .get_top_apis(10)
+            .into_iter()
+            .map(|entry| (entry.name, entry.count))
+            .collect()
+    } else {
+        range_top_apis
+            .into_iter()
+            .map(|entry| (entry.name, entry.count))
+            .collect()
+    };
+    let range_top_users = analytics.get_top_users_in_range(range_start, range_end, 10);
+    let (top_users, unique_users): (Vec<(String, u64)>, usize) = if range_top_users.is_empty() {
+        let global = analytics.get_top_users(10);
+        let count = global.len();
+        (
+            global
+                .into_iter()
+                .map(|entry| (entry.name, entry.count))
+                .collect(),
+            count,
+        )
+    } else {
+        let count = range_top_users.len();
+        (
+            range_top_users
+                .into_iter()
+                .map(|entry| (entry.name, entry.count))
+                .collect(),
+            count,
+        )
     };
     success(
         StatusCode::OK,
@@ -5995,11 +8093,16 @@ async fn monitor_metrics(state: &AppState, request_id: &str) -> Response {
             "uptime_seconds": state.runtime.started_at.elapsed().as_secs(),
             "active_requests": state.runtime.active_requests.load(std::sync::atomic::Ordering::Relaxed),
             "total_requests": total_requests,
+            "total_test_requests": 0,
             "total_errors": total_errors,
             "avg_response_ms": average_response_ms,
             "status_counts": analytics.get_status_distribution(),
             "series": series,
-            "top_apis": analytics.get_top_apis(10),
+            "top_apis": top_apis,
+            "top_users": top_users,
+            "unique_users": unique_users,
+            "total_upstream_timeouts": 0,
+            "total_retries": 0,
             "total_bytes_in": state.runtime.total_bytes_in.load(std::sync::atomic::Ordering::Relaxed),
             "total_bytes_out": state.runtime.total_bytes_out.load(std::sync::atomic::Ordering::Relaxed)
         }),
@@ -6010,91 +8113,333 @@ async fn monitor_metrics(state: &AppState, request_id: &str) -> Response {
 async fn monitor_report(
     state: &AppState,
     query: &HashMap<String, String>,
-    _request_id: &str,
+    request_id: &str,
 ) -> Response {
-    let analytics = global_analytics();
-    let points = analytics.get_timeseries();
-    let total_requests = points.iter().map(|point| point.requests).sum::<u64>();
-    let total_errors = points.iter().map(|point| point.errors).sum::<u64>();
-    let total_ms = points
-        .iter()
-        .map(|point| point.latency_ms * point.requests as f64)
-        .sum::<f64>();
-    let average_ms = if total_requests == 0 {
-        0.0
-    } else {
-        total_ms / total_requests as f64
-    };
-    let successes = total_requests.saturating_sub(total_errors);
-    let success_rate = if total_requests == 0 {
-        0.0
-    } else {
-        successes as f64 * 100.0 / total_requests as f64
-    };
     let start = query.get("start").map(String::as_str).unwrap_or("");
     let end = query.get("end").map(String::as_str).unwrap_or("");
+    let start_ts = match parse_report_timestamp(start) {
+        Ok(ts) => ts,
+        Err(message_text) => {
+            return error(StatusCode::BAD_REQUEST, "MON003", &message_text, request_id);
+        }
+    };
+    let end_ts = match parse_report_timestamp(end) {
+        Ok(ts) => ts,
+        Err(message_text) => {
+            return error(StatusCode::BAD_REQUEST, "MON003", &message_text, request_id);
+        }
+    };
+    if end_ts < start_ts {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "MON003",
+            "End date must be after start date",
+            request_id,
+        );
+    }
+
+    let (start_date, start_time_str) = report_date_time_utc(start_ts);
+    let (end_date, end_time_str) = report_date_time_utc(end_ts);
+    let directory = state
+        .config
+        .logs_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("platform-logs"));
+    let mut log_query = HashMap::new();
+    log_query.insert("start_date".to_owned(), start_date);
+    log_query.insert("end_date".to_owned(), end_date);
+    log_query.insert("start_time".to_owned(), start_time_str);
+    log_query.insert("end_time".to_owned(), end_time_str);
+    // Python pages through up to 100 * 1000 = 100,000 log-service results;
+    // read_log_records already bounds total bytes read via MAX_LOG_EXPORT_BYTES.
+    let logs = read_log_records(&directory, &log_query, 100_000).unwrap_or_default();
+
+    let mut total = 0u64;
+    let mut errors = 0u64;
+    let mut total_ms = 0.0f64;
+    let mut status_counts: std::collections::BTreeMap<u16, u64> = std::collections::BTreeMap::new();
+    let mut api_totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut api_errors: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut user_totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for record in &logs {
+        let endpoint = record.get("endpoint").and_then(Value::as_str).unwrap_or("");
+        if endpoint.is_empty() || endpoint == "/platform" || endpoint.starts_with("/platform/") {
+            continue;
+        }
+        total += 1;
+        let status_code = record
+            .get("status_code")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u16>().ok())
+            .or_else(|| {
+                record
+                    .get("status_code")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u16)
+            });
+        let level = record
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let is_error = status_code.is_some_and(|code| code >= 400)
+            || !matches!(level.as_str(), "INFO" | "DEBUG");
+        if is_error {
+            errors += 1;
+        }
+        if let Some(code) = status_code {
+            *status_counts.entry(code).or_default() += 1;
+        }
+        if let Some(response_time) = record.get("response_time").and_then(log_number) {
+            total_ms += response_time;
+        }
+        let api_key = report_api_from_endpoint(endpoint);
+        *api_totals.entry(api_key.clone()).or_default() += 1;
+        if is_error {
+            *api_errors.entry(api_key).or_default() += 1;
+        }
+        if let Some(username) = record
+            .get("user")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            *user_totals.entry(username.to_owned()).or_default() += 1;
+        }
+    }
+
+    let analytics = global_analytics();
+    let points_in_range = analytics
+        .get_timeseries()
+        .into_iter()
+        .filter(|point| {
+            point.timestamp >= start_ts.max(0) as u64 && point.timestamp <= end_ts.max(0) as u64
+        })
+        .collect::<Vec<_>>();
+    // Python's own defensive fallback: if no log lines matched (e.g. logs
+    // rotated away), reconstruct totals from the retained metrics buckets
+    // instead of reporting an empty period.
+    if total == 0 {
+        total = points_in_range.iter().map(|point| point.requests).sum();
+        errors = points_in_range.iter().map(|point| point.errors).sum();
+        total_ms = points_in_range
+            .iter()
+            .map(|point| point.latency_ms * point.requests as f64)
+            .sum();
+        for (status, count) in analytics.get_status_distribution() {
+            if let Ok(code) = status.parse::<u16>() {
+                *status_counts.entry(code).or_default() += count;
+            }
+        }
+        for entry in analytics.get_top_apis_in_range(
+            start_ts.max(0) as u64,
+            end_ts.max(0) as u64,
+            usize::MAX,
+        ) {
+            api_totals.insert(entry.name.clone(), entry.count);
+            if entry.error_count > 0 {
+                api_errors.insert(entry.name, entry.error_count);
+            }
+        }
+        for entry in analytics.get_top_users_in_range(
+            start_ts.max(0) as u64,
+            end_ts.max(0) as u64,
+            usize::MAX,
+        ) {
+            user_totals.insert(entry.name, entry.count);
+        }
+    }
+
+    let total_bytes_in: u64 = points_in_range.iter().map(|point| point.bytes_in).sum();
+    let total_bytes_out: u64 = points_in_range.iter().map(|point| point.bytes_out).sum();
+    let mut daily_bandwidth: std::collections::BTreeMap<u64, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for point in &points_in_range {
+        let day_ts = (point.timestamp / 86_400) * 86_400;
+        let entry = daily_bandwidth.entry(day_ts).or_default();
+        entry.0 += point.bytes_in;
+        entry.1 += point.bytes_out;
+    }
+
+    let average_ms = if total == 0 {
+        0.0
+    } else {
+        total_ms / total as f64
+    };
+    let successes = total.saturating_sub(errors);
+    let success_rate = if total == 0 {
+        0.0
+    } else {
+        successes as f64 * 100.0 / total as f64
+    };
+
     let mut csv = String::new();
     let _ = writeln!(csv, "Report,From,{},To,{}", csv_cell(start), csv_cell(end));
     csv.push_str("Overview\n");
-    let _ = writeln!(csv, "total_requests,{total_requests}");
-    let _ = writeln!(csv, "total_errors,{total_errors}");
+    let _ = writeln!(csv, "total_requests,{total}");
+    let _ = writeln!(csv, "total_errors,{errors}");
     let _ = writeln!(csv, "successes,{successes}");
     let _ = writeln!(csv, "success_rate,{success_rate:.2}%");
     let _ = writeln!(csv, "avg_response_ms,{average_ms:.2}");
     csv.push_str("\nBandwidth Overview\n");
-    let bytes_in = state
-        .runtime
-        .total_bytes_in
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let bytes_out = state
-        .runtime
-        .total_bytes_out
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let _ = writeln!(csv, "total_bytes_in,{bytes_in}");
-    let _ = writeln!(csv, "total_bytes_out,{bytes_out}");
-    let _ = writeln!(csv, "total_bytes,{}", bytes_in.saturating_add(bytes_out));
+    let _ = writeln!(csv, "total_bytes_in,{total_bytes_in}");
+    let _ = writeln!(csv, "total_bytes_out,{total_bytes_out}");
+    let _ = writeln!(
+        csv,
+        "total_bytes,{}",
+        total_bytes_in.saturating_add(total_bytes_out)
+    );
     csv.push_str("\nStatus Codes\nstatus,count\n");
-    let mut status_counts = analytics
-        .get_status_distribution()
-        .into_iter()
-        .collect::<Vec<_>>();
-    status_counts.sort_by_key(|(status, _)| status.parse::<u16>().unwrap_or(u16::MAX));
-    for (status, count) in status_counts {
-        let _ = writeln!(csv, "{},{}", csv_cell(&status), count);
+    for (status, count) in &status_counts {
+        let _ = writeln!(csv, "{status},{count}");
     }
     csv.push_str("\nAPI Usage\napi,total,errors,successes,success_rate\n");
-    for api in analytics.get_top_apis(analytics.api_count()) {
-        let successes = api.count.saturating_sub(api.error_count);
-        let rate = if api.count == 0 {
+    let mut apis = api_totals.into_iter().collect::<Vec<_>>();
+    apis.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (api, count) in apis {
+        let err = api_errors.get(&api).copied().unwrap_or_default();
+        let succ = count.saturating_sub(err);
+        let rate = if count == 0 {
             0.0
         } else {
-            successes as f64 * 100.0 / api.count as f64
+            succ as f64 * 100.0 / count as f64
         };
-        let _ = writeln!(
-            csv,
-            "{},{},{},{},{rate:.2}%",
-            csv_cell(&api.name),
-            api.count,
-            api.error_count,
-            successes
-        );
+        let _ = writeln!(csv, "{},{count},{err},{succ},{rate:.2}%", csv_cell(&api));
     }
     csv.push_str("\nUser Usage\nusername,requests\n");
-    for user in analytics.get_top_users(analytics.user_count()) {
-        let _ = writeln!(csv, "{},{}", csv_cell(&user.name), user.count);
+    let mut users = user_totals.into_iter().collect::<Vec<_>>();
+    users.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (user, count) in users {
+        let _ = writeln!(csv, "{},{count}", csv_cell(&user));
+    }
+    csv.push_str("\nBandwidth (per day, UTC)\ndate,bytes_in,bytes_out,total\n");
+    for (day_ts, (bytes_in, bytes_out)) in daily_bandwidth {
+        let (date_str, _) = report_date_time_utc(day_ts as i64);
+        let _ = writeln!(
+            csv,
+            "{date_str},{bytes_in},{bytes_out},{}",
+            bytes_in.saturating_add(bytes_out)
+        );
     }
 
+    let mut response = ([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], csv).into_response();
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "attachment; filename=doorman_report_{start}_to_{end}.csv"
+    )) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// `api` key derivation matching Python's `_api_from_endpoint` in
+/// `monitor_routes.py::generate_report`.
+fn report_api_from_endpoint(endpoint: &str) -> String {
+    if let Some(rest) = endpoint.strip_prefix("/api/rest/") {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        return format!("rest:{}", parts.first().copied().unwrap_or("unknown"));
+    }
+    if let Some(rest) = endpoint.strip_prefix("/api/graphql/") {
+        let name = rest
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        return format!("graphql:{name}");
+    }
+    if let Some(rest) = endpoint.strip_prefix("/api/soap/") {
+        let name = rest
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        return format!("soap:{name}");
+    }
+    "platform".to_owned()
+}
+
+/// Python's `_parse_ts`: try `%Y-%m-%dT%H:%M`, then `%Y-%m-%d`, then a
+/// best-effort ISO-8601 fallback via `datetime.fromisoformat`. A naive
+/// `datetime.strptime(...).timestamp()` in Python interprets the value in the
+/// process's local timezone; this deployment (like the pinned reference's
+/// container images) runs in UTC, so the two are equivalent here.
+fn parse_report_timestamp(value: &str) -> Result<i64, String> {
+    let invalid = || "Invalid date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM".to_owned();
+    let parse_date = |text: &str| -> Option<time::Date> {
+        let mut parts = text.splitn(3, '-');
+        let year = parts.next()?.parse::<i32>().ok()?;
+        let month = parts.next()?.parse::<u8>().ok()?;
+        let day = parts.next()?.parse::<u8>().ok()?;
+        time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()
+    };
+    let parse_time = |text: &str| -> Option<time::Time> {
+        // Strict "%H:%M" callers pass exactly two fields; the fromisoformat
+        // fallback below may also hand this "%H:%M:%S[.ffffff]", in which
+        // case the seconds (whole part only; unix timestamps here are
+        // second-resolution) are preserved rather than silently dropped.
+        let mut fields = text.splitn(3, ':');
+        let hour = fields.next()?;
+        let minute = fields.next()?;
+        let second = fields
+            .next()
+            .and_then(|value| value.split(['.', ',']).next())
+            .unwrap_or("0");
+        time::Time::from_hms(
+            hour.parse().ok()?,
+            minute.parse().ok()?,
+            second.parse().ok()?,
+        )
+        .ok()
+    };
+    let to_ts = |date: time::Date, time_value: time::Time| {
+        time::PrimitiveDateTime::new(date, time_value)
+            .assume_utc()
+            .unix_timestamp()
+    };
+
+    if let Some((date_part, time_part)) = value.split_once('T')
+        && let (Some(date), Some(time_value)) = (parse_date(date_part), parse_time(time_part))
+    {
+        return Ok(to_ts(date, time_value));
+    }
+    if let Some(date) = parse_date(value) {
+        return Ok(to_ts(date, time::Time::MIDNIGHT));
+    }
+    // fromisoformat fallback: accept "date time" (space separator) and an
+    // optional trailing "Z"/offset the two strict formats above reject.
+    let normalized = value.trim().replace('Z', "+00:00");
+    let date_part = normalized.split(['T', ' ']).next().unwrap_or_default();
+    let Some(date) = parse_date(date_part) else {
+        return Err(invalid());
+    };
+    let time_part = normalized
+        .split_once(['T', ' '])
+        .map(|(_, rest)| rest)
+        .map(|rest| rest.split(['+', '-']).next().unwrap_or_default())
+        .unwrap_or_default();
+    let time_value = if time_part.is_empty() {
+        time::Time::MIDNIGHT
+    } else {
+        parse_time(time_part).ok_or_else(invalid)?
+    };
+    Ok(to_ts(date, time_value))
+}
+
+/// Formats a unix timestamp as UTC `(YYYY-MM-DD, HH:MM)`, matching Python's
+/// `datetime.fromtimestamp(ts, timezone.utc).strftime(...)`.
+fn report_date_time_utc(timestamp: i64) -> (String, String) {
+    let Ok(value) = time::OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return (String::new(), String::new());
+    };
     (
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=doorman_report.csv",
-            ),
-        ],
-        csv,
+        format!(
+            "{:04}-{:02}-{:02}",
+            value.year(),
+            value.month() as u8,
+            value.day()
+        ),
+        format!("{:02}:{:02}", value.hour(), value.minute()),
     )
-        .into_response()
 }
 
 fn csv_cell(value: &str) -> String {
@@ -6104,6 +8449,80 @@ fn csv_cell(value: &str) -> String {
         value.to_owned()
     }
 }
+/// Matches FastAPI's automatic validation of a typed integer query parameter
+/// (e.g. `page: int = 1`): a present-but-non-numeric value never reaches the
+/// route handler and instead produces a 422 with this `detail` shape, rather
+/// than being silently coerced to a default.
+fn int_query_validation_error(
+    query: &HashMap<String, String>,
+    fields: &[&str],
+    request_id: &str,
+) -> Option<Response> {
+    for field in fields {
+        if query
+            .get(*field)
+            .is_some_and(|value| value.parse::<i64>().is_err())
+        {
+            return Some(validation_errors(
+                vec![json!({
+                    "loc": ["query", field],
+                    "msg": "value is not a valid integer",
+                    "type": "type_error.integer"
+                })],
+                request_id,
+            ));
+        }
+    }
+    None
+}
+
+fn analytics_query_error(
+    query: &HashMap<String, String>,
+    has_limit: bool,
+    request_id: &str,
+) -> Option<Response> {
+    if let Some(response) = int_query_validation_error(query, &["start_ts", "end_ts"], request_id) {
+        return Some(response);
+    }
+    if !has_limit {
+        return None;
+    }
+    let raw = query.get("limit")?;
+    let Ok(limit) = raw.parse::<i64>() else {
+        return Some(validation_errors(
+            vec![json!({
+                "loc": ["query", "limit"],
+                "msg": "value is not a valid integer",
+                "type": "type_error.integer"
+            })],
+            request_id,
+        ));
+    };
+    if limit < 1 {
+        return Some(validation_errors(
+            vec![json!({
+                "loc": ["query", "limit"],
+                "msg": "ensure this value is greater than or equal to 1",
+                "type": "value_error.number.not_ge",
+                "ctx": {"limit_value": 1}
+            })],
+            request_id,
+        ));
+    }
+    if limit > 100 {
+        return Some(validation_errors(
+            vec![json!({
+                "loc": ["query", "limit"],
+                "msg": "ensure this value is less than or equal to 100",
+                "type": "value_error.number.not_le",
+                "ctx": {"limit_value": 100}
+            })],
+            request_id,
+        ));
+    }
+    None
+}
+
 fn analytics_denied(request_id: &str) -> Response {
     error(
         StatusCode::FORBIDDEN,
@@ -6113,17 +8532,23 @@ fn analytics_denied(request_id: &str) -> Response {
     )
 }
 
-fn analytics_time_range(query: &HashMap<String, String>) -> (u64, u64) {
+fn analytics_time_range(query: &HashMap<String, String>) -> (i64, i64) {
     if let (Some(start), Some(end)) = (
-        query.get("start_ts").and_then(|value| value.parse().ok()),
-        query.get("end_ts").and_then(|value| value.parse().ok()),
+        query
+            .get("start_ts")
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value != 0),
+        query
+            .get("end_ts")
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value != 0),
     ) {
         return (start, end);
     }
     let end = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64;
     let duration = match query.get("range").map(String::as_str).unwrap_or("24h") {
         "1h" => 3_600,
         "7d" => 604_800,
@@ -6141,26 +8566,23 @@ fn analytics_limit(query: &HashMap<String, String>) -> usize {
         .clamp(1, 100)
 }
 
+/// Python's `PercentileMetrics.calculate`: pool every raw latency sample from
+/// every bucket (not per-bucket averages), sort, and index each percentile at
+/// `max(0, int(p * n) - 1)`.
 fn analytics_percentiles(points: &[AggregatedPoint]) -> Value {
-    let mut values = points
+    let values: Vec<f64> = points
         .iter()
-        .map(|point| point.latency_ms)
-        .collect::<Vec<_>>();
-    values.sort_by(|left, right| left.total_cmp(right));
-    let percentile = |fraction: f64| {
-        if values.is_empty() {
-            0.0
-        } else {
-            let index = ((values.len() - 1) as f64 * fraction).round() as usize;
-            values[index]
-        }
-    };
+        .flat_map(|point| point.latencies_ms.iter().copied())
+        .collect();
+    let (min, max) = (
+        values.iter().copied().fold(f64::INFINITY, f64::min),
+        values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let (p50, p75, p90, p95, p99) = pooled_percentiles(values.iter().copied());
     json!({
-        "p50": percentile(0.50),
-        "p75": percentile(0.75),
-        "p90": percentile(0.90),
-        "p95": percentile(0.95),
-        "p99": percentile(0.99)
+        "p50": p50, "p75": p75, "p90": p90, "p95": p95, "p99": p99,
+        "min": if values.is_empty() { 0.0 } else { min },
+        "max": if values.is_empty() { 0.0 } else { max }
     })
 }
 
@@ -6168,19 +8590,20 @@ fn analytics_entity(entity: &EntityCounter, key: &str) -> Value {
     json!({key: entity.name, "count": entity.count})
 }
 
-fn analytics_endpoint(entity: &EntityCounter) -> Value {
+fn analytics_endpoint(entity: &EndpointEntity) -> Value {
     let error_rate = if entity.count == 0 {
         0.0
     } else {
         entity.error_count as f64 / entity.count as f64
     };
+    let (p50, p75, p90, p95, p99) = entity.percentiles;
     json!({
         "endpoint_uri": entity.name,
         "count": entity.count,
         "error_count": entity.error_count,
         "error_rate": error_rate,
-        "avg_ms": 0.0,
-        "percentiles": {"p50": 0.0, "p75": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0}
+        "avg_ms": entity.avg_ms,
+        "percentiles": {"p50": p50, "p75": p75, "p90": p90, "p95": p95, "p99": p99}
     })
 }
 
@@ -6204,13 +8627,7 @@ fn analytics_series_point(point: &AggregatedPoint, metric_type: Option<&str>) ->
             value.insert("avg_ms".to_owned(), json!(point.latency_ms));
             value.insert(
                 "percentiles".to_owned(),
-                json!({
-                    "p50": point.latency_ms,
-                    "p75": point.latency_ms,
-                    "p90": point.latency_ms,
-                    "p95": point.latency_ms,
-                    "p99": point.latency_ms
-                }),
+                analytics_percentiles(std::slice::from_ref(point)),
             );
         }
         Some("bandwidth") => {
@@ -6225,13 +8642,7 @@ fn analytics_series_point(point: &AggregatedPoint, metric_type: Option<&str>) ->
             value.insert("avg_ms".to_owned(), json!(point.latency_ms));
             value.insert(
                 "percentiles".to_owned(),
-                json!({
-                    "p50": point.latency_ms,
-                    "p75": point.latency_ms,
-                    "p90": point.latency_ms,
-                    "p95": point.latency_ms,
-                    "p99": point.latency_ms
-                }),
+                analytics_percentiles(std::slice::from_ref(point)),
             );
             value.insert("bytes_in".to_owned(), json!(point.bytes_in));
             value.insert("bytes_out".to_owned(), json!(point.bytes_out));
@@ -6243,7 +8654,8 @@ fn analytics_series_point(point: &AggregatedPoint, metric_type: Option<&str>) ->
 
 fn analytics_timeseries(query: &HashMap<String, String>, request_id: &str) -> Response {
     let (start_ts, end_ts) = analytics_time_range(query);
-    let points = global_analytics().get_timeseries_range(start_ts, end_ts);
+    let points =
+        global_analytics().get_timeseries_range(start_ts.max(0) as u64, end_ts.max(0) as u64);
     let metric_type = query.get("metric_type").map(String::as_str);
     let series = points
         .iter()
@@ -6265,44 +8677,53 @@ fn analytics_top(kind: &str, query: &HashMap<String, String>, request_id: &str) 
     let (start_ts, end_ts) = analytics_time_range(query);
     let limit = analytics_limit(query);
     let analytics = global_analytics();
+    let (start_bound, end_bound) = (start_ts.max(0) as u64, end_ts.max(0) as u64);
     let response = match kind {
         "api" => {
-            let entries = analytics
-                .get_top_apis(limit)
+            // Reconstructed from only the minute buckets in [start_ts, end_ts],
+            // matching Python's enhanced_metrics_store.get_snapshot-backed top_apis
+            // rather than an all-time process-global total.
+            let all = analytics.get_top_apis_in_range(start_bound, end_bound, usize::MAX);
+            let entries = all
                 .iter()
+                .take(limit)
                 .map(|entry| analytics_entity(entry, "api"))
                 .collect::<Vec<_>>();
             json!({
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "top_apis": entries,
-                "total_apis": analytics.api_count()
+                "total_apis": all.len()
             })
         }
         "user" => {
-            let entries = analytics
-                .get_top_users(limit)
+            let all = analytics.get_top_users_in_range(start_bound, end_bound, usize::MAX);
+            let entries = all
                 .iter()
+                .take(limit)
                 .map(|entry| analytics_entity(entry, "user"))
                 .collect::<Vec<_>>();
             json!({
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "top_users": entries,
-                "total_users": analytics.user_count()
+                "total_users": all.len()
             })
         }
         _ => {
-            let mut entries = analytics
-                .get_top_endpoints(analytics.endpoint_count())
-                .iter()
-                .map(analytics_endpoint)
-                .collect::<Vec<_>>();
+            let all = analytics.get_top_endpoints_in_range(start_bound, end_bound, usize::MAX);
+            let mut entries = all.iter().map(analytics_endpoint).collect::<Vec<_>>();
+            let total_endpoints = entries.len();
             let sort_by = query.get("sort_by").map(String::as_str).unwrap_or("count");
-            if sort_by == "error_rate" {
+            let sort_key = match sort_by {
+                "error_rate" => Some("error_rate"),
+                "avg_ms" => Some("avg_ms"),
+                _ => None,
+            };
+            if let Some(key) = sort_key {
                 entries.sort_by(|left, right| {
-                    right["error_rate"]
+                    right[key]
                         .as_f64()
                         .unwrap_or_default()
-                        .total_cmp(&left["error_rate"].as_f64().unwrap_or_default())
+                        .total_cmp(&left[key].as_f64().unwrap_or_default())
                 });
             }
             entries.truncate(limit);
@@ -6310,7 +8731,7 @@ fn analytics_top(kind: &str, query: &HashMap<String, String>, request_id: &str) 
                 "time_range": {"start_ts": start_ts, "end_ts": end_ts},
                 "sort_by": sort_by,
                 "top_endpoints": entries,
-                "total_endpoints": analytics.endpoint_count()
+                "total_endpoints": total_endpoints
             })
         }
     };
@@ -6328,7 +8749,7 @@ async fn analytics_overview(
     }
     let (start_ts, end_ts) = analytics_time_range(query);
     let analytics = global_analytics();
-    let points = analytics.get_timeseries_range(start_ts, end_ts);
+    let points = analytics.get_timeseries_range(start_ts.max(0) as u64, end_ts.max(0) as u64);
     let total_requests = points.iter().map(|point| point.requests).sum::<u64>();
     let total_errors = points.iter().map(|point| point.errors).sum::<u64>();
     let total_ms = points
@@ -6706,13 +9127,13 @@ async fn config_export(
     query: &HashMap<String, String>,
     request_id: &str,
 ) -> Response {
-    let permission = match only {
-        None => "manage_gateway",
-        Some("apis") => "manage_apis",
-        Some("endpoints") => "manage_endpoints",
-        Some("roles") => "manage_roles",
-        Some("groups") => "manage_groups",
-        Some("routings") => "manage_routings",
+    let (permission, permission_code) = match only {
+        None => ("manage_gateway", "CFG001"),
+        Some("apis") => ("manage_apis", "CFG002"),
+        Some("endpoints") => ("manage_endpoints", "CFG007"),
+        Some("roles") => ("manage_roles", "CFG003"),
+        Some("groups") => ("manage_groups", "CFG004"),
+        Some("routings") => ("manage_routings", "CFG005"),
         Some(_) => {
             return error(
                 StatusCode::NOT_FOUND,
@@ -6725,7 +9146,7 @@ async fn config_export(
     if !has_permission(state, username, permission).await {
         return error(
             StatusCode::FORBIDDEN,
-            "CFG001",
+            permission_code,
             "Insufficient permissions",
             request_id,
         );
@@ -6734,11 +9155,9 @@ async fn config_export(
         return unexpected(request_id);
     };
     if let Some("apis") = only {
-        if let Some(api_name) = query.get("api_name") {
-            let api_version = query
-                .get("api_version")
-                .cloned()
-                .unwrap_or_else(|| "v1".to_owned());
+        if let (Some(api_name), Some(api_version)) =
+            (query.get("api_name"), query.get("api_version"))
+        {
             let filter = json!({"api_name": api_name, "api_version": api_version});
             let api = match storage.find_one("apis", &filter).await {
                 Ok(Some(api)) => api,
@@ -6766,33 +9185,64 @@ async fn config_export(
         }
     }
     if let Some(collection) = only {
-        let identifying_filter = match collection {
-            "roles" => query
-                .get("role_name")
-                .map(|value| json!({"role_name": value})),
-            "groups" => query
-                .get("group_name")
-                .map(|value| json!({"group_name": value})),
-            "routings" => query
-                .get("client_key")
-                .map(|value| json!({"client_key": value})),
+        let named_export = match collection {
+            "roles" => query.get("role_name").map(|value| {
+                (
+                    json!({"role_name": value}),
+                    "role",
+                    "CFG405",
+                    "Role not found",
+                )
+            }),
+            "groups" => query.get("group_name").map(|value| {
+                (
+                    json!({"group_name": value}),
+                    "group",
+                    "CFG406",
+                    "Group not found",
+                )
+            }),
+            "routings" => query.get("client_key").map(|value| {
+                (
+                    json!({"client_key": value}),
+                    "routing",
+                    "CFG407",
+                    "Routing not found",
+                )
+            }),
             _ => None,
         };
-        if let Some(filter) = identifying_filter {
-            match storage.find_one(collection, &filter).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return error(
-                        StatusCode::NOT_FOUND,
-                        "CFG404",
-                        "Configuration item not found",
+        if let Some((filter, response_key, missing_code, missing_text)) = named_export {
+            return match storage.find_one(collection, &filter).await {
+                Ok(Some(value)) => {
+                    audit::config_export(username, only);
+                    success(
+                        StatusCode::OK,
+                        json!({response_key: strip_internal(value)}),
                         request_id,
-                    );
+                    )
                 }
-                Err(_) => return unexpected(request_id),
-            }
+                Ok(None) => error(
+                    StatusCode::NOT_FOUND,
+                    missing_code,
+                    missing_text,
+                    request_id,
+                ),
+                Err(_) => unexpected(request_id),
+            };
         }
-        let values = match storage.find_many(collection, &json!({})).await {
+        let filter = if collection == "endpoints" {
+            let mut filter = Map::new();
+            for key in ["api_name", "api_version"] {
+                if let Some(value) = query.get(key) {
+                    filter.insert(key.to_owned(), json!(value));
+                }
+            }
+            Value::Object(filter)
+        } else {
+            json!({})
+        };
+        let values = match storage.find_many(collection, &filter).await {
             Ok(values) => values.into_iter().map(strip_internal).collect::<Vec<_>>(),
             Err(_) => return unexpected(request_id),
         };
@@ -6820,41 +9270,6 @@ async fn config_import(
     if !has_permission(state, username, "manage_gateway").await {
         return error(
             StatusCode::FORBIDDEN,
-            "CFG001",
-            "Insufficient permissions",
-            request_id,
-        );
-    }
-    let Some(storage) = &state.storage else {
-        return unexpected(request_id);
-    };
-    let imported = match storage
-        .import_configuration_atomically(
-            &payload,
-            json!({
-                "snapshot_id": Uuid::new_v4().to_string(),
-                "created_at": timestamp_now(),
-                "actor": username
-            }),
-        )
-        .await
-    {
-        Ok(imported) => imported,
-        Err(_) => return unexpected(request_id),
-    };
-    audit::management_mutation(username, "config.import", "configuration", "success");
-    success(StatusCode::OK, json!({"imported": imported}), request_id)
-}
-
-async fn config_rollback(
-    state: &AppState,
-    username: &str,
-    payload: Value,
-    request_id: &str,
-) -> Response {
-    if !has_permission(state, username, "manage_gateway").await {
-        return error(
-            StatusCode::FORBIDDEN,
             "CFG006",
             "Insufficient permissions",
             request_id,
@@ -6863,70 +9278,201 @@ async fn config_rollback(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let requested_snapshot_id = payload.get("snapshot_id").and_then(Value::as_str);
-    let snapshot = if let Some(snapshot_id) = requested_snapshot_id {
-        match storage
-            .find_one("config_snapshots", &json!({"snapshot_id": snapshot_id}))
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "CFG404",
-                    "Configuration snapshot not found",
-                    request_id,
-                );
-            }
-            Err(_) => return unexpected(request_id),
-        }
-    } else {
-        let snapshots = match storage.find_many("config_snapshots", &json!({})).await {
-            Ok(snapshots) => snapshots,
-            Err(_) => return unexpected(request_id),
-        };
-        let Some(snapshot) = snapshots.into_iter().max_by(|left, right| {
-            left.get("created_at")
-                .and_then(Value::as_str)
-                .cmp(&right.get("created_at").and_then(Value::as_str))
-        }) else {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "CFG007",
-                "No configuration snapshot available",
-                request_id,
-            );
-        };
-        snapshot
-    };
-    let Some(data) = snapshot.get("data").and_then(Value::as_object) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "CFG007",
-            "Configuration snapshot is invalid",
-            request_id,
-        );
-    };
-    let mut replacements = Vec::new();
+    let mut snapshot_data = Map::new();
     for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
-        let Some(values) = data.get(collection).and_then(Value::as_array) else {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "CFG007",
-                "Configuration snapshot is invalid",
-                request_id,
-            );
+        let values = match storage.find_many(collection, &json!({})).await {
+            Ok(values) => values.into_iter().map(strip_internal).collect::<Vec<_>>(),
+            Err(_) => return unexpected(request_id),
         };
-        replacements.push((collection.to_owned(), values.clone()));
+        snapshot_data.insert(collection.to_owned(), json!(values));
     }
+    let timestamp = timestamp_now_naive().replace('T', " ");
     if storage
-        .replace_collections_atomically(&replacements, None)
+        .insert_one(
+            "config_snapshots",
+            json!({
+                "snapshot_id": Uuid::new_v4().to_string(),
+                "timestamp": timestamp,
+                "created_by": username,
+                "data": snapshot_data,
+            }),
+        )
         .await
         .is_err()
     {
         return unexpected(request_id);
     }
-    let restored_to = snapshot.get("created_at").cloned().unwrap_or(Value::Null);
+    let mut imported = Map::new();
+    for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
+        let values = match payload.get(collection) {
+            None => Vec::new(),
+            Some(value) if !python_truthy_json(value) => Vec::new(),
+            Some(Value::Array(values)) => values.clone(),
+            Some(_) => return unexpected(request_id),
+        };
+        let mut count = 0;
+        for value in values {
+            let Some(document) = value.as_object() else {
+                return unexpected(request_id);
+            };
+            if config_upsert(storage, collection, document).await.is_err() {
+                return unexpected(request_id);
+            }
+            count += 1;
+        }
+        imported.insert(collection.to_owned(), json!(count));
+    }
+    audit::management_mutation(username, "config.import", "configuration", "success");
+    success(
+        StatusCode::OK,
+        json!({"imported": Value::Object(imported)}),
+        request_id,
+    )
+}
+
+async fn config_upsert(
+    storage: &SharedStorage,
+    collection: &str,
+    document: &Map<String, Value>,
+) -> Result<(), crate::storage::runtime::StorageError> {
+    let required: &[&str] = match collection {
+        "apis" => &["api_name", "api_version"],
+        "endpoints" => &["api_name", "api_version", "endpoint_method", "endpoint_uri"],
+        "roles" => &["role_name"],
+        "groups" => &["group_name"],
+        "routings" => &["client_key"],
+        _ => return Ok(()),
+    };
+    if required.iter().any(|field| {
+        document
+            .get(*field)
+            .is_none_or(|value| !python_truthy_json(value))
+    }) {
+        return Ok(());
+    }
+    let filter = Value::Object(
+        required
+            .iter()
+            .map(|field| ((*field).to_owned(), document[*field].clone()))
+            .collect(),
+    );
+    let mut value = Value::Object(document.clone());
+    strip_mongo_id(&mut value);
+    if collection == "endpoints" {
+        if let Some(api) = storage
+            .find_one(
+                "apis",
+                &json!({
+                    "api_name": document["api_name"],
+                    "api_version": document["api_version"],
+                }),
+            )
+            .await?
+            && let Some(api_id) = api.get("api_id")
+        {
+            value["api_id"] = api_id.clone();
+        }
+        if value.get("endpoint_id").is_none() {
+            value["endpoint_id"] = json!(Uuid::new_v4().to_string());
+        }
+    }
+    let existing = storage.find_one(collection, &filter).await?;
+    if collection == "apis" {
+        if existing.is_none() {
+            if value.get("api_id").is_none() {
+                value["api_id"] = json!(Uuid::new_v4().to_string());
+            }
+            if value.get("api_path").is_none() {
+                value["api_path"] = json!(format!(
+                    "/{}/{}",
+                    python_string(&document["api_name"]),
+                    python_string(&document["api_version"]),
+                ));
+            }
+        } else if value.get("api_id").is_none()
+            && let Some(api_id) = existing.as_ref().and_then(|api| api.get("api_id"))
+        {
+            value["api_id"] = api_id.clone();
+        }
+    }
+    if existing.is_some() {
+        storage.update_one(collection, &filter, &value).await?;
+    } else {
+        storage.insert_one(collection, value).await?;
+    }
+    Ok(())
+}
+
+fn python_string(value: &Value) -> String {
+    security_setting_string(value).unwrap_or_else(|| value.to_string())
+}
+
+async fn config_rollback(
+    state: &AppState,
+    username: &str,
+    _payload: Value,
+    request_id: &str,
+) -> Response {
+    if !has_permission(state, username, "manage_gateway").await {
+        return http_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Rollback failed",
+            request_id,
+        );
+    }
+    let Some(storage) = &state.storage else {
+        return unexpected(request_id);
+    };
+    let snapshots = match storage.find_many("config_snapshots", &json!({})).await {
+        Ok(snapshots) => snapshots,
+        Err(_) => {
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
+                request_id,
+            );
+        }
+    };
+    let Some(snapshot) = snapshots.into_iter().max_by(|left, right| {
+        left.get("timestamp")
+            .and_then(Value::as_str)
+            .cmp(&right.get("timestamp").and_then(Value::as_str))
+    }) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "CFG404",
+            "No snapshot found",
+            request_id,
+        );
+    };
+    let Some(data) = snapshot.get("data").and_then(Value::as_object) else {
+        return http_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Rollback failed",
+            request_id,
+        );
+    };
+    for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
+        let Some(values) = data.get(collection).and_then(Value::as_array) else {
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
+                request_id,
+            );
+        };
+        if storage
+            .replace_collection(collection, values.clone())
+            .await
+            .is_err()
+        {
+            return http_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Rollback failed",
+                request_id,
+            );
+        }
+    }
+    let restored_to = snapshot.get("timestamp").cloned().unwrap_or(Value::Null);
     let snapshot_id = snapshot.get("snapshot_id").cloned().unwrap_or(Value::Null);
     audit::management_mutation(
         username,
@@ -6936,7 +9482,7 @@ async fn config_rollback(
     );
     success(
         StatusCode::OK,
-        json!({"message": format!("Configuration rolled back to {}", restored_to.as_str().unwrap_or("latest")), "restored_to": restored_to, "snapshot_id": snapshot_id}),
+        json!({"message": format!("Configuration rolled back to {}", restored_to.as_str().unwrap_or("latest"))}),
         request_id,
     )
 }
@@ -6978,7 +9524,15 @@ async fn analytics_detail(
                 endpoint.name.starts_with(&endpoint_prefix)
                     || endpoint.name.starts_with(&gateway_prefix)
             })
-            .map(analytics_endpoint)
+            .map(|endpoint| {
+                analytics_endpoint(&EndpointEntity {
+                    name: endpoint.name.clone(),
+                    count: endpoint.count,
+                    error_count: endpoint.error_count,
+                    avg_ms: 0.0,
+                    percentiles: (0.0, 0.0, 0.0, 0.0, 0.0),
+                })
+            })
             .collect::<Vec<_>>();
         return success(
             StatusCode::OK,
@@ -7087,43 +9641,72 @@ fn restart_required_keys() -> Value {
     )
 }
 
-async fn demo_seed(state: &AppState, username: &str, request_id: &str) -> Response {
-    if username != "admin" {
+async fn demo_seed(
+    state: &AppState,
+    username: &str,
+    query: &HashMap<String, String>,
+    request_id: &str,
+) -> Response {
+    // Python: `if not await is_admin_user(username)` -- a role-based admin
+    // check, not a literal username comparison.
+    if !is_admin_user(state, username).await {
         return error(
             StatusCode::FORBIDDEN,
-            "AUTH006",
-            "Admin access required",
+            "DEMO001",
+            "Permission denied to run seeder",
             request_id,
         );
     }
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
+    // Python has no such gate and will happily seed a real MongoDB; Rust
+    // deliberately refuses outside memory mode as an additional safety guard
+    // against seeding synthetic data into a production database. This is a
+    // documented approved addition, not a parity gap, so it uses its own
+    // error code rather than colliding with DEMO001 above.
     if !storage.is_memory() {
         return error(
             StatusCode::BAD_REQUEST,
-            "DEMO001",
+            "DEMO002",
             "Demo seed is available only in memory mode",
             request_id,
         );
     }
-    for (name, version, server) in [
-        ("customers", "v1", "http://localhost:8080"),
-        ("orders", "v1", "http://localhost:8081"),
-        ("weather", "v1", "http://localhost:8082"),
-    ] {
-        if storage
-            .find_one("apis", &json!({"api_name": name, "api_version": version}))
-            .await
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            let _ = storage.insert_one("apis", json!({"api_name": name, "api_version": version, "api_id": Uuid::new_v4().to_string(), "api_path": format!("/{name}/{version}"), "api_servers": [server], "api_type": "REST", "api_public": false, "api_auth_required": true, "active": true})).await;
-            let _ = storage.insert_one("endpoints", json!({"api_name": name, "api_version": version, "endpoint_id": Uuid::new_v4().to_string(), "endpoint_method": "GET", "endpoint_uri": "/status", "client_uri": "/status", "endpoint_description": "Demo status"})).await;
+    let query_usize = |key: &str, default: usize| {
+        query
+            .get(key)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let options = crate::demo_seed::SeedOptions {
+        users: query_usize("users", 40),
+        apis: query_usize("apis", 15),
+        endpoints: query_usize("endpoints", 6),
+        groups: query_usize("groups", 8),
+        protos: query_usize("protos", 6),
+        logs: query_usize("logs", 1500),
+        seed: query
+            .get("seed")
+            .and_then(|value| value.parse::<u64>().ok()),
+    };
+    match crate::demo_seed::run_seed(storage, &options).await {
+        Ok(mut result) => {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("message".to_owned(), json!("Seed completed"));
+            }
+            success(StatusCode::OK, result, request_id)
+        }
+        Err(error_value) => {
+            tracing::error!(error = %error_value, "demo seed error");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEMO999",
+                "Failed to seed demo data",
+                request_id,
+            )
         }
     }
-    message(StatusCode::OK, "Demo data seeded successfully", request_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7176,14 +9759,12 @@ fn cors_check_config_from(get: impl Fn(&str) -> Option<String>) -> CorsCheckConf
     if !methods.iter().any(|method| method == "OPTIONS") {
         methods.push("OPTIONS".to_owned());
     }
-    let raw_headers = {
-        let value = get("ALLOW_HEADERS")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "*".to_owned());
-        csv(value)
-    };
-    let used_wildcard_headers = raw_headers.iter().any(|header| header == "*");
-    let headers = if used_wildcard_headers {
+    let raw_headers_value = get("ALLOW_HEADERS")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "*".to_owned());
+    let used_wildcard_headers = raw_headers_value.split(',').any(|header| header == "*");
+    let raw_headers = csv(raw_headers_value);
+    let headers = if raw_headers.iter().any(|header| header == "*") {
         ["Accept", "Content-Type", "X-CSRF-Token", "Authorization"]
             .into_iter()
             .map(str::to_owned)
@@ -7229,11 +9810,130 @@ fn cors_check_config_from(get: impl Fn(&str) -> Option<String>) -> CorsCheckConf
 }
 
 fn cors_check(payload: Value, request_id: &str) -> Response {
+    let payload = match normalize_cors_check(payload) {
+        Ok(payload) => payload,
+        Err(errors) => return validation_errors(errors, request_id),
+    };
     cors_check_with_config(
         payload,
         request_id,
         &cors_check_config_from(|key| env::var(key).ok()),
     )
+}
+
+fn normalize_cors_check(payload: Value) -> Result<Value, Vec<Value>> {
+    let Value::Object(values) = payload else {
+        return Err(vec![json!({
+            "loc": ["body"],
+            "msg": "value is not a valid dict",
+            "type": "type_error.dict"
+        })]);
+    };
+    let mut errors = Vec::new();
+    let mut normalized = Map::new();
+    for field in ["origin", "method"] {
+        match values.get(field) {
+            None => errors.push(json!({"loc": ["body", field], "msg": "field required", "type": "value_error.missing"})),
+            Some(Value::Null) => errors.push(json!({"loc": ["body", field], "msg": "none is not an allowed value", "type": "type_error.none.not_allowed"})),
+            Some(value) => match security_setting_string(value) {
+                Some(value) => {
+                    normalized.insert(field.to_owned(), json!(value));
+                }
+                None => errors.push(json!({"loc": ["body", field], "msg": "str type expected", "type": "type_error.str"})),
+            },
+        }
+    }
+    match values.get("request_headers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(headers)) => {
+            let mut parsed = Vec::with_capacity(headers.len());
+            for (index, header) in headers.iter().enumerate() {
+                if header.is_null() {
+                    errors.push(json!({"loc": ["body", "request_headers", index], "msg": "none is not an allowed value", "type": "type_error.none.not_allowed"}));
+                } else if let Some(header) = security_setting_string(header) {
+                    parsed.push(header);
+                } else {
+                    errors.push(json!({"loc": ["body", "request_headers", index], "msg": "str type expected", "type": "type_error.str"}));
+                }
+            }
+            normalized.insert("request_headers".to_owned(), json!(parsed));
+        }
+        Some(_) => errors.push(json!({"loc": ["body", "request_headers"], "msg": "value is not a valid list", "type": "type_error.list"})),
+    }
+    match values.get("with_credentials") {
+        None | Some(Value::Null) => {}
+        Some(value) => match security_setting_bool(value) {
+            Some(value) => {
+                normalized.insert("with_credentials".to_owned(), json!(value));
+            }
+            None => errors.push(json!({"loc": ["body", "with_credentials"], "msg": "value could not be parsed to a boolean", "type": "type_error.bool"})),
+        },
+    }
+    if errors.is_empty() {
+        Ok(Value::Object(normalized))
+    } else {
+        Err(errors)
+    }
+}
+
+fn normalize_chaos_toggle(payload: &Value) -> Result<(String, bool, i64), Vec<Value>> {
+    let Some(values) = payload.as_object() else {
+        return Err(vec![json!({
+            "loc": ["body"],
+            "msg": "value is not a valid dict",
+            "type": "type_error.dict"
+        })]);
+    };
+    let mut errors = Vec::new();
+    let backend = match values.get("backend") {
+        None => {
+            errors.push(json!({"loc": ["body", "backend"], "msg": "field required", "type": "value_error.missing"}));
+            None
+        }
+        Some(Value::Null) => {
+            errors.push(json!({"loc": ["body", "backend"], "msg": "none is not an allowed value", "type": "type_error.none.not_allowed"}));
+            None
+        }
+        Some(value) => match security_setting_string(value) {
+            Some(value) => Some(value),
+            None => {
+                errors.push(json!({"loc": ["body", "backend"], "msg": "str type expected", "type": "type_error.str"}));
+                None
+            }
+        },
+    };
+    let enabled = match values.get("enabled") {
+        None => {
+            errors.push(json!({"loc": ["body", "enabled"], "msg": "field required", "type": "value_error.missing"}));
+            None
+        }
+        Some(Value::Null) => {
+            errors.push(json!({"loc": ["body", "enabled"], "msg": "none is not an allowed value", "type": "type_error.none.not_allowed"}));
+            None
+        }
+        Some(value) => match security_setting_bool(value) {
+            Some(value) => Some(value),
+            None => {
+                errors.push(json!({"loc": ["body", "enabled"], "msg": "value could not be parsed to a boolean", "type": "type_error.bool"}));
+                None
+            }
+        },
+    };
+    let duration_ms = match values.get("duration_ms") {
+        None | Some(Value::Null) => Some(0),
+        Some(value) => match rate_rule_integer(value) {
+            Some(value) => Some(value),
+            None => {
+                errors.push(json!({"loc": ["body", "duration_ms"], "msg": "value is not a valid integer", "type": "type_error.integer"}));
+                None
+            }
+        },
+    };
+    if errors.is_empty() {
+        Ok((backend.unwrap(), enabled.unwrap(), duration_ms.unwrap()))
+    } else {
+        Err(errors)
+    }
 }
 
 fn cors_check_with_config(payload: Value, request_id: &str, config: &CorsCheckConfig) -> Response {
@@ -7302,14 +10002,14 @@ fn cors_check_with_config(payload: Value, request_id: &str, config: &CorsCheckCo
     }
 
     let preflight_headers = json!({
-        "Access-Control-Allow-Origin": if origin_allowed { &origin } else { "" },
+        "Access-Control-Allow-Origin": if origin_allowed { json!(&origin) } else { Value::Null },
         "Access-Control-Allow-Methods": config.methods.join(", "),
         "Access-Control-Allow-Headers": config.headers.join(", "),
         "Access-Control-Allow-Credentials": if with_credentials && config.credentials { "true" } else { "false" },
         "Vary": "Origin",
     });
     let actual_headers = json!({
-        "Access-Control-Allow-Origin": if origin_allowed { &origin } else { "" },
+        "Access-Control-Allow-Origin": if origin_allowed { json!(&origin) } else { Value::Null },
         "Access-Control-Allow-Credentials": if with_credentials && config.credentials { "true" } else { "false" },
         "Vary": "Origin",
     });
@@ -7399,18 +10099,21 @@ async fn subscription_routes(
                 request_id,
             );
         }
-        let apis = storage
+        let document = storage
             .find_one("subscriptions", &json!({"username": target}))
             .await
             .ok()
-            .flatten()
-            .and_then(|doc| doc.get("apis").cloned())
-            .unwrap_or_else(|| json!([]));
-        return success(
-            StatusCode::OK,
-            json!({"apis": apis, "subscriptions": {"apis": apis}}),
-            request_id,
-        );
+            .flatten();
+        // The pinned service echoes the list under `subscriptions` once a
+        // subscription document exists.
+        let body = match document {
+            Some(doc) => {
+                let apis = doc.get("apis").cloned().unwrap_or_else(|| json!([]));
+                json!({"apis": apis.clone(), "subscriptions": {"apis": apis}})
+            }
+            None => json!({"apis": []}),
+        };
+        return success(StatusCode::OK, body, request_id);
     }
     let operation = if method == Method::POST && path.ends_with("/subscribe") {
         Some(true)
@@ -7457,10 +10160,12 @@ async fn subscription_routes(
         {
             Ok(Some(api)) => api,
             _ => {
+                // group_required raises HTTPException(404, 'API not found'),
+                // which the route re-renders under its generic error code.
                 return error(
                     StatusCode::NOT_FOUND,
-                    if subscribe { "SUB003" } else { "SUB005" },
-                    "API does not exist for the requested name and version",
+                    if subscribe { "GEN001" } else { "GEN002" },
+                    "API not found",
                     request_id,
                 );
             }
@@ -7468,18 +10173,29 @@ async fn subscription_routes(
         // Python's group_required runs before SubscriptionService and evaluates
         // the user named in the request (which can differ from the actor).
         // Preserve that policy gate for both subscribing and unsubscribing.
+        let generic_code = if subscribe { "GEN001" } else { "GEN002" };
         let target_user = match storage
             .find_one("users", &json!({"username": target}))
             .await
         {
             Ok(Some(user)) => user,
-            _ => return unexpected(request_id),
+            Ok(None) => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    generic_code,
+                    "User not found",
+                    request_id,
+                );
+            }
+            Err(_) => return unexpected(request_id),
         };
+        // group_required raises HTTPException(401, ...) rather than returning
+        // False, so the pinned route answers 401 with its generic error code.
         if enforce_group_access(&api_document, &target_user).is_err() {
             return error(
-                StatusCode::FORBIDDEN,
-                if subscribe { "SUB007" } else { "SUB008" },
-                "You do not have the correct group access",
+                StatusCode::UNAUTHORIZED,
+                generic_code,
+                "You do not have the correct group for this",
                 request_id,
             );
         }
@@ -7553,18 +10269,57 @@ async fn subscription_routes(
     )
 }
 
-fn public_credit_definition(mut value: Value) -> Value {
-    let key_present = value
-        .get("api_key")
-        .or_else(|| value.get("api_key_new"))
-        .and_then(Value::as_str)
-        .is_some_and(|key| !key.is_empty());
-    value["api_key_present"] = json!(key_present);
-    if let Some(value) = value.as_object_mut() {
-        value.remove("api_key");
-        value.remove("api_key_new");
+/// The pinned service projects exactly these four fields, with
+/// `api_key_present = bool(doc.get('api_key'))`.
+fn public_credit_definition(value: Value) -> Value {
+    json!({
+        "api_credit_group": value.get("api_credit_group").cloned().unwrap_or(Value::Null),
+        "api_key_header": value.get("api_key_header").cloned().unwrap_or(Value::Null),
+        "api_key_present": value.get("api_key").is_some_and(python_truthy_json),
+        "credit_tiers": value.get("credit_tiers").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn encrypt_credit_definition(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in ["api_key", "api_key_new"] {
+        let encrypted = object
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|value| crate::storage::field_encryption::encrypt_value(Some(value)));
+        if let Some(encrypted) = encrypted {
+            object.insert(field.to_owned(), json!(encrypted));
+        }
     }
-    strip_internal(value)
+}
+
+fn transform_user_credit_keys(value: &mut Value, encrypt: bool) {
+    let Some(credits) = value
+        .get_mut("users_credits")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for credit in credits.values_mut() {
+        let Some(credit) = credit.as_object_mut() else {
+            continue;
+        };
+        let transformed = credit
+            .get("user_api_key")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                if encrypt {
+                    crate::storage::field_encryption::encrypt_value(Some(value))
+                } else {
+                    crate::storage::field_encryption::decrypt_value(Some(value))
+                }
+            });
+        if let Some(transformed) = transformed {
+            credit.insert("user_api_key".to_owned(), json!(transformed));
+        }
+    }
 }
 
 async fn credit_routes(
@@ -7572,6 +10327,7 @@ async fn credit_routes(
     path: &str,
     method: &Method,
     mut payload: Value,
+    query: &HashMap<String, String>,
     username: &str,
     request_id: &str,
 ) -> Response {
@@ -7603,38 +10359,109 @@ async fn credit_routes(
                 request_id,
             );
         };
-        let Some(mut credits) = storage
+        let existing = storage
             .find_one("user_credits", &json!({"username": username}))
             .await
             .ok()
-            .flatten()
-        else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "CRD005",
-                "Credits not found",
-                request_id,
-            );
+            .flatten();
+        let mut credits = existing
+            .clone()
+            .unwrap_or_else(|| json!({"username": username, "users_credits": {}}));
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut random = [0_u8; 32];
+        random[..16].copy_from_slice(first.as_bytes());
+        random[16..].copy_from_slice(second.as_bytes());
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+        let encrypted = crate::storage::field_encryption::encrypt_value(Some(&key))
+            .unwrap_or_else(|| key.clone());
+        let users_credits = credits
+            .as_object_mut()
+            .and_then(|value| value.get_mut("users_credits"))
+            .and_then(Value::as_object_mut);
+        let Some(users_credits) = users_credits else {
+            return unexpected(request_id);
         };
-        let key = Uuid::new_v4().to_string().replace('-', "");
-        credits["users_credits"][group]["api_key"] = json!(key);
-        return match storage
-            .update_one("user_credits", &json!({"username": username}), &credits)
-            .await
-        {
-            Ok(Some(_)) => success(StatusCode::OK, json!({"api_key": key}), request_id),
-            _ => unexpected(request_id),
+        let group_credit = users_credits
+            .entry(group.to_owned())
+            .or_insert_with(|| json!({}));
+        if !group_credit.is_object() {
+            *group_credit = json!({
+                "available_credits": 0,
+                "tier_name": "default"
+            });
+        }
+        group_credit["user_api_key"] = json!(encrypted);
+        let result = if existing.is_some() {
+            storage
+                .update_one("user_credits", &json!({"username": username}), &credits)
+                .await
+                .map(|_| ())
+        } else {
+            storage
+                .insert_one("user_credits", credits)
+                .await
+                .map(|_| ())
+        };
+        return match result {
+            Ok(()) => success(StatusCode::OK, json!({"api_key": key}), request_id),
+            Err(_) => unexpected(request_id),
         };
     }
-    if method == Method::GET && (suffix == "defs" || suffix.is_empty()) {
-        let values = storage
+    if method == Method::GET && suffix == "defs" {
+        if !has_permission(state, username, "manage_credits").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "CRD002",
+                "Unable to retrieve credits",
+                request_id,
+            );
+        }
+        let mut values = storage
             .find_many("credit_defs", &json!({}))
             .await
             .unwrap_or_default()
             .into_iter()
             .map(public_credit_definition)
             .collect::<Vec<_>>();
-        return success(StatusCode::OK, json!(values), request_id);
+        values.sort_by(|left, right| {
+            left.get("api_credit_group")
+                .and_then(Value::as_str)
+                .cmp(&right.get("api_credit_group").and_then(Value::as_str))
+        });
+        // Python's `list_credit_definitions(page: int = 1, page_size: int = 50)`
+        // typed FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
+        }
+        if let Err(message_text) = validate_pagination(query) {
+            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
+        }
+        let page = query
+            .get("page")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let page_size = query
+            .get("page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50);
+        let total = values.len();
+        let start = (page - 1).saturating_mul(page_size);
+        let has_next = start.saturating_add(page_size) < total;
+        values = values.into_iter().skip(start).take(page_size).collect();
+        return success(
+            StatusCode::OK,
+            json!({
+                "items": values,
+                "page": page,
+                "page_size": page_size,
+                "has_next": has_next,
+                "total": total
+            }),
+            request_id,
+        );
     }
     if method == Method::GET && suffix == "all" {
         if !has_permission(state, username, "manage_credits").await {
@@ -7645,14 +10472,77 @@ async fn credit_routes(
                 request_id,
             );
         }
-        let values = storage
+        // Python's `get_all_users_credits(page: int = 1, page_size: int = 10, ...)`
+        // typed FastAPI query params: a non-numeric value produces a 422.
+        if let Some(response) =
+            int_query_validation_error(query, &["page", "page_size"], request_id)
+        {
+            return response;
+        }
+        if let Err(message_text) = validate_pagination(query) {
+            return error(StatusCode::BAD_REQUEST, "PAG001", &message_text, request_id);
+        }
+        let page = query
+            .get("page")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let page_size = query
+            .get("page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+        let search = query
+            .get("search")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut values = storage
             .find_many("user_credits", &json!({}))
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(strip_internal)
+            .filter(|value| {
+                search.is_empty()
+                    || value
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&search))
+                    || value
+                        .get("users_credits")
+                        .and_then(Value::as_object)
+                        .is_some_and(|credits| {
+                            credits
+                                .keys()
+                                .any(|group| group.to_ascii_lowercase().contains(&search))
+                        })
+            })
+            .map(|mut value| {
+                transform_user_credit_keys(&mut value, false);
+                strip_internal(value)
+            })
             .collect::<Vec<_>>();
-        return success(StatusCode::OK, json!(values), request_id);
+        values.sort_by(|left, right| {
+            left.get("username")
+                .and_then(Value::as_str)
+                .cmp(&right.get("username").and_then(Value::as_str))
+        });
+        let total = values.len();
+        let start = (page - 1).saturating_mul(page_size);
+        let has_next = start.saturating_add(page_size) < total;
+        let values = values
+            .into_iter()
+            .skip(start)
+            .take(page_size)
+            .collect::<Vec<_>>();
+        return success(
+            StatusCode::OK,
+            json!({
+                "user_credits": values,
+                "page": page,
+                "page_size": page_size,
+                "has_next": has_next,
+                "total": total
+            }),
+            request_id,
+        );
     }
     if method == Method::POST && suffix.is_empty() {
         if !has_permission(state, username, "manage_credits").await {
@@ -7684,6 +10574,7 @@ async fn credit_routes(
                 request_id,
             );
         }
+        encrypt_credit_definition(&mut payload);
         return match storage.insert_one("credit_defs", payload).await {
             Ok(_) => message(
                 StatusCode::CREATED,
@@ -7696,13 +10587,21 @@ async fn credit_routes(
     if let Some(group) = suffix.strip_prefix("defs/") {
         let filter = json!({"api_credit_group": group});
         if method == Method::GET {
+            if !has_permission(state, username, "manage_credits").await {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "CRD002",
+                    "Unable to retrieve credits",
+                    request_id,
+                );
+            }
             return match storage.find_one("credit_defs", &filter).await {
                 Ok(Some(value)) => {
                     success(StatusCode::OK, public_credit_definition(value), request_id)
                 }
                 _ => error(
                     StatusCode::NOT_FOUND,
-                    "CRD002",
+                    "CRD021",
                     "Credit definition not found",
                     request_id,
                 ),
@@ -7747,6 +10646,7 @@ async fn credit_routes(
                 }
                 Err(_) => return unexpected(request_id),
             }
+            encrypt_credit_definition(&mut payload);
             return match storage.update_one("credit_defs", &filter, &payload).await {
                 Ok(Some(_)) => message(
                     StatusCode::OK,
@@ -7784,8 +10684,21 @@ async fn credit_routes(
                 request_id,
             );
         }
+        if payload
+            .get("username")
+            .and_then(Value::as_str)
+            .is_some_and(|body_username| body_username != suffix)
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "CRD014",
+                "Username in body does not match path",
+                request_id,
+            );
+        }
         let mut value = payload;
         value["username"] = json!(suffix);
+        transform_user_credit_keys(&mut value, true);
         let existing = storage
             .find_one("user_credits", &json!({"username": suffix}))
             .await
@@ -7817,11 +10730,14 @@ async fn credit_routes(
             .find_one("user_credits", &json!({"username": suffix}))
             .await
         {
-            Ok(Some(value)) => success(StatusCode::OK, strip_internal(value), request_id),
+            Ok(Some(mut value)) => {
+                transform_user_credit_keys(&mut value, false);
+                success(StatusCode::OK, strip_internal(value), request_id)
+            }
             _ => error(
                 StatusCode::NOT_FOUND,
-                "CRD005",
-                "Credits not found",
+                "CRD017",
+                "User credits not found",
                 request_id,
             ),
         };
@@ -8042,10 +10958,6 @@ async fn quota_routes(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
-    let (tier, limits) = match quota_tier_and_limits(storage, username).await {
-        Ok(value) => value,
-        Err(_) => return unexpected(request_id),
-    };
     if path == "/quota/usage/history" && method == Method::GET {
         return success(
             StatusCode::OK,
@@ -8053,6 +10965,10 @@ async fn quota_routes(
             request_id,
         );
     }
+    let (tier, limits) = match quota_tier_and_limits(storage, username).await {
+        Ok(value) => value,
+        Err(_) => return quota_route_failure(path, request_id),
+    };
     if path == "/quota/usage/export" && method == Method::POST {
         let Some(limits) = limits.as_ref() else {
             return http_detail(
@@ -8063,7 +10979,7 @@ async fn quota_routes(
         };
         let quotas = match quota_values(storage, username, limits).await {
             Ok(quotas) => quotas,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return quota_route_failure(path, request_id),
         };
         // The pinned Python export intentionally contains request quotas only;
         // monthly bandwidth is present in the dashboard but not this payload.
@@ -8073,7 +10989,7 @@ async fn quota_routes(
             .collect::<Vec<_>>();
         let export_data = json!({
             "user_id": username,
-            "export_date": timestamp_now(),
+            "export_date": timestamp_now_naive(),
             "quotas": export_quotas.iter().map(|quota| quota_export_value(quota)).collect::<Vec<_>>(),
         });
         if query.get("format").is_some_and(|format| format == "csv") {
@@ -8114,7 +11030,7 @@ async fn quota_routes(
                                 && candidate
                                     .get("enabled")
                                     .and_then(Value::as_bool)
-                                    .unwrap_or(true)
+                                    == Some(true)
                         })
                         .map(|candidate| {
                             json!({
@@ -8125,7 +11041,7 @@ async fn quota_routes(
                             })
                         })
                         .collect::<Vec<_>>(),
-                    Err(_) => return unexpected(request_id),
+                    Err(_) => return quota_route_failure(path, request_id),
                 };
                 success(
                     StatusCode::OK,
@@ -8187,7 +11103,7 @@ async fn quota_routes(
         };
         let quotas = match quota_values(storage, username, limits).await {
             Ok(quotas) => quotas,
-            Err(_) => return unexpected(request_id),
+            Err(_) => return quota_route_failure(path, request_id),
         };
         let request_quotas = quotas.iter().filter(|quota| {
             quota["quota_type"]
@@ -8233,9 +11149,8 @@ async fn quota_routes(
             "daily_requests" => "daily_request_quota",
             "monthly_bandwidth" => "monthly_bandwidth_quota",
             _ => {
-                return error(
+                return http_detail(
                     StatusCode::BAD_REQUEST,
-                    "QUOTA001",
                     &format!("Invalid quota type: {quota_type}"),
                     request_id,
                 );
@@ -8254,7 +11169,7 @@ async fn quota_routes(
         };
         return match quota_status(storage, username, quota_type, limit).await {
             Ok(status) => success(StatusCode::OK, status, request_id),
-            Err(_) => unexpected(request_id),
+            Err(_) => quota_route_failure(path, request_id),
         };
     }
     error(
@@ -8263,6 +11178,17 @@ async fn quota_routes(
         "Platform route does not exist",
         request_id,
     )
+}
+
+fn quota_route_failure(path: &str, request_id: &str) -> Response {
+    let detail = match path {
+        "/quota/usage/history" => "Failed to get usage history",
+        "/quota/usage/export" => "Failed to export usage data",
+        "/quota/tier/info" => "Failed to get tier info",
+        "/quota/burst/status" => "Failed to get burst status",
+        _ => "Failed to get quota status",
+    };
+    http_detail(StatusCode::INTERNAL_SERVER_ERROR, detail, request_id)
 }
 
 async fn quota_tier_and_limits(
@@ -8293,6 +11219,8 @@ async fn quota_tier_and_limits(
                     .unwrap_or(false)
             })
     };
+    // The pinned TierService applies assignment overrides before checking the
+    // assignment's effective dates, even when get_user_tier falls back.
     let limits = assignment
         .as_ref()
         .and_then(|assignment| assignment.get("override_limits"))
@@ -8338,11 +11266,14 @@ async fn quota_status(
     limit: u64,
 ) -> Result<Value, crate::storage::runtime::StorageError> {
     let (counter_type, period_key, reset_at) = quota_period(name);
+    // QuotaTracker.check_quota deliberately fails open when Redis is
+    // unavailable, returning zero usage with the configured limit intact.
     let current_usage = storage
         .current_counter(&format!(
             "quota:user:{username}:{counter_type}:month:{period_key}:usage"
         ))
-        .await?;
+        .await
+        .unwrap_or(0);
     let percentage_used = current_usage as f64 / limit as f64 * 100.0;
     Ok(json!({
         "quota_type": name,
@@ -8478,7 +11409,7 @@ async fn api_discovery_routes(
         return error(
             StatusCode::FORBIDDEN,
             "AUTHZ001",
-            "Insufficient permissions",
+            "Not authorized",
             request_id,
         );
     }
@@ -8494,13 +11425,40 @@ async fn api_discovery_routes(
         }
         return error(StatusCode::NOT_FOUND, "API001", "API not found", request_id);
     };
+    if kind == "openapi" {
+        return openapi_discovery_route(
+            state, storage, &api, &filter, parts, action, method, username, request_id,
+        )
+        .await;
+    }
     if kind == "grpc" && action == "services" && method == Method::GET {
-        use base64::Engine as _;
-        let Some(raw) = api.get("api_grpc_descriptor_set").and_then(Value::as_str) else {
-            return success(StatusCode::OK, json!({"services": []}), request_id);
-        };
-        let services = base64::engine::general_purpose::STANDARD.decode(raw).ok().and_then(|bytes| prost_reflect::DescriptorPool::decode(bytes.as_slice()).ok()).map(|pool| pool.services().map(|service| json!({"name": service.name(), "full_name": service.full_name(), "methods": service.methods().map(|method_value| method_value.name().to_owned()).collect::<Vec<_>>() })).collect::<Vec<_>>()).unwrap_or_default();
-        return success(StatusCode::OK, json!({"services": services}), request_id);
+        // The pinned route reports the configured allow-list rather than
+        // querying reflection.
+        if api
+            .get("api_servers")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                "GRPC001",
+                "No upstream servers configured",
+                request_id,
+            );
+        }
+        return success(
+            StatusCode::OK,
+            json!({
+                "services": api
+                    .get("api_grpc_allowed_services")
+                    .filter(|value| python_truthy_json(value))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "reflection_enabled": api.get("api_grpc_reflection_url").is_some_and(python_truthy_json),
+                "note": "Auto-discovery via reflection not fully implemented in this demo route",
+            }),
+            request_id,
+        );
     }
     if kind == "graphql" {
         let field = "api_graphql_schema";
@@ -8552,31 +11510,13 @@ async fn api_discovery_routes(
                     return error(StatusCode::BAD_REQUEST, "API003", &message_text, request_id);
                 }
             };
-            let query = json!({"query": "query IntrospectionQuery { __schema { types { name kind } queryType { name } mutationType { name } subscriptionType { name } } }"});
-            let schema = match state.proxy_client.post(target).json(&query).send().await {
-                Ok(response) => match response.json::<Value>().await {
-                    Ok(response) => response
-                        .get("data")
-                        .and_then(|data| data.get("__schema"))
-                        .cloned()
-                        .unwrap_or(response),
-                    Err(_) => {
-                        return error(
-                            StatusCode::BAD_GATEWAY,
-                            "GQL002",
-                            "Invalid GraphQL schema response",
-                            request_id,
-                        );
-                    }
-                },
-                Err(_) => {
-                    return error(
-                        StatusCode::BAD_GATEWAY,
-                        "GQL001",
-                        "Unable to fetch GraphQL schema",
-                        request_id,
-                    );
-                }
+            let Some(schema) = fetch_introspection_schema(state, target).await else {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "GQL002",
+                    "Failed to fetch schema from upstream",
+                    request_id,
+                );
             };
             let _ = storage
                 .update_one("apis", &filter, &json!({field: schema.clone()}))
@@ -8607,29 +11547,45 @@ async fn api_discovery_routes(
                     return error(StatusCode::BAD_REQUEST, "API003", &message_text, request_id);
                 }
             };
-            let query = json!({"query": "query IntrospectionQuery { __schema { types { name kind } queryType { name } mutationType { name } } }"});
-            return match state.proxy_client.post(target).json(&query).send().await {
-                Ok(response) => match response.json::<Value>().await {
-                    Ok(schema) => {
-                        let _ = storage
-                            .update_one("apis", &filter, &json!({field: schema.clone()}))
-                            .await;
-                        success(StatusCode::OK, schema, request_id)
-                    }
-                    Err(_) => error(
-                        StatusCode::BAD_GATEWAY,
-                        "GQL002",
-                        "Invalid GraphQL schema response",
-                        request_id,
-                    ),
-                },
-                Err(_) => error(
+            let Some(schema) = fetch_introspection_schema(state, target).await else {
+                return error(
                     StatusCode::BAD_GATEWAY,
-                    "GQL001",
-                    "Unable to fetch GraphQL schema",
+                    "GQL002",
+                    "Failed to fetch schema",
                     request_id,
-                ),
+                );
             };
+            let _ = storage
+                .update_one("apis", &filter, &json!({field: schema.clone()}))
+                .await;
+            let types_count = schema
+                .get("types")
+                .and_then(Value::as_array)
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter(|item| {
+                            !item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .starts_with("__")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let has_subscriptions = schema
+                .get("subscriptionType")
+                .is_some_and(|item| item.get("name").is_some_and(|name| !name.is_null()));
+            return success(
+                StatusCode::OK,
+                json!({
+                    "message": "Schema refreshed successfully",
+                    "types_count": types_count,
+                    "has_subscriptions": has_subscriptions,
+                }),
+                request_id,
+            );
         }
     }
     let (field, configured_url) = if kind == "openapi" {
@@ -8648,6 +11604,19 @@ async fn api_discovery_routes(
         if let Some(value) = api.get(field).filter(|value| !value.is_null()) {
             return discovery_document_response(kind, value.clone(), true, request_id);
         }
+        // The pinned route checks the configured URL before the servers.
+        let Some(path) = api
+            .get(configured_url)
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "WSDL001",
+                "No WSDL URL configured for this API",
+                request_id,
+            );
+        };
         let Some(server) = api
             .get("api_servers")
             .and_then(Value::as_array)
@@ -8656,16 +11625,8 @@ async fn api_discovery_routes(
         else {
             return error(
                 StatusCode::NOT_FOUND,
-                "API003",
-                &format!("{} document not found", kind.to_ascii_uppercase()),
-                request_id,
-            );
-        };
-        let Some(path) = api.get(configured_url).and_then(Value::as_str) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "API003",
-                &format!("{} document not found", kind.to_ascii_uppercase()),
+                "WSDL002",
+                "No upstream servers configured",
                 request_id,
             );
         };
@@ -8713,6 +11674,20 @@ async fn api_discovery_routes(
         return discovery_document_response(kind, document, false, request_id);
     }
     if method == Method::POST && action == "refresh" {
+        let Some(path) = api
+            .get(configured_url)
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "WSDL001",
+                "No WSDL URL configured",
+                request_id,
+            );
+        };
+        // Without a server the pinned route fetches the bare relative URL,
+        // which fails as an upstream error.
         let Some(server) = api
             .get("api_servers")
             .and_then(Value::as_array)
@@ -8720,25 +11695,9 @@ async fn api_discovery_routes(
             .and_then(Value::as_str)
         else {
             return error(
-                StatusCode::BAD_REQUEST,
-                "API003",
-                "API server is not configured",
-                request_id,
-            );
-        };
-        let Some(path) = api.get(configured_url).and_then(Value::as_str) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                if kind == "openapi" {
-                    "OPENAPI001"
-                } else {
-                    "WSDL001"
-                },
-                if kind == "openapi" {
-                    "OpenAPI URL is not configured"
-                } else {
-                    "WSDL URL is not configured"
-                },
+                StatusCode::BAD_GATEWAY,
+                "WSDL003",
+                "Failed to fetch WSDL",
                 request_id,
             );
         };
@@ -8921,6 +11880,257 @@ async fn api_discovery_routes(
     )
 }
 
+async fn fetch_openapi_spec(state: &AppState, api: &Value, path: &str) -> Option<Value> {
+    let servers = api.get("api_servers").and_then(Value::as_array)?;
+    for server in servers.iter().filter_map(Value::as_str) {
+        let Ok(target) = discovery_target(server, path) else {
+            continue;
+        };
+        let Ok(response) = state.proxy_client.get(target).send().await else {
+            continue;
+        };
+        if response.status() != StatusCode::OK {
+            continue;
+        }
+        if let Ok(spec) = response.json::<Value>().await {
+            return Some(spec);
+        }
+    }
+    None
+}
+
+fn python_truthy_json(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openapi_discovery_route(
+    state: &AppState,
+    storage: &SharedStorage,
+    api: &Value,
+    filter: &Value,
+    parts: &[&str],
+    action: &str,
+    method: &Method,
+    username: &str,
+    request_id: &str,
+) -> Response {
+    let cached = api
+        .get("api_openapi_spec")
+        .filter(|value| python_truthy_json(value));
+    if method == Method::GET && action.is_empty() {
+        if let Some(spec) = cached {
+            return success(StatusCode::OK, spec.clone(), request_id);
+        }
+        let Some(path) = api.get("api_openapi_url").and_then(Value::as_str) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "OPENAPI001",
+                "No OpenAPI URL configured for this API",
+                request_id,
+            );
+        };
+        if api
+            .get("api_servers")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                "OPENAPI002",
+                "No upstream servers configured",
+                request_id,
+            );
+        }
+        let Some(spec) = fetch_openapi_spec(state, api, path).await else {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "OPENAPI003",
+                "Failed to fetch OpenAPI spec from upstream",
+                request_id,
+            );
+        };
+        let _ = storage
+            .update_one("apis", filter, &json!({"api_openapi_spec": spec.clone()}))
+            .await;
+        return success(StatusCode::OK, spec, request_id);
+    }
+    if method == Method::POST && action == "refresh" {
+        let Some(path) = api.get("api_openapi_url").and_then(Value::as_str) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "OPENAPI001",
+                "No OpenAPI URL configured",
+                request_id,
+            );
+        };
+        if api
+            .get("api_servers")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                "OPENAPI002",
+                "No upstream servers configured",
+                request_id,
+            );
+        }
+        let Some(spec) = fetch_openapi_spec(state, api, path).await else {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "OPENAPI003",
+                "Failed to fetch OpenAPI spec",
+                request_id,
+            );
+        };
+        let _ = storage
+            .update_one("apis", filter, &json!({"api_openapi_spec": spec.clone()}))
+            .await;
+        return success(
+            StatusCode::OK,
+            json!({
+                "message": "OpenAPI spec refreshed successfully",
+                "endpoints_found": spec.get("paths").and_then(Value::as_object).map_or(0, Map::len),
+            }),
+            request_id,
+        );
+    }
+    if method == Method::POST && action == "import" {
+        if !has_permission(state, username, "manage_endpoints").await {
+            return error(
+                StatusCode::FORBIDDEN,
+                "AUTHZ001",
+                "Not authorized",
+                request_id,
+            );
+        }
+        let spec = if let Some(spec) = cached.cloned() {
+            Some(spec)
+        } else if let Some(path) = api.get("api_openapi_url").and_then(Value::as_str) {
+            let fetched = fetch_openapi_spec(state, api, path).await;
+            if let Some(spec) = &fetched {
+                let _ = storage
+                    .update_one("apis", filter, &json!({"api_openapi_spec": spec.clone()}))
+                    .await;
+            }
+            fetched
+        } else {
+            None
+        };
+        let Some(spec) = spec else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "OPENAPI003",
+                "No OpenAPI spec available",
+                request_id,
+            );
+        };
+        let candidates = crate::routes::discovery::openapi_endpoints(&spec);
+        let endpoints_found = candidates.len();
+        let api_id = api.get("api_id").cloned().unwrap_or(Value::Null);
+        let existing = storage
+            .find_many("endpoints", &json!({"api_id": api_id.clone()}))
+            .await
+            .unwrap_or_default();
+        let mut imported = 0_u64;
+        let mut skipped = 0_u64;
+        for candidate in candidates {
+            let uri = candidate
+                .get("endpoint_uri")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let method = candidate
+                .get("endpoint_method")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let composite = format!("{method}/{}", uri.trim_start_matches('/'));
+            let duplicate = existing.iter().any(|endpoint| {
+                let existing_method = endpoint
+                    .get("endpoint_method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let existing_uri = endpoint
+                    .get("endpoint_uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{existing_method}/{}", existing_uri.trim_start_matches('/')) == composite
+            });
+            if duplicate {
+                skipped += 1;
+                continue;
+            }
+            let description = candidate
+                .get("endpoint_description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(127)
+                .collect::<String>();
+            let endpoint = json!({
+                "api_id": api_id,
+                "api_name": parts[0],
+                "api_version": parts[1],
+                "endpoint_id": Uuid::new_v4().to_string(),
+                "endpoint_uri": uri,
+                "endpoint_method": method,
+                "endpoint_description": description,
+            });
+            if storage.insert_one("endpoints", endpoint).await.is_ok() {
+                imported += 1;
+            }
+        }
+        return success(
+            StatusCode::OK,
+            json!({
+                "message": "OpenAPI import completed",
+                "endpoints_found": endpoints_found,
+                "endpoints_imported": imported,
+                "endpoints_skipped": skipped,
+            }),
+            request_id,
+        );
+    }
+    error(
+        StatusCode::NOT_FOUND,
+        "GTW003",
+        "Platform route does not exist",
+        request_id,
+    )
+}
+
+/// Mirror of the pinned `fetch_introspection_schema`: only a 200 response with
+/// no GraphQL errors and a `data.__schema` object yields a schema.
+async fn fetch_introspection_schema(state: &AppState, target: String) -> Option<Value> {
+    const INTROSPECTION_QUERY: &str = include_str!("graphql_introspection.graphql");
+    let response = state
+        .proxy_client
+        .post(target)
+        .header(header::ACCEPT, "application/json")
+        .json(&json!({"query": INTROSPECTION_QUERY}))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    let value = response.json::<Value>().await.ok()?;
+    if value.get("errors").is_some_and(python_truthy_json) {
+        return None;
+    }
+    value
+        .pointer("/data/__schema")
+        .filter(|schema| schema.is_object() && !schema.as_object().is_some_and(Map::is_empty))
+        .cloned()
+}
+
 fn graphql_schema_response(schema: Value, cached: bool, request_id: &str) -> Response {
     let query = schema
         .get("queryType")
@@ -8986,29 +12196,65 @@ pub async fn backfill_grpc_descriptors(storage: &SharedStorage) -> DescriptorBac
     };
     let mut backfill = DescriptorBackfill::default();
     for api in apis {
-        if !api
+        let grpc_configured = api
             .get("api_type")
             .and_then(Value::as_str)
             .is_some_and(|kind| kind.eq_ignore_ascii_case("GRPC"))
-            || !bool_field_default(&api, "active", true)
-        {
+            || api.get("api_grpc_proto_source").is_some_and(python_truthy)
+            || api.get("api_grpc_package").is_some_and(python_truthy);
+        if !grpc_configured || api.get("active") == Some(&Value::Bool(false)) {
             continue;
         }
-        let Some(source) = api.get("api_grpc_proto_source").and_then(Value::as_str) else {
-            continue;
-        };
         backfill.scanned += 1;
         if api
             .get("api_grpc_descriptor_set")
-            .and_then(Value::as_str)
-            .is_some_and(|descriptor| !descriptor.trim().is_empty())
+            .is_some_and(python_truthy)
         {
             backfill.skipped += 1;
             continue;
         }
-        let api_name = api.get("api_name").cloned().unwrap_or(Value::Null);
-        let api_version = api.get("api_version").cloned().unwrap_or(Value::Null);
-        match compile_proto(source) {
+        let api_name = api
+            .get("api_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_version = api
+            .get("api_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_label = format!("{api_name}/{api_version}");
+        if api_name.is_empty() || api_version.is_empty() {
+            backfill.errors.push(json!({
+                "api": api_label,
+                "error": "API name/version is missing",
+            }));
+            continue;
+        }
+        let Some(source) = api
+            .get("api_grpc_proto_source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+        else {
+            backfill.errors.push(json!({
+                "api": api_label,
+                "error": "Proto source not found",
+            }));
+            continue;
+        };
+        let max_proto_size = env::var("MAX_PROTO_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1024 * 1024);
+        let source = match validate_proto_content(source.as_bytes(), max_proto_size) {
+            Ok(source) => source,
+            Err(error_value) => {
+                backfill.errors.push(json!({
+                    "api": api_label,
+                    "error": error_value.chars().take(500).collect::<String>(),
+                }));
+                continue;
+            }
+        };
+        match compile_proto(&source) {
             Ok((descriptor, digest)) => {
                 let filter = json!({"api_name": api_name, "api_version": api_version});
                 match storage
@@ -9024,18 +12270,18 @@ pub async fn backfill_grpc_descriptors(storage: &SharedStorage) -> DescriptorBac
                 {
                     Ok(Some(_)) => backfill.updated += 1,
                     Ok(None) => backfill.errors.push(json!({
-                        "api": filter.get("api_name"),
+                        "api": api_label,
                         "error": "API disappeared while descriptor backfill was running",
                     })),
                     Err(error_value) => backfill.errors.push(json!({
-                        "api": filter.get("api_name"),
+                        "api": api_label,
                         "error": error_value.to_string(),
                     })),
                 }
             }
             Err(error_value) => backfill.errors.push(json!({
-                "api": api_name,
-                "error": error_value,
+                "api": api_label,
+                "error": error_value.chars().take(500).collect::<String>(),
             })),
         }
     }
@@ -9051,13 +12297,34 @@ async fn proto_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
+    if method == Method::POST {
+        let max_size = env::var(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(crate::constants::Defaults::MAX_MULTIPART_SIZE_BYTES_DEFAULT);
+        if headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > max_size)
+        {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                crate::constants::ErrorCodes::REQUEST_TOO_LARGE,
+                crate::constants::Messages::FILE_TOO_LARGE,
+                request_id,
+            );
+        }
+    }
     if !has_permission(state, username, "manage_apis").await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "API008",
-            "You do not have permission to manage proto files",
-            request_id,
-        );
+        let (code, message_text) = if method == Method::PUT {
+            ("API008", "You do not have permission to update proto files")
+        } else if method == Method::DELETE {
+            ("API008", "You do not have permission to delete proto files")
+        } else {
+            ("AUTH001", "User does not have permission to manage APIs")
+        };
+        return error(StatusCode::FORBIDDEN, code, message_text, request_id);
     }
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
@@ -9083,6 +12350,16 @@ async fn proto_routes(
     if parts.len() != 2 {
         return error(StatusCode::NOT_FOUND, "API003", "API not found", request_id);
     }
+    // The pinned handlers derive a proto file name from the path and reject
+    // unusable names with 400 GTW013.
+    if let Some(reason) = parts.iter().find_map(|part| proto_file_name_error(part)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "GTW013",
+            &format!("Path validation error: {reason}"),
+            request_id,
+        );
+    }
     let filter = json!({"api_name": parts[0], "api_version": parts[1]});
     if method == Method::GET {
         let proto_record = storage
@@ -9096,17 +12373,33 @@ async fn proto_routes(
                 .ok()
                 .flatten());
         let Some(proto_record) = proto_record else {
-            return error(StatusCode::NOT_FOUND, "API003", "API not found", request_id);
+            return error(
+                StatusCode::NOT_FOUND,
+                "API002",
+                &format!("Proto file not found for API {}/{}", parts[0], parts[1]),
+                request_id,
+            );
         };
         return match proto_record
             .get("api_grpc_proto_source")
             .and_then(Value::as_str)
         {
-            Some(source) => success(StatusCode::OK, json!({"content": source}), request_id),
+            Some(source) if !source.is_empty() => success(
+                StatusCode::OK,
+                // respond_rest drops `message` when a response body is present.
+                json!({"content": source}),
+                request_id,
+            ),
             None => error(
                 StatusCode::NOT_FOUND,
-                "API003",
-                "Proto file not found",
+                "API002",
+                &format!("Proto file not found for API {}/{}", parts[0], parts[1]),
+                request_id,
+            ),
+            Some(_) => error(
+                StatusCode::NOT_FOUND,
+                "API002",
+                &format!("Proto file not found for API {}/{}", parts[0], parts[1]),
                 request_id,
             ),
         };
@@ -9118,9 +12411,9 @@ async fn proto_routes(
                     "apis",
                     &filter,
                     &json!({
-                        "api_grpc_proto_source": "",
-                        "api_grpc_descriptor_set": "",
-                        "api_grpc_descriptor_sha256": ""
+                        "api_grpc_proto_source": null,
+                        "api_grpc_descriptor_set": null,
+                        "api_grpc_descriptor_sha256": null
                     }),
                 )
                 .await,
@@ -9130,33 +12423,38 @@ async fn proto_routes(
             .delete_one("grpc_proto_uploads", &filter)
             .await
             .unwrap_or(false);
-        return if cleared_api || cleared_pending {
-            message(
-                StatusCode::OK,
-                "Proto file deleted successfully",
-                request_id,
-            )
-        } else {
-            error(
-                StatusCode::NOT_FOUND,
-                "API003",
-                "Proto file not found",
-                request_id,
-            )
-        };
+        let _ = (cleared_api, cleared_pending);
+        return message(
+            StatusCode::OK,
+            "Proto file and generated files deleted successfully",
+            request_id,
+        );
     }
     if method == Method::POST || method == Method::PUT {
-        let max_size = env::var("MAX_PROTO_SIZE_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1024 * 1024);
-        let source = match extract_proto_source(headers, body) {
-            Ok(source) if source.len() <= max_size => source,
-            Ok(_) => {
+        let max_proto_size = match env::var("MAX_PROTO_SIZE_BYTES") {
+            Err(_) => 1024 * 1024,
+            Ok(value) => match value.trim().parse::<i64>() {
+                Ok(size) => usize::try_from(size).unwrap_or(0),
+                // The pinned route rejects every upload when the limit is unusable.
+                Err(_) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        crate::constants::ErrorCodes::REQUEST_FILE_TYPE,
+                        "Invalid proto file: MAX_PROTO_SIZE_BYTES is not an integer",
+                        request_id,
+                    );
+                }
+            },
+        };
+        let content = match extract_proto_source(headers, body) {
+            Ok(content) => content,
+            // The pinned route declares an UploadFile form field, so FastAPI
+            // rejects any non-multipart request before the handler runs.
+            Err(error_value) if error_value == NOT_MULTIPART => {
                 return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "GTW013",
-                    "File too large",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "VAL001",
+                    "Validation Error",
                     request_id,
                 );
             }
@@ -9173,26 +12471,29 @@ async fn proto_routes(
                 );
             }
         };
-        if source.contains('`')
-            || source.contains("$(")
-            || !(source.contains("syntax")
-                || source.contains("message")
-                || source.contains("service"))
-        {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "REQ002",
-                "Invalid proto file",
-                request_id,
-            );
-        }
+        let source = match validate_proto_content(&content, max_proto_size) {
+            Ok(source) => source,
+            Err(error_value) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    crate::constants::ErrorCodes::REQUEST_FILE_TYPE,
+                    &format!("Invalid proto file: {error_value}"),
+                    request_id,
+                );
+            }
+        };
         let (descriptor, digest) = match compile_proto(&source) {
             Ok(result) => result,
             Err(error_value) => {
+                let message_text = if method == Method::PUT {
+                    "Failed to generate gRPC code from proto file".to_owned()
+                } else {
+                    format!("Failed to generate gRPC code: {error_value}")
+                };
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "API009",
-                    &format!("Failed to generate gRPC descriptor: {error_value}"),
+                    &message_text,
                     request_id,
                 );
             }
@@ -9209,7 +12510,11 @@ async fn proto_routes(
         return match result {
             Ok(Some(_)) => message(
                 StatusCode::OK,
-                "Proto file uploaded and gRPC code generated successfully",
+                if method == Method::PUT {
+                    "Proto file updated successfully"
+                } else {
+                    "Proto file uploaded and gRPC code generated successfully"
+                },
                 request_id,
             ),
             Ok(None) => {
@@ -9243,7 +12548,11 @@ async fn proto_routes(
                 if saved {
                     message(
                         StatusCode::OK,
-                        "Proto file uploaded and gRPC code generated successfully",
+                        if method == Method::PUT {
+                            "Proto file updated successfully"
+                        } else {
+                            "Proto file uploaded and gRPC code generated successfully"
+                        },
                         request_id,
                     )
                 } else {
@@ -9261,13 +12570,15 @@ async fn proto_routes(
     )
 }
 
-fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, String> {
+const NOT_MULTIPART: &str = "Request is not multipart/form-data";
+
+fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !content_type.starts_with("multipart/form-data") {
-        return String::from_utf8(body.to_vec()).map_err(|_| "Proto file must be UTF-8".to_owned());
+        return Err(NOT_MULTIPART.to_owned());
     }
     let boundary = content_type
         .split("boundary=")
@@ -9275,9 +12586,19 @@ fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, Stri
         .map(str::trim)
         .map(|value| value.trim_matches('"'))
         .ok_or_else(|| "Multipart boundary is missing".to_owned())?;
-    let text =
-        String::from_utf8(body.to_vec()).map_err(|_| "Proto file must be UTF-8".to_owned())?;
-    let disposition = text
+    let header_end = body
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4))
+        .or_else(|| {
+            body.windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| (index, 2))
+        })
+        .ok_or_else(|| "Invalid multipart body".to_owned())?;
+    let multipart_headers = std::str::from_utf8(&body[..header_end.0])
+        .map_err(|_| "Invalid multipart body".to_owned())?;
+    let disposition = multipart_headers
         .lines()
         .find(|line| {
             line.to_ascii_lowercase()
@@ -9293,58 +12614,54 @@ fn extract_proto_source(headers: &HeaderMap, body: &[u8]) -> Result<String, Stri
         })
         .map(|value| value.trim_matches('"'))
         .ok_or_else(|| "Only .proto files are allowed".to_owned())?;
-    if !filename.ends_with(".proto") {
+    if !filename.to_ascii_lowercase().ends_with(".proto") {
         return Err("Only .proto files are allowed".to_owned());
     }
-    if !valid_proto_filename(filename) {
-        return Err("Invalid proto filename".to_owned());
+    let content = &body[header_end.0 + header_end.1..];
+    let marker = format!("\r\n--{boundary}").into_bytes();
+    let content_end = content
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap_or(content.len());
+    let mut content = content[..content_end].to_vec();
+    while content
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        content.pop();
     }
-    let header_end = text
-        .find("\r\n\r\n")
-        .or_else(|| text.find("\n\n"))
-        .ok_or_else(|| "Invalid multipart body".to_owned())?;
-    let separator = if text[header_end..].starts_with("\r\n\r\n") {
-        4
-    } else {
-        2
-    };
-    let content = &text[header_end + separator..];
-    let marker = format!("\r\n--{boundary}");
-    Ok(content
-        .split(&marker)
-        .next()
-        .unwrap_or(content)
-        .trim_end_matches(['\r', '\n'])
-        .to_owned())
-}
-
-fn valid_proto_filename(filename: &str) -> bool {
-    filename.ends_with(".proto")
-        && !filename.is_empty()
-        && filename.len() <= 255
-        && !filename.contains("..")
-        && !filename.starts_with(['/', '\\'])
-        && filename.as_bytes().get(1).is_none_or(|byte| *byte != b':')
-        && filename.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
+    Ok(content)
 }
 
 fn extract_proto_package(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("package") {
-            let pkg = rest.trim().trim_matches(';').trim();
-            if !pkg.is_empty()
-                && pkg
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            {
-                return Some(pkg.to_owned());
-            }
-        }
+    static PACKAGE: OnceLock<Regex> = OnceLock::new();
+    PACKAGE
+        .get_or_init(|| Regex::new(r"\bpackage\s+([a-zA-Z0-9_.]+)\s*;").unwrap())
+        .captures(source)
+        .and_then(|captures| captures.get(1))
+        .map(|package| package.as_str().to_owned())
+}
+
+fn validate_proto_content(content: &[u8], max_size: usize) -> Result<String, String> {
+    if content.len() > max_size {
+        return Err(format!("File too large (max {max_size} bytes)"));
     }
-    None
+    if content.contains(&0) {
+        return Err("Invalid proto file: binary content detected".to_owned());
+    }
+    let source = std::str::from_utf8(content)
+        .map_err(|_| "Invalid proto file: not valid UTF-8".to_owned())?;
+    if !(source.contains("syntax") || source.contains("message") || source.contains("service")) {
+        return Err("Invalid proto file: missing proto syntax (syntax/message/service)".to_owned());
+    }
+    static SUSPICIOUS: OnceLock<Regex> = OnceLock::new();
+    if SUSPICIOUS
+        .get_or_init(|| Regex::new(r"`|\$\(|;\s*(?:rm|mv|cp|chmod|cat|wget|curl)").unwrap())
+        .is_match(source)
+    {
+        return Err("Invalid proto file: suspicious content detected".to_owned());
+    }
+    Ok(source.to_owned())
 }
 
 fn compile_proto(source: &str) -> Result<(String, String), String> {
@@ -9402,6 +12719,14 @@ async fn logging_routes(
     username: &str,
     request_id: &str,
 ) -> Response {
+    if !state.config.logs_enabled {
+        return error(
+            StatusCode::NOT_FOUND,
+            "GTW003",
+            "Platform route does not exist",
+            request_id,
+        );
+    }
     if method != Method::GET {
         return error(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -9416,6 +12741,11 @@ async fn logging_routes(
         let (code, message_text) = match path {
             "/logging/logs/export" => ("LOG003", "You do not have permission to export logs"),
             "/logging/logs/download" => ("LOG004", "You do not have permission to download logs"),
+            "/logging/logs/files" => ("LOG005", "You do not have permission to view log files"),
+            "/logging/logs/statistics" => (
+                "LOG002",
+                "You do not have permission to view log statistics",
+            ),
             _ => ("LOG001", "You do not have permission to view logs"),
         };
         return error(StatusCode::FORBIDDEN, code, message_text, request_id);
@@ -9433,8 +12763,9 @@ async fn logging_routes(
                     Ok(entry) => entry,
                     Err(_) => return unexpected(request_id),
                 };
-                if entry.path().is_file() {
-                    files.push(entry.file_name().to_string_lossy().into_owned());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.path().is_file() && is_log_file_name(&name) {
+                    files.push(name);
                 }
             }
         }
@@ -9560,6 +12891,13 @@ fn log_export(
     ))
 }
 
+/// The pinned LoggingService only reads `doorman.log*` and
+/// `doorman-trail.log*`; other files in the directory (such as the persisted
+/// metrics documents) are not logs.
+fn is_log_file_name(name: &str) -> bool {
+    name.starts_with("doorman.log") || name.starts_with("doorman-trail.log")
+}
+
 fn read_log_records(
     directory: &std::path::Path,
     query: &HashMap<String, String>,
@@ -9567,25 +12905,25 @@ fn read_log_records(
 ) -> Result<Vec<Value>, LogExportError> {
     let mut paths = Vec::new();
     let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error_value) if error_value.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Vec::new());
-        }
+        Ok(entries) => Some(entries),
+        Err(error_value) if error_value.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(LogExportError::Read),
     };
-    for entry in entries {
-        let entry = entry.map_err(|_| LogExportError::Read)?;
-        let file_type = entry.file_type().map_err(|_| LogExportError::Read)?;
-        if !file_type.is_file() {
-            continue;
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry.map_err(|_| LogExportError::Read)?;
+            let file_type = entry.file_type().map_err(|_| LogExportError::Read)?;
+            if !file_type.is_file() || !is_log_file_name(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            let metadata = entry.metadata().map_err(|_| LogExportError::Read)?;
+            paths.push((
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                metadata.len(),
+                entry.path(),
+            ));
         }
-        let metadata = entry.metadata().map_err(|_| LogExportError::Read)?;
-        paths.push((
-            metadata.modified().unwrap_or(UNIX_EPOCH),
-            metadata.len(),
-            entry.path(),
-        ));
-    }
+    };
     paths.sort_by(|left, right| right.0.cmp(&left.0));
 
     let mut read_bytes = 0_u64;
@@ -9612,12 +12950,26 @@ fn read_log_records(
             break;
         }
     }
+    for line in crate::observability::logging::memory_log_snapshot()
+        .into_iter()
+        .rev()
+        .take(max_entries)
+    {
+        let Some(mut record) = parse_log_record(&line) else {
+            continue;
+        };
+        if log_record_matches(&record, query) {
+            audit::redact_record(&mut record);
+            logs.push(record);
+        }
+    }
     logs.sort_by(|left, right| {
         right
             .get("timestamp")
             .and_then(Value::as_str)
             .cmp(&left.get("timestamp").and_then(Value::as_str))
     });
+    logs.truncate(max_entries);
     Ok(logs)
 }
 
@@ -9709,17 +13061,140 @@ fn valid_log_date(value: &str) -> bool {
 }
 
 fn parse_log_record(line: &str) -> Option<Value> {
-    let mut record = serde_json::from_str::<Value>(line).ok()?;
-    let values = record.as_object_mut()?;
-    let timestamp = values
-        .remove("time")
-        .or_else(|| values.get("timestamp").cloned())?;
-    let source = values
-        .remove("name")
-        .unwrap_or(Value::String(String::new()));
-    values.insert("timestamp".to_owned(), timestamp);
-    values.insert("source".to_owned(), source);
-    Some(record)
+    let line = line.trim();
+    if let Ok(mut record) = serde_json::from_str::<Value>(line) {
+        let values = record.as_object_mut()?;
+        let timestamp = values
+            .remove("time")
+            .or_else(|| values.get("timestamp").cloned())
+            .unwrap_or_else(|| Value::String(time::OffsetDateTime::now_utc().to_string()));
+        let source = values
+            .remove("name")
+            .unwrap_or(Value::String(String::new()));
+        let message = values
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let structured = extract_log_fields(message);
+        for (key, value) in structured {
+            values.entry(key).or_insert(value);
+        }
+        values.insert("timestamp".to_owned(), timestamp);
+        values.insert("source".to_owned(), source);
+        return Some(record);
+    }
+
+    let mut parts = line.splitn(4, " - ");
+    let timestamp = parts.next()?;
+    let source = parts.next()?;
+    let level = parts.next()?;
+    let full_message = parts.next()?;
+    let (request_id, message) = full_message
+        .split_once(" | ")
+        .map_or((None, full_message), |(request_id, message)| {
+            (Some(request_id), message)
+        });
+    let mut values = extract_log_fields(message);
+    if let Some(request_id) = request_id {
+        values.insert("request_id".to_owned(), json!(request_id));
+    }
+    values.insert(
+        "timestamp".to_owned(),
+        json!(timestamp.replace(' ', "T").replace(',', ".")),
+    );
+    values.insert(
+        "level".to_owned(),
+        json!(if request_id.is_some() { level } else { "DEBUG" }),
+    );
+    values.insert("message".to_owned(), json!(message));
+    values.insert("source".to_owned(), json!(source));
+    Some(Value::Object(values))
+}
+
+/// Compile each log-parsing pattern once; log queries parse up to thousands of
+/// records, and compiling per record made them take tens of seconds.
+fn cached_regex(pattern: &'static str) -> Option<Regex> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<&'static str, Regex>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    if let Some(regex) = cache.get(pattern) {
+        return Some(regex.clone());
+    }
+    let regex = Regex::new(pattern).ok()?;
+    cache.insert(pattern, regex.clone());
+    Some(regex)
+}
+
+fn extract_log_fields(message: &str) -> Map<String, Value> {
+    let mut values = Map::new();
+    let capture = |pattern: &'static str, group: usize| {
+        cached_regex(pattern)?
+            .captures(message)?
+            .get(group)
+            .map(|value| value.as_str().to_owned())
+    };
+    if let Some(value) = capture(r"(\w{8}-\w{4}-\w{4}-\w{4}-\w{12})", 1) {
+        values.insert("request_id".to_owned(), json!(value));
+    }
+    if let Some(value) = capture(r"Username: (\w+)", 1) {
+        values.insert("user".to_owned(), json!(value));
+    }
+    if let Some(value) = capture(r"(?:effective_ip|client_ip)=([A-Fa-f0-9:.]+)", 1) {
+        values.insert("ip_address".to_owned(), json!(value));
+    } else if let Some(mut value) = capture(r"From:\s+(.+?)$", 1) {
+        if value.matches(':').count() > 1 {
+            if let Some((host, _)) = value.rsplit_once(':') {
+                value = host.to_owned();
+            }
+        } else if let Some((host, _)) = value.split_once(':') {
+            value = host.to_owned();
+        }
+        values.insert("ip_address".to_owned(), json!(value));
+    }
+    if let Some(pattern) = cached_regex(r"Endpoint: (\w+) (.+)")
+        && let Some(captures) = pattern.captures(message)
+    {
+        values.insert("method".to_owned(), json!(&captures[1]));
+        values.insert("endpoint".to_owned(), json!(&captures[2]));
+    }
+    if let Some(value) = capture(r"Total time: ([\d.]+)ms", 1) {
+        values.insert("response_time".to_owned(), json!(value));
+    }
+    if (message.contains("Status check failed")
+        || message.to_ascii_lowercase().contains("status_code"))
+        && let Some(value) = capture(r"(?i)status_code[:\s]+(\d+)", 1)
+    {
+        values.insert("status_code".to_owned(), json!(value));
+    }
+    let endpoint = values
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let lower = message.to_ascii_lowercase();
+    let request_type = if ["/rest", "/soap", "/graphql"]
+        .iter()
+        .any(|part| endpoint.contains(part))
+        || [
+            "rest gateway",
+            "soap gateway",
+            "graphql gateway",
+            "upstream",
+        ]
+        .iter()
+        .any(|part| lower.contains(part))
+    {
+        "gateway"
+    } else if endpoint.contains("/authorization")
+        || ["login", "register", "token", "permission"]
+            .iter()
+            .any(|part| lower.contains(part))
+    {
+        "auth"
+    } else {
+        "platform"
+    };
+    values.insert("type".to_owned(), json!(request_type));
+    values
 }
 
 fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
@@ -9734,6 +13209,24 @@ fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
     {
         return false;
     }
+    let timestamp = value("timestamp");
+    let timestamp_time = timestamp
+        .get(11..16)
+        .filter(|value| value.as_bytes().get(2) == Some(&b':'));
+    if let Some(start_time) = query
+        .get("start_time")
+        .filter(|value| !value.trim().is_empty())
+        && timestamp_time.is_none_or(|value| value < start_time.as_str())
+    {
+        return false;
+    }
+    if let Some(end_time) = query
+        .get("end_time")
+        .filter(|value| !value.trim().is_empty())
+        && timestamp_time.is_none_or(|value| value > end_time.as_str())
+    {
+        return false;
+    }
     for key in [
         "user",
         "api",
@@ -9744,16 +13237,22 @@ fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
         "level",
         "type",
     ] {
-        let Some(expected) = query.get(key) else {
+        let Some(expected) = query.get(key).filter(|value| !value.trim().is_empty()) else {
             continue;
         };
-        if key == "level" {
-            if !value(key).eq_ignore_ascii_case(expected) {
-                return false;
-            }
-        } else if value(key) != expected {
+        if !value(key)
+            .to_ascii_lowercase()
+            .contains(&expected.trim().to_ascii_lowercase())
+        {
             return false;
         }
+    }
+    if let Some(expected) = query
+        .get("status_code")
+        .filter(|value| !value.trim().is_empty())
+        && value("status_code") != expected.trim()
+    {
+        return false;
     }
     let response_time = record.get("response_time").and_then(log_number);
     if let Some(minimum) = query
@@ -9771,6 +13270,20 @@ fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
         && response_time.is_none_or(|value| value > maximum)
     {
         return false;
+    }
+    if let Some(excluded) = query
+        .get("exclude_type")
+        .filter(|value| !value.trim().is_empty())
+    {
+        let excluded = excluded.trim().to_ascii_lowercase();
+        if value("type").eq_ignore_ascii_case(&excluded)
+            || (excluded == "platform"
+                && value("endpoint")
+                    .to_ascii_lowercase()
+                    .contains("/platform/"))
+        {
+            return false;
+        }
     }
     true
 }
@@ -9907,13 +13420,16 @@ async fn discovery_parse(
         };
     }
 
-    let content = payload
-        .get("content")
-        .or_else(|| payload.get("wsdl"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| payload.as_str().map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(raw_body).into_owned());
+    // The pinned route parses the raw request body as the WSDL document.
+    let content = String::from_utf8_lossy(raw_body).into_owned();
+    if let Err(message) = crate::routes::discovery::validate_wsdl(&content) {
+        let message = if content.trim().is_empty() {
+            message
+        } else {
+            format!("Invalid WSDL: {message}")
+        };
+        return error(StatusCode::BAD_REQUEST, "WSDL004", &message, request_id);
+    }
     match crate::routes::discovery::parse_wsdl(&content) {
         Ok(parsed) => success(
             StatusCode::OK,
@@ -9958,7 +13474,17 @@ fn sign_token(
                 });
                 header.kid = kid;
                 if algorithm.eq_ignore_ascii_case("RS256") {
-                    if let Some(key) = entry.get("private_key").and_then(Value::as_str) {
+                    let key = entry
+                        .get("private_key_path")
+                        .and_then(Value::as_str)
+                        .and_then(|path| fs::read_to_string(path).ok())
+                        .or_else(|| {
+                            entry
+                                .get("private_key")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    if let Some(key) = key {
                         return encode(
                             &header,
                             claims,
@@ -10018,24 +13544,34 @@ fn password_hash(user: &Value) -> Option<String> {
     }
 }
 
-fn self_update_fields_are_safe(payload: &Value) -> bool {
-    matches!(
-        payload.as_object(),
-        Some(fields) if fields.keys().all(|field| {
-            !matches!(field.as_str(), "role" | "groups" | "active" | "username")
+/// Restricted fields the caller attempted to set, sorted like Python's
+/// `sorted(attempted_restricted)`. Python only counts a field as "attempted"
+/// when its incoming value is not null, so a null-valued restricted field is
+/// treated as safe here too.
+fn restricted_self_update_fields(payload: &Value) -> Vec<String> {
+    let Some(fields) = payload.as_object() else {
+        return Vec::new();
+    };
+    let mut restricted: Vec<String> = fields
+        .iter()
+        .filter(|(field, value)| {
+            matches!(field.as_str(), "role" | "groups" | "active" | "username") && !value.is_null()
         })
-    )
+        .map(|(field, _)| field.clone())
+        .collect();
+    restricted.sort();
+    restricted
 }
 
 fn bootstrap_admin_update_fields_are_safe(payload: &Value) -> bool {
     matches!(
         payload.as_object(),
-        Some(fields) if fields.keys().all(|field| {
+        // Null values are not updates; bandwidth_limit_enabled is not operational.
+        Some(fields) if fields.iter().filter(|(_, value)| !value.is_null()).all(|(field, _)| {
             matches!(
                 field.as_str(),
                 "bandwidth_limit_bytes"
                     | "bandwidth_limit_window"
-                    | "bandwidth_limit_enabled"
                     | "rate_limit_duration"
                     | "rate_limit_duration_type"
                     | "rate_limit_enabled"
@@ -10051,10 +13587,10 @@ fn bootstrap_admin_update_fields_are_safe(payload: &Value) -> bool {
 }
 
 fn secure_password(password: &str) -> bool {
-    password.len() >= 16
-        && password.chars().any(|c| c.is_ascii_uppercase())
-        && password.chars().any(|c| c.is_ascii_lowercase())
-        && password.chars().any(|c| c.is_ascii_digit())
+    password.chars().count() >= 16
+        && password.chars().any(char::is_uppercase)
+        && password.chars().any(char::is_lowercase)
+        && password.chars().any(char::is_numeric)
         && password
             .chars()
             .any(|c| "!@#$%^&*()-_=+[]{};:,.<>?/".contains(c))
@@ -10065,27 +13601,46 @@ fn password_policy() -> &'static str {
 }
 
 fn cookie_secure(headers: &HeaderMap) -> bool {
-    env::var("COOKIE_SECURE")
+    let https_only = env_bool("HTTPS_ONLY", false);
+    let inferred_secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"));
+    let secure = env::var("COOKIE_SECURE")
         .ok()
         .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|| {
-            env_bool("HTTPS_ONLY", false)
-                || headers
-                    .get("x-forwarded-proto")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("https"))
-        })
+        .unwrap_or(https_only || inferred_secure);
+    // Plain-HTTP local hosts never get Secure cookies unless HTTPS_ONLY is set,
+    // so local runs stay usable (pinned behaviour).
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .rsplit_once(':')
+                .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+                .map_or(value, |(name, _)| name)
+                .to_ascii_lowercase()
+        });
+    if !inferred_secure
+        && !https_only
+        && host
+            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "testserver"))
+    {
+        return false;
+    }
+    secure
 }
 
 fn cookie_same_site(secure: bool) -> &'static str {
-    match env::var("COOKIE_SAMESITE")
-        .unwrap_or_else(|_| "strict".to_owned())
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let raw = env::var("COOKIE_SAMESITE").unwrap_or_default();
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "" | "strict" => "Strict",
         "none" if secure => "None",
-        "lax" | "none" => "Lax",
-        _ => "Strict",
+        // Unknown values and None without Secure fall back to Lax.
+        _ => "Lax",
     }
 }
 
@@ -10348,34 +13903,48 @@ fn content_type_is_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn is_typed_json_mutation(path: &str, method: &Method) -> bool {
-    if !matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-        return false;
+/// Routes whose Python counterpart declares a required (non-Optional) typed
+/// Pydantic body parameter, so FastAPI's global RequestValidationError
+/// handler returns 422 VAL001 for a request with no body at all -- before
+/// authentication, permission, or existence checks run -- regardless of
+/// Content-Type. Confirmed against the pinned reference for every listed
+/// route; routes with an `Optional`/defaulted body (memory dump/restore,
+/// security settings) are deliberately excluded.
+/// Python's service-layer message for a missing entity; collections without a
+/// dedicated service message use the generic one.
+fn not_found_message(collection: &str) -> &'static str {
+    match collection {
+        "roles" => "Role does not exist",
+        "groups" => "Group does not exist",
+        "routings" => "Routing does not exist",
+        _ => "Resource not found",
     }
-    [
-        "/api",
-        "/apis",
-        "/endpoint",
-        "/endpoints",
-        "/credit",
-        "/config/import",
-        "/group",
-        "/memory/dump",
-        "/memory/restore",
-        "/role",
-        "/routing",
-        "/security/settings",
-        "/tiers",
-        "/tools/chaos/toggle",
-        "/tools/cors/check",
-        "/rate-limits",
-        "/subscription",
-        "/user",
-        "/users",
-        "/vault",
-    ]
-    .iter()
-    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn requires_nonempty_json_body(path: &str, method: &Method) -> bool {
+    match *method {
+        Method::POST => {
+            path == "/credit/rotate-key"
+                || (path.starts_with("/proto/") && path != "/proto/descriptors/backfill")
+                || (path.starts_with("/rate-limits/") && path.ends_with("/duplicate"))
+        }
+        Method::PUT => {
+            path.starts_with("/api/")
+                || path.starts_with("/endpoint/")
+                || path.starts_with("/group/")
+                || path.starts_with("/proto/")
+                || (path.starts_with("/rate-limits/") && !path.ends_with("/duplicate"))
+                || path.starts_with("/role/")
+                || path.starts_with("/routing/")
+                || ((path.starts_with("/user/") || path.starts_with("/users/"))
+                    && !path.ends_with("/update-password"))
+                || path.starts_with("/vault/")
+                || (path
+                    .strip_prefix("/tiers/")
+                    .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/')))
+        }
+        _ => false,
+    }
 }
 
 fn is_subscription_mutation(path: &str, method: &Method) -> bool {
@@ -10384,6 +13953,13 @@ fn is_subscription_mutation(path: &str, method: &Method) -> bool {
             path,
             "/subscription/subscribe" | "/subscription/unsubscribe"
         )
+}
+
+fn is_update_password_path(path: &str) -> bool {
+    ["/user/", "/users/"].iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.ends_with("/update-password"))
+    })
 }
 
 fn subscription_payload_has_required_fields(payload: &Value) -> bool {
@@ -10422,28 +13998,54 @@ fn paginate(items: Vec<Value>, query: &HashMap<String, String>) -> Value {
 /// Validate client pagination before applying the page window. This prevents
 /// invalid values from being silently normalized and honors the configured
 /// maximum on each request.
-fn validate_pagination(query: &HashMap<String, String>) -> Result<(), &'static str> {
+fn validate_pagination(query: &HashMap<String, String>) -> Result<(), String> {
     if query
         .get("page")
         .is_some_and(|value| value.parse::<usize>().ok().is_none_or(|number| number == 0))
     {
-        return Err("page must be a positive integer");
+        return Err("page must be >= 1".to_owned());
     }
     let Some(page_size) = query.get("page_size") else {
         return Ok(());
     };
     let Some(page_size) = page_size.parse::<usize>().ok().filter(|number| *number > 0) else {
-        return Err("page_size must be a positive integer");
+        return Err("page_size must be >= 1".to_owned());
     };
-    if let Some(maximum) = env::var("MAX_PAGE_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|number| *number > 0)
-        && page_size > maximum
-    {
-        return Err("page_size exceeds the configured maximum");
+    if page_size > configured_max_page_size() {
+        return Err(format!(
+            "page_size must be <= {}",
+            configured_max_page_size()
+        ));
     }
     Ok(())
+}
+
+fn configured_max_page_size() -> usize {
+    env::var("MAX_PAGE_SIZE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.parse::<i128>().ok())
+        .map(|value| value.max(1) as usize)
+        .unwrap_or(200)
+}
+
+/// The page window (default 100 per page) without any envelope.
+fn paginate_items(items: Vec<Value>, query: &HashMap<String, String>) -> Vec<Value> {
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("page_size")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    items
+        .into_iter()
+        .skip((page - 1).saturating_mul(page_size))
+        .take(page_size)
+        .collect()
 }
 
 fn paginate_named(items: Vec<Value>, query: &HashMap<String, String>, name: &str) -> Value {
@@ -10502,6 +14104,9 @@ fn public_user(mut value: Value) -> Value {
 
 fn schedule_restart() -> Result<(), (&'static str, &'static str)> {
     let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("PID_FILE") {
+        candidates.push(std::path::PathBuf::from(path));
+    }
     if let Some(path) = env::var_os("DOORMAN_PID_FILE") {
         candidates.push(std::path::PathBuf::from(path));
     }
@@ -10578,10 +14183,33 @@ fn http_detail(status: StatusCode, detail: &str, request_id: &str) -> Response {
     json_response(status, json!({"detail": detail}), request_id)
 }
 
+/// FastAPI's request validation failures all pass through the pinned global
+/// RequestValidationError handler, which renders the VAL001 envelope; the
+/// Pydantic error list is only logged, never returned.
 fn validation_errors(errors: Vec<Value>, request_id: &str) -> Response {
-    json_response(
+    let errors = Value::Array(errors);
+    tracing::debug!(%errors, "request validation failed");
+    error(
         StatusCode::UNPROCESSABLE_ENTITY,
-        json!({"detail": errors}),
+        "VAL001",
+        "Validation Error",
+        request_id,
+    )
+}
+
+/// The pinned tier routes return a bare `ResponseModel`, which FastAPI
+/// serializes in full rather than through the respond_rest envelope.
+fn response_model_envelope(message_text: &str, request_id: &str) -> Response {
+    success(
+        StatusCode::OK,
+        json!({
+            "status_code": 200,
+            "response_headers": null,
+            "response": null,
+            "message": message_text,
+            "error_code": null,
+            "error_message": null,
+        }),
         request_id,
     )
 }
@@ -10595,7 +14223,7 @@ fn unexpected(request_id: &str) -> Response {
     )
 }
 
-fn json_response(status: StatusCode, payload: Value, request_id: &str) -> Response {
+pub(crate) fn json_response(status: StatusCode, payload: Value, request_id: &str) -> Response {
     let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let length = body.len().to_string();
     let mut response = (
@@ -10627,12 +14255,6 @@ fn env_bool(name: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
-}
-
-fn timestamp_now() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 // VaultService stores `datetime.now(UTC).isoformat()` directly. Unlike the
@@ -10686,6 +14308,337 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pinned_log_file_patterns_are_read_as_logs() {
+        assert!(is_log_file_name("doorman.log"));
+        assert!(is_log_file_name("doorman.log.3"));
+        assert!(is_log_file_name("doorman-trail.log"));
+        assert!(!is_log_file_name("metrics.json"));
+        assert!(!is_log_file_name("enhanced_metrics.json"));
+    }
+
+    #[test]
+    fn parse_report_timestamp_matches_pythons_strptime_cascade() {
+        // "%Y-%m-%dT%H:%M"
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30").unwrap(),
+            1_705_314_600
+        );
+        // "%Y-%m-%d" (midnight UTC)
+        assert_eq!(parse_report_timestamp("2024-01-15").unwrap(), 1_705_276_800);
+        // fromisoformat fallback: space separator and a trailing Z.
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30:00Z").unwrap(),
+            1_705_314_600
+        );
+        // Seconds in the fromisoformat fallback are preserved, not truncated.
+        assert_eq!(
+            parse_report_timestamp("2024-01-15T10:30:45Z").unwrap(),
+            1_705_314_645
+        );
+        assert!(parse_report_timestamp("not-a-date").is_err());
+        assert_eq!(
+            parse_report_timestamp("garbage").unwrap_err(),
+            "Invalid date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+        );
+    }
+
+    #[test]
+    fn report_date_time_utc_matches_python_strftime() {
+        assert_eq!(
+            report_date_time_utc(1_705_314_600),
+            ("2024-01-15".to_owned(), "10:30".to_owned())
+        );
+    }
+
+    #[test]
+    fn report_api_from_endpoint_matches_python_classification() {
+        assert_eq!(
+            report_api_from_endpoint("/api/rest/orders/v1/list"),
+            "rest:orders"
+        );
+        // Matches Python: `ep.split('/')` on "/api/rest/" yields a trailing
+        // empty segment, so `parts[3]` is "" rather than ever reaching the
+        // `len(parts) > 3` "unknown" fallback (unreachable via this prefix).
+        assert_eq!(report_api_from_endpoint("/api/rest/"), "rest:");
+        assert_eq!(
+            report_api_from_endpoint("/api/graphql/catalog"),
+            "graphql:catalog"
+        );
+        assert_eq!(
+            report_api_from_endpoint("/api/soap/billing"),
+            "soap:billing"
+        );
+        assert_eq!(report_api_from_endpoint("/platform/users"), "platform");
+    }
+
+    #[test]
+    fn analytics_percentiles_pools_raw_samples_like_python_percentile_metrics() {
+        let mut a = AggregatedPoint {
+            timestamp: 0,
+            requests: 2,
+            ..Default::default()
+        };
+        a.latencies_ms.extend([10.0, 20.0]);
+        let mut b = AggregatedPoint {
+            timestamp: 60,
+            requests: 1,
+            ..Default::default()
+        };
+        b.latencies_ms.extend([100.0]);
+        // Pooled sorted samples: [10, 20, 100], n = 3.
+        // k = max(0, int(p*3) - 1): p50 -> int(1.5)-1=0 -> 10; p95 -> int(2.85)-1=1 -> 20.
+        let result = analytics_percentiles(&[a, b]);
+        assert_eq!(result["p50"], json!(10.0));
+        assert_eq!(result["p95"], json!(20.0));
+        assert_eq!(result["min"], json!(10.0));
+        assert_eq!(result["max"], json!(100.0));
+
+        let empty = analytics_percentiles(&[]);
+        assert_eq!(empty["p50"], json!(0.0));
+        assert_eq!(empty["min"], json!(0.0));
+    }
+
+    #[test]
+    fn restricted_self_update_fields_matches_python_attempted_set() {
+        // Null-valued restricted fields are not "attempted" in Python, since it
+        // filters `v is not None` before intersecting with the restricted set.
+        assert!(restricted_self_update_fields(&json!({"email": "a@b.com"})).is_empty());
+        assert!(restricted_self_update_fields(&json!({"role": null})).is_empty());
+        assert_eq!(
+            restricted_self_update_fields(&json!({
+                "username": "new", "active": true, "role": "admin", "email": "a@b.com"
+            })),
+            vec!["active", "role", "username"]
+        );
+    }
+
+    #[test]
+    fn tier_request_models_coerce_scalars_and_apply_defaults() {
+        let mut create = json!({
+            "tier_id": 7,
+            "name": "not-an-enum",
+            "display_name": true,
+            "limits": {"requests_per_minute": "12", "enable_throttling": "yes"},
+            "price_monthly": "19.5",
+            "features": [1, false],
+            "enabled": "off",
+            "ignored": "field"
+        });
+        normalize_tier_request("/tiers", &Method::POST, &mut create).unwrap();
+        assert_eq!(create["tier_id"], "7");
+        assert_eq!(create["name"], "not-an-enum");
+        assert_eq!(create["display_name"], "True");
+        assert_eq!(create["limits"]["requests_per_minute"], 12);
+        assert_eq!(create["limits"]["burst_per_second"], 0);
+        assert_eq!(create["limits"]["max_queue_time_ms"], 5000);
+        assert_eq!(create["limits"]["enable_throttling"], true);
+        assert_eq!(create["price_monthly"], 19.5);
+        assert_eq!(create["features"], json!(["1", "False"]));
+        assert_eq!(create["is_default"], false);
+        assert_eq!(create["enabled"], false);
+        assert!(create.get("ignored").is_none());
+
+        let mut action = json!({
+            "user_id": 42,
+            "new_tier_id": false,
+            "grace_period_days": "3",
+            "ignored": true
+        });
+        normalize_tier_request("/tiers/downgrade", &Method::POST, &mut action).unwrap();
+        assert_eq!(
+            action,
+            json!({"user_id": "42", "new_tier_id": "False", "grace_period_days": 3})
+        );
+
+        let mut assignment = json!({
+            "user_id": "dated",
+            "tier_id": "pro",
+            "effective_from": 0,
+            "effective_until": "2020-1-2 3:04:05.12Z"
+        });
+        normalize_tier_request("/tiers/assignments", &Method::POST, &mut assignment).unwrap();
+        assert_eq!(assignment["effective_from"], "1970-01-01T00:00:00+00:00");
+        assert_eq!(
+            assignment["effective_until"],
+            "2020-01-02T03:04:05.120000+00:00"
+        );
+    }
+
+    #[test]
+    fn tier_request_models_reject_invalid_shapes_and_drop_update_nulls() {
+        for mut invalid in [
+            json!({"tier_id": "x", "name": "free", "display_name": "X", "limits": []}),
+            json!({"user_id": "x", "temp_tier_id": "pro", "duration_days": null}),
+            json!({"user_id": "x", "new_tier_id": "pro", "immediate": "sometimes"}),
+            json!({"user_id": "x", "tier_id": "pro", "effective_from": "not-a-date"}),
+            json!({"tier_ids": ["free"]}),
+        ] {
+            let (path, method) = if invalid.get("effective_from").is_some() {
+                ("/tiers/assignments", Method::POST)
+            } else if invalid.get("tier_id").is_some() {
+                ("/tiers", Method::POST)
+            } else if invalid.get("temp_tier_id").is_some() {
+                ("/tiers/temporary-upgrade", Method::POST)
+            } else if invalid.get("new_tier_id").is_some() {
+                ("/tiers/upgrade", Method::POST)
+            } else {
+                ("/tiers/compare", Method::POST)
+            };
+            assert!(normalize_tier_request(path, &method, &mut invalid).is_err());
+        }
+
+        let mut update = json!({
+            "display_name": null,
+            "limits": null,
+            "enabled": null,
+            "features": null,
+            "price_monthly": null,
+            "description": null
+        });
+        normalize_tier_request("/tiers/pro", &Method::PUT, &mut update).unwrap();
+        assert_eq!(update, json!({}));
+
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("YES", Some(true)),
+            ("on", Some(true)),
+            ("1", Some(true)),
+            ("false", Some(false)),
+            ("No", Some(false)),
+            ("off", Some(false)),
+            ("0", Some(false)),
+            (" true ", None),
+        ] {
+            assert_eq!(pydantic_bool_string(value), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_exception_envelopes_match_each_python_route() {
+        for (operation, detail) in [
+            ("get", "Failed to get tier"),
+            ("update", "Failed to update tier"),
+            ("delete", "Failed to delete tier"),
+            ("assign", "Failed to assign user"),
+            ("get_assignment", "Failed to get assignment"),
+            ("get_user_tier", "Failed to get user tier"),
+            ("remove_assignment", "Failed to remove assignment"),
+            ("list_users", "Failed to list users"),
+            ("upgrade", "Failed to upgrade tier"),
+            ("downgrade", "Failed to downgrade tier"),
+            ("temporary-upgrade", "Failed to create temporary upgrade"),
+            ("trial/start", "Failed to start trial"),
+            ("payment/failure", "Failed to handle payment failure"),
+            ("compare", "Failed to compare tiers"),
+        ] {
+            let response = tier_detail_failure(operation, "tier-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+
+        let response = tier_statistics_failure("tier-error");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error_code"], "TIER999");
+        assert_eq!(body["error_message"], "Failed to get statistics");
+    }
+
+    #[tokio::test]
+    async fn rate_rule_exception_envelopes_match_each_python_route() {
+        for (operation, detail) in [
+            ("create", "Failed to create rule"),
+            ("list", "Failed to list rules"),
+            ("search", "Failed to search rules"),
+            ("get", "Failed to get rule"),
+            ("update", "Failed to update rule"),
+            ("delete", "Failed to delete rule"),
+            ("enable", "Failed to enable rule"),
+            ("disable", "Failed to disable rule"),
+            ("bulk/delete", "Failed to delete rules"),
+            ("bulk/enable", "Failed to enable rules"),
+            ("bulk/disable", "Failed to disable rules"),
+            ("duplicate", "Failed to duplicate rule"),
+            ("statistics", "Failed to get statistics"),
+            ("status", "Failed to get rate limit status"),
+        ] {
+            let response = rate_rule_failure(operation, "rule-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_exception_envelopes_match_each_python_route() {
+        for (path, detail) in [
+            ("/quota/status", "Failed to get quota status"),
+            (
+                "/quota/status/monthly_requests",
+                "Failed to get quota status",
+            ),
+            ("/quota/usage/history", "Failed to get usage history"),
+            ("/quota/usage/export", "Failed to export usage data"),
+            ("/quota/tier/info", "Failed to get tier info"),
+            ("/quota/burst/status", "Failed to get burst status"),
+        ] {
+            let response = quota_route_failure(path, "quota-error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+                detail
+            );
+        }
+    }
+
+    #[test]
+    fn log_parsing_and_filters_match_python_service() {
+        let record = parse_log_record(
+            "2026-09-26 10:11:12,345 - doorman.gateway - INFO - 12345678-1234-1234-1234-123456789012 | Username: Alice Endpoint: GET /rest/pets Total time: 12.5ms status_code: 200 From: 127.0.0.1:1234",
+        )
+        .unwrap();
+        assert_eq!(record["timestamp"], "2026-09-26T10:11:12.345");
+        assert_eq!(record["user"], "Alice");
+        assert_eq!(record["method"], "GET");
+        assert_eq!(record["type"], "gateway");
+        assert_eq!(record["ip_address"], "127.0.0.1");
+
+        let filters = HashMap::from([
+            ("user".to_owned(), "ali".to_owned()),
+            ("endpoint".to_owned(), "/REST".to_owned()),
+            ("start_time".to_owned(), "10:00".to_owned()),
+            ("end_time".to_owned(), "11:00".to_owned()),
+            ("status_code".to_owned(), "200".to_owned()),
+        ]);
+        assert!(log_record_matches(&record, &filters));
+        assert!(!log_record_matches(
+            &record,
+            &HashMap::from([("exclude_type".to_owned(), "gateway".to_owned())])
+        ));
+
+        let debug =
+            parse_log_record("2026-09-26 10:11:12 - doorman.gateway - ERROR - startup complete")
+                .unwrap();
+        assert_eq!(debug["level"], "DEBUG");
+    }
 
     // Oracle: pinned models/security_settings_model.py, Pydantic 1.10.26.
     #[test]
@@ -10952,13 +14905,13 @@ mod tests {
 
     #[test]
     fn self_updates_without_user_management_cannot_change_authorization_fields() {
-        assert!(self_update_fields_are_safe(
+        assert!(restricted_self_update_fields(
             &json!({"email": "user@example.com", "custom_attributes": {}, "rate_limit_duration": 1})
-        ));
-        assert!(!self_update_fields_are_safe(&json!({"groups": ["admin"]})));
-        assert!(!self_update_fields_are_safe(&json!({"role": "admin"})));
-        assert!(!self_update_fields_are_safe(&json!({"active": true})));
-        assert!(!self_update_fields_are_safe(&json!({"username": "other"})));
+        ).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"groups": ["admin"]})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"role": "admin"})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"active": true})).is_empty());
+        assert!(!restricted_self_update_fields(&json!({"username": "other"})).is_empty());
     }
 
     #[test]
@@ -10991,6 +14944,25 @@ mod tests {
             Uuid::new_v4().simple().to_string().to_uppercase()
         );
         assert!(!secure_password(&without_special));
+
+        // 16 characters but 18 bytes passes; 14 characters (16 bytes) must not.
+        assert!(secure_password(&non_ascii_test_password(16)));
+        assert!(!secure_password(&non_ascii_test_password(14)));
+    }
+
+    fn non_ascii_test_password(chars: usize) -> String {
+        let bytes = Uuid::new_v4().into_bytes();
+        let uppercase = char::from_u32(0xC0 + u32::from(bytes[0] % 0x17)).unwrap();
+        let lowercase = char::from_u32(0xE0 + u32::from(bytes[1] % 0x17)).unwrap();
+        let digit = char::from(bytes[2] % 10 + b'0');
+        let special = char::from(bytes[3] % 15 + b'!');
+        let padding = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(chars - 4)
+            .collect::<String>();
+        format!("{uppercase}{lowercase}{digit}{special}{padding}")
     }
 
     fn test_password() -> String {
@@ -11115,7 +15087,7 @@ mod tests {
         assert_eq!(wildcard_blocked["actual"]["allowed"], false);
         assert_eq!(
             wildcard_blocked["preflight"]["response_headers"]["Access-Control-Allow-Origin"],
-            ""
+            Value::Null
         );
         assert_eq!(
             wildcard_blocked["preflight"]["response_headers"]["Access-Control-Allow-Credentials"],

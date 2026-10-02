@@ -32,7 +32,7 @@ from scripts.release_fixtures import ReleaseFixtures, free_port
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_STAGES = (
     "Runner/checker regression tests",
-    "Pinned Python reference and 600-entry coverage ledger",
+    "Pinned Python reference plus test and production-source coverage ledgers",
     "Rust formatting, Clippy, and complete Cargo suite",
     "Production frontend dependency audit",
     "Frontend dependency install and production build",
@@ -255,7 +255,11 @@ class Runner:
             [sys.executable, "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
             verification,
         )
-        self.run("parity-inventory", ["make", "parity-reference", "parity-ledger"], verification)
+        self.run(
+            "parity-inventory",
+            ["make", "parity-reference", "parity-ledger", "parity-source-ledger"],
+            verification,
+        )
         self.run("rust-checks", ["make", "check"], verification)
         self.run("frontend-audit", ["make", "web-audit"], verification)
         self.run("frontend-build", ["make", "web-build"], verification)
@@ -264,7 +268,7 @@ class Runner:
         )
         self.run(
             "image-build",
-            ["docker", "build", "--iidfile", str(self.evidence / "image-id.txt"), "."],
+            ["docker", "build", "--provenance=false", "--iidfile", str(self.evidence / "image-id.txt"), "."],
             verification,
         )
         self.image_id = (self.evidence / "image-id.txt").read_text().strip()

@@ -48,6 +48,29 @@ make parity-ledger
 pinned commit. The verification report includes counts by suite/domain and
 status, allowing incremental migration work to target a concrete gap.
 
+## Python-to-Rust source coverage ledger
+
+`source_coverage_ledger.json` inventories production Python modules, classes,
+fields, functions, and methods from the same pinned reference. It exists because
+test disposition alone cannot prove that untested Python behavior was translated.
+`source_coverage_overrides.json` records the reviewed Rust symbol and test evidence
+for each unit. Large uniform modules may use a file default, with exact symbol
+entries taking precedence for partial or obsolete exceptions.
+
+Unlisted units generate as `unreviewed`. A unit is `translated` only when the
+override identifies both its Rust implementation and assertion-level tests.
+`partial` and `missing` keep incomplete work visible; approved changes and
+obsoletions require explicit rationales.
+
+```bash
+python3 scripts/generate_source_coverage_ledger.py --write
+make parity-source-ledger
+```
+
+The source-unit percentage measures inventory review, not semantic weighting or
+release readiness. Complete parity also requires the operation and system evidence
+described below.
+
 With the pinned Python server on port 3102 and Rust on port 3101, provide a fresh
 administrator token for each disposable fixture and run the differential comparison:
 

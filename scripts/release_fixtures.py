@@ -218,7 +218,7 @@ CMD ["python", "doorman.py"]
             )
             iid = context / "python-image-id.txt"
             self.command(
-                ["docker", "build", "--iidfile", str(iid), str(context)],
+                ["docker", "build", "--provenance=false", "--iidfile", str(iid), str(context)],
                 timeout=1800,
                 output_file=self.evidence / "python-reference-image-build.log",
             )

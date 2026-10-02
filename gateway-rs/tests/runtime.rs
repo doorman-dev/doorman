@@ -8,6 +8,7 @@ use doorman_gateway::storage::models::PolicyDocuments;
 use doorman_gateway::{AppState, Config, build_router};
 use http::{Request, StatusCode, header};
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -34,14 +35,56 @@ async fn rust_health_matches_public_contract() {
 }
 
 #[tokio::test]
+async fn disabled_logs_leave_request_metrics_running_without_creating_log_files() {
+    let logs_dir =
+        std::env::temp_dir().join(format!("doorman-disabled-logs-{}", uuid::Uuid::new_v4()));
+    let mut config = Config::for_test("http://127.0.0.1:9".to_owned());
+    config.logs_enabled = false;
+    config.logs_dir = Some(logs_dir.clone());
+    let state = AppState::new(config).unwrap();
+    let runtime = state.runtime.clone();
+    let app = build_router(state);
+
+    let features = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/features")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(features.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(features.into_body(), 1024).await.unwrap(),
+        r#"{"logs_enabled":false}"#
+    );
+
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(runtime.request_total.load(Ordering::Relaxed) >= 2);
+    assert!(!logs_dir.exists(), "disabled logging created {logs_dir:?}");
+}
+
+#[tokio::test]
 async fn platform_routes_are_native_and_never_use_an_internal_backend() {
     let (upstream_url, server) =
-        spawn_upstream(Router::new().route("/platform/ping", get(|| async { "upstream" }))).await;
+        spawn_upstream(Router::new().route("/platform/user/me", get(|| async { "upstream" })))
+            .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/platform/ping")
+                .uri("/platform/user/me")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -129,17 +172,18 @@ async fn rust_serves_health_independent_of_removed_rollout_flags() {
 
 #[tokio::test]
 async fn platform_requests_are_not_forwarded_to_an_internal_backend() {
-    let (upstream_url, server) = spawn_upstream(
-        Router::new().route("/platform/echo", any(|| async { StatusCode::IM_A_TEAPOT })),
-    )
+    let (upstream_url, server) = spawn_upstream(Router::new().route(
+        "/platform/api/all",
+        any(|| async { StatusCode::IM_A_TEAPOT }),
+    ))
     .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .method(Method::POST)
-                .uri("/platform/echo?value=1")
-                .body(Body::from("payload"))
+                .method(Method::GET)
+                .uri("/platform/api/all?value=1")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -152,13 +196,13 @@ async fn platform_requests_are_not_forwarded_to_an_internal_backend() {
 #[tokio::test]
 async fn spoofed_forwarding_headers_do_not_enable_platform_access() {
     let (upstream_url, server) =
-        spawn_upstream(Router::new().route("/platform/headers", any(|| async { StatusCode::OK })))
+        spawn_upstream(Router::new().route("/platform/user/me", any(|| async { StatusCode::OK })))
             .await;
     let app = build_router(AppState::new(Config::for_test(upstream_url)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/platform/headers")
+                .uri("/platform/user/me")
                 .header("x-forwarded-for", "203.0.113.10")
                 .header("x-real-ip", "203.0.113.11")
                 .body(Body::empty())
@@ -334,7 +378,7 @@ async fn rust_handles_cache_delete_locally() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         to_bytes(response.into_body(), 1024).await.unwrap(),
-        r#"{"error_code":"GTW401","error_message":"Unauthorized"}"#
+        r#"{"detail":"Unauthorized"}"#
     );
     server.abort();
 }
@@ -390,11 +434,10 @@ async fn rust_rejects_unported_health_methods_in_rust() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert!(
-        to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap()
-            .is_empty()
+    // Verified against the pinned server: Starlette renders the FastAPI detail body.
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap(),
+        br#"{"detail":"Method Not Allowed"}"#.as_slice()
     );
     server.abort();
 }
@@ -849,6 +892,8 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
                 .method(Method::POST)
                 .uri("/api/rest/limited/v1/items")
                 .header("content-type", "application/json")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
                 .body(Body::from(vec![b'x'; 1024 * 1024 + 1]))
                 .unwrap(),
         )
@@ -856,6 +901,7 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
     assert_eq!(body["error_code"], "REQ001");
@@ -864,6 +910,28 @@ async fn oversized_rest_body_returns_legacy_413_without_reaching_upstream() {
         "Request entity too large (max: 1048576 bytes)"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn oversized_grpc_web_body_is_rejected_before_policy() {
+    let state = AppState::new(Config::for_test("removed-internal-backend".to_owned()))
+        .unwrap()
+        .with_policy_documents(PolicyDocuments::default());
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/grpc-web/missing/fixture.v1.Resource/Create")
+                .header(header::CONTENT_TYPE, "application/grpc-web-text")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
 }
 
 #[tokio::test]

@@ -22,6 +22,19 @@ pub fn duration_to_seconds(duration: &str) -> u64 {
     }
 }
 
+/// Python truthiness for a numeric limit field: `bool(x)` / `int(x or default)`.
+pub fn truthy_count(value: &Value, field: &str) -> Option<u64> {
+    match value.get(field) {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(|float| float as u64))
+            .filter(|count| *count != 0),
+        Some(Value::String(raw)) if !raw.is_empty() => raw.parse().ok(),
+        Some(Value::Bool(true)) => Some(1),
+        _ => None,
+    }
+}
+
 pub fn enforce_rate_limit(
     username: &str,
     user: &Value,
@@ -30,11 +43,11 @@ pub fn enforce_rate_limit(
     now_millis: u64,
 ) -> Result<(), PolicyFailure> {
     let rate_enabled = bool_field_default(user, "rate_limit_enabled", false)
-        || user.get("rate_limit_duration").is_some();
+        || truthy_count(user, "rate_limit_duration").is_some();
     if !rate_enabled {
         return Ok(());
     }
-    let limit = u64_field(user, "rate_limit_duration").unwrap_or(60);
+    let limit = truthy_count(user, "rate_limit_duration").unwrap_or(60);
     let duration = string_field(user, "rate_limit_duration_type").unwrap_or("minute");
     let window = duration_to_seconds(duration);
     let window_millis = window * 1000;
@@ -85,21 +98,28 @@ pub fn enforce_rate_limit(
             "Rate limit exceeded",
         ))
     } else {
-        if algorithm.eq_ignore_ascii_case("hybrid")
-            && u64_field(user, "rate_limit_burst_allowance").unwrap_or(0) > 0
-            && !bucket_counter.take(
-                &format!("rate_hybrid_bucket:{username}"),
-                limit.saturating_add(u64_field(user, "rate_limit_burst_allowance").unwrap_or(0)),
-                window_millis,
-                now_millis,
-            )
-        {
-            return Err(PolicyFailure::new(
-                PolicyStage::RateLimit,
-                StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded",
-                "Rate limit exceeded",
-            ));
+        if algorithm.eq_ignore_ascii_case("hybrid") {
+            let burst = u64_field(user, "rate_limit_burst_allowance").unwrap_or(0);
+            if burst > 0
+                && !bucket_counter.take(
+                    &format!("rate_hybrid_bucket:{username}"),
+                    limit,
+                    window_millis,
+                    now_millis,
+                )
+            {
+                let window_start = window_index.saturating_mul(window);
+                let burst_key = format!("burst:user:{username}:{window_start}");
+                if counter.get(&burst_key, now_seconds) >= burst {
+                    return Err(PolicyFailure::new(
+                        PolicyStage::RateLimit,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Rate limit exceeded",
+                        "Rate limit exceeded",
+                    ));
+                }
+                counter.incr(&burst_key, window * 2, now_seconds);
+            }
         }
         Ok(())
     }
@@ -126,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_limit_is_a_graceful_rate_limit_denial() {
+    fn zero_limit_falls_back_to_python_default_instead_of_denying() {
         let user = json!({
             "rate_limit_enabled": true,
             "rate_limit_duration": 0,
@@ -134,7 +154,12 @@ mod tests {
         });
         let counter = WindowCounter::default();
         let buckets = TokenBucketCounter::default();
-        assert!(enforce_rate_limit("invalid", &user, &counter, &buckets, 60_000).is_err());
+        // Python: `int(user.get('rate_limit_duration') or 60)` treats 0 as unset.
+        assert!(enforce_rate_limit("invalid", &user, &counter, &buckets, 60_000).is_ok());
+        let disabled = json!({"rate_limit_duration": 0});
+        for _ in 0..100 {
+            assert!(enforce_rate_limit("off", &disabled, &counter, &buckets, 60_000).is_ok());
+        }
     }
 
     #[test]
@@ -185,6 +210,25 @@ mod tests {
         assert!(enforce_rate_limit("dana", &user, &counter, &buckets, 0).is_ok());
         assert!(enforce_rate_limit("dana", &user, &counter, &buckets, 0).is_ok());
         assert!(enforce_rate_limit("dana", &user, &counter, &buckets, 0).is_err());
+    }
+
+    #[test]
+    fn hybrid_mode_uses_a_separate_windowed_burst_counter_like_python() {
+        let user = json!({
+            "rate_limit_enabled": true,
+            "rate_limit_duration": 2,
+            "rate_limit_duration_type": "second",
+            "rate_limit_algorithm": "hybrid",
+            "rate_limit_burst_allowance": 1,
+        });
+        let counter = WindowCounter::default();
+        let buckets = TokenBucketCounter::default();
+        assert!(buckets.take("rate_hybrid_bucket:erin", 2, 1_000, 0));
+        assert!(buckets.take("rate_hybrid_bucket:erin", 2, 1_000, 0));
+
+        assert!(enforce_rate_limit("erin", &user, &counter, &buckets, 0).is_ok());
+        assert_eq!(counter.get("burst:user:erin:0", 0), 1);
+        assert!(enforce_rate_limit("erin", &user, &counter, &buckets, 0).is_err());
     }
 
     #[test]

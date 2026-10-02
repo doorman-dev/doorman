@@ -8,6 +8,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, Generate, KeyInit},
 };
+use base64::Engine as _;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,11 +173,80 @@ async fn restore_file_with_key(
 ) -> Result<(u8, String), SnapshotError> {
     validate_key(key_material)?;
     let blob = fs::read(path)?;
-    let payload = decrypt_blob(&blob, key_material)?;
+    let mut payload = decrypt_blob(&blob, key_material)?;
     let version = payload.version;
     let created_at = payload.created_at.clone();
+    for records in payload.data.values_mut() {
+        for record in records {
+            restore_python_json_values(record);
+        }
+    }
     storage.restore_memory_data(payload.data).await?;
+    reconcile_bootstrap_admin(storage).await;
     Ok((version, created_at))
+}
+
+fn restore_python_json_values(value: &mut Value) {
+    match value {
+        Value::Object(object)
+            if object.get("__type__").and_then(Value::as_str) == Some("bytes") =>
+        {
+            let decoded = object
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_default();
+            *value = Value::String(decoded);
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                restore_python_json_values(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                restore_python_json_values(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn reconcile_bootstrap_admin(storage: &SharedStorage) {
+    let Ok(Some(admin)) = storage
+        .find_one("users", &serde_json::json!({"username": "admin"}))
+        .await
+    else {
+        return;
+    };
+    let mut updates = serde_json::Map::new();
+    if let Ok(email) = env::var("DOORMAN_ADMIN_EMAIL")
+        && admin.get("email").and_then(Value::as_str) != Some(email.as_str())
+    {
+        updates.insert("email".to_owned(), Value::String(email));
+    }
+    if admin.get("ui_access").and_then(Value::as_bool) != Some(true) {
+        updates.insert("ui_access".to_owned(), Value::Bool(true));
+    }
+    if let Ok(password) = env::var("DOORMAN_ADMIN_PASSWORD")
+        && let Ok(password) = bcrypt::hash(password, bcrypt::DEFAULT_COST)
+    {
+        updates.insert("password".to_owned(), Value::String(password));
+    }
+    if !updates.is_empty() {
+        let _ = storage
+            .update_one(
+                "users",
+                &serde_json::json!({"username": "admin"}),
+                &Value::Object(updates),
+            )
+            .await;
+    }
 }
 
 fn decrypt_blob(blob: &[u8], key_material: &str) -> Result<Snapshot, SnapshotError> {
@@ -628,6 +698,17 @@ mod tests {
         assert_eq!(snapshot.created_at, "2026-08-06T12:34:56Z");
         assert_eq!(snapshot.data["users"][0]["username"], "fixture-admin");
         assert_eq!(snapshot.data["users"][0]["password"], "hash");
+    }
+
+    #[test]
+    fn restores_python_byte_wrappers_for_password_hashes() {
+        let mut value = serde_json::json!({
+            "password": {"__type__": "bytes", "data": "JDJiJDEyJGhhc2g="},
+            "nested": [{"value": {"__type__": "bytes", "data": "dGV4dA=="}}]
+        });
+        restore_python_json_values(&mut value);
+        assert_eq!(value["password"], "$2b$12$hash");
+        assert_eq!(value["nested"][0]["value"], "text");
     }
 
     #[test]

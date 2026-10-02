@@ -507,13 +507,8 @@ async fn security_settings_coerced_updates_persist_and_invalid_updates_are_atomi
     }))).await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let errors = response_json(response).await;
-    let errors = &response_payload(&errors)["detail"];
-    assert_eq!(
-        errors[0],
-        json!({"loc": ["body", "auto_save_frequency_seconds"],
-        "msg": "ensure this value is greater than or equal to 60", "type": "value_error.number.not_ge", "ctx": {"limit_value": 60}})
-    );
-    assert_eq!(errors[1]["type"], "type_error.bool");
+    // The pinned global handler returns VAL001; the Pydantic details are only logged.
+    assert_eq!(response_payload(&errors)["error_code"], "VAL001");
     assert_eq!(
         storage
             .find_one("settings", &json!({"type": "security_settings"}))
@@ -661,10 +656,8 @@ async fn security_settings_integer_length_limits_reject_atomically() {
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            response_payload(&response_json(response).await)["detail"],
-            json!([
-                {"loc":["body","auto_save_frequency_seconds"],"msg":"value is not a valid integer","type":"type_error.integer"}
-            ])
+            response_payload(&response_json(response).await)["error_code"],
+            "VAL001"
         );
         assert_eq!(
             storage
@@ -683,10 +676,8 @@ async fn security_settings_integer_length_limits_reject_atomically() {
     }))).await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
-        response_payload(&response_json(response).await)["detail"],
-        json!([
-            {"loc":["body","auto_save_frequency_seconds"],"msg":"ensure this value is greater than or equal to 60","type":"value_error.number.not_ge","ctx":{"limit_value":60}}
-        ])
+        response_payload(&response_json(response).await)["error_code"],
+        "VAL001"
     );
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
     assert_eq!(
@@ -791,14 +782,8 @@ async fn security_settings_lists_persist_and_enforce_python_patterns_atomically(
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
-        response_payload(&response_json(response).await)["detail"],
-        json!([
-            {"loc":["body","ip_whitelist",0],"msg":"none is not an allowed value","type":"type_error.none.not_allowed"},
-            {"loc":["body","ip_whitelist",1],"msg":"str type expected","type":"type_error.str"},
-            {"loc":["body","ip_whitelist",2],"msg":"str type expected","type":"type_error.str"},
-            {"loc":["body","ip_blacklist"],"msg":"value is not a valid list","type":"type_error.list"},
-            {"loc":["body","xff_trusted_proxies",0],"msg":"none is not an allowed value","type":"type_error.none.not_allowed"}
-        ])
+        response_payload(&response_json(response).await)["error_code"],
+        "VAL001"
     );
     assert_eq!(
         storage
@@ -956,12 +941,11 @@ async fn security_settings_unicode_intervals_persist_and_invalid_updates_are_ato
             "{value:?}"
         );
         let body = response_json(response).await;
-        let error = &response_payload(&body)["detail"][0];
-        assert_eq!(error["loc"], json!(["body", "auto_save_frequency_seconds"]));
-        assert_eq!(error["type"], error_type);
-        if error_type == "value_error.number.not_ge" {
-            assert_eq!(error["ctx"], json!({"limit_value":60}));
-        }
+        assert_eq!(
+            response_payload(&body)["error_code"],
+            "VAL001",
+            "{error_type}"
+        );
         assert_eq!(
             storage
                 .find_one("settings", &json!({"type":"security_settings"}))
@@ -1054,8 +1038,8 @@ async fn security_settings_dump_path_coercion_persists_and_publishes_atomically(
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            response_payload(&response_json(response).await)["detail"],
-            json!([{"loc": ["body", "dump_path"], "msg": "str type expected", "type": "type_error.str"}])
+            response_payload(&response_json(response).await)["error_code"],
+            "VAL001"
         );
         assert_eq!(
             storage
@@ -1324,7 +1308,7 @@ async fn log_export_filters_records_and_redacts_nested_credentials() {
         json!({"time":"2026-09-12T12:00:00Z","name":"fixture","user":"fixture-user","level":"INFO","message":"earlier request"}),
     ];
     std::fs::write(
-        directory.join("fixture.log"),
+        directory.join("doorman.log"),
         records
             .iter()
             .map(Value::to_string)

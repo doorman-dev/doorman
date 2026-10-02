@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     error::GatewayError,
@@ -20,12 +20,14 @@ use crate::{
         transforms::{transform_request, transform_response},
     },
     middleware::{
-        body_limit::BodyLimits,
+        body_limit::{BodyLimits, NoCompression},
         cors::{apply_actual_response, preflight_response},
     },
     policy::{
         PolicyErrorBody,
-        evaluator::{PolicyRequest, PolicyRuntime, evaluate_rest_policy, evaluate_shared_effects},
+        evaluator::{
+            PolicyRequest, PolicyRuntime, evaluate_rest_policy_staged, evaluate_shared_effects,
+        },
     },
     state::AppState,
 };
@@ -41,6 +43,73 @@ pub enum DataPlaneProtocol {
 
 #[derive(Clone, Debug)]
 pub struct PolicyPath(pub String);
+
+/// The pinned tier middleware runs before the body-size middleware, which
+/// rejects a declared oversized body before routing and endpoint policy.
+pub(crate) async fn early_body_limit(
+    state: &AppState,
+    path: &str,
+    headers: &HeaderMap,
+    is_preflight: bool,
+    protocol: DataPlaneProtocol,
+) -> Option<Response> {
+    let limits = BodyLimits::from_env();
+    let limit = match protocol {
+        DataPlaneProtocol::Rest => limits.rest,
+        DataPlaneProtocol::Graphql => limits.graphql,
+        DataPlaneProtocol::Soap => limits.soap,
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => limits.grpc,
+    };
+    let limit = BodyLimits::for_path(path, limit);
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())?;
+    if declared <= limit as u64 {
+        return None;
+    }
+    let tier_username = (!state.config.shared_storage.skip_tier_rate_limit && !is_preflight)
+        .then(|| {
+            crate::policy::auth::verify_request_token(headers, &state.config.shared_storage)
+                .ok()
+                .and_then(|claims| claims.sub)
+        })
+        .flatten();
+    if let (Some(storage), Some(username)) = (&state.storage, tier_username) {
+        let injected_snapshot = state
+            .policy_documents
+            .as_ref()
+            .map(|injected| injected.lock().ok().map(|documents| documents.clone()));
+        let documents = match injected_snapshot {
+            Some(snapshot) => snapshot,
+            None => storage.load_policy_documents().await.ok(),
+        };
+        if let Some(documents) = documents
+            && let Err(failure) = crate::policy::tier::enforce(
+                &documents,
+                storage,
+                &username,
+                now_millis() / 1_000,
+                true,
+            )
+            .await
+            && let Some(tier_limit) = failure.tier_limit
+        {
+            let (body, status) = *tier_limit;
+            let mut response = (failure.status, Json(body)).into_response();
+            apply_tier_headers(&mut response, Some(&status));
+            response.extensions_mut().insert(NoCompression);
+            return Some(response);
+        }
+    }
+    let mut response = policy_error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "REQ001",
+        &format!("Request entity too large (max: {limit} bytes)"),
+    );
+    response.extensions_mut().insert(NoCompression);
+    Some(response)
+}
 
 pub async fn rest_policy_then_proxy(
     State(state): State<AppState>,
@@ -63,6 +132,17 @@ pub async fn rest_policy_then_proxy(
         .get::<DataPlaneProtocol>()
         .copied()
         .unwrap_or(DataPlaneProtocol::Rest);
+    if let Some(response) = early_body_limit(
+        &state,
+        request.uri().path(),
+        request.headers(),
+        request.method() == http::Method::OPTIONS,
+        protocol,
+    )
+    .await
+    {
+        return Ok(response);
+    }
     let path = request
         .extensions()
         .get::<PolicyPath>()
@@ -77,7 +157,13 @@ pub async fn rest_policy_then_proxy(
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|value| value.0.ip());
+        .map(|value| value.0.ip())
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+                .map(|value| value.0.peer.ip())
+        });
     let headers = request.headers().clone();
     let content_length = headers
         .get(header::CONTENT_LENGTH)
@@ -90,6 +176,12 @@ pub async fn rest_policy_then_proxy(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| http::Method::from_bytes(value.as_bytes()).ok())
             .unwrap_or(http::Method::OPTIONS)
+    } else if matches!(protocol, DataPlaneProtocol::Grpc | DataPlaneProtocol::Soap)
+        && request.method() == http::Method::GET
+    {
+        // The pinned JSON gRPC and SOAP gateways match endpoints as POST
+        // (`'POST/' + endpoint_uri` for SOAP) whatever the request method.
+        http::Method::POST
     } else {
         request.method().clone()
     };
@@ -100,6 +192,20 @@ pub async fn rest_policy_then_proxy(
         direct_ip: peer,
         now_millis: now_millis(),
         content_length,
+        peer_certificates: request
+            .extensions()
+            .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+            .map(|info| info.0.peer_certificates.clone())
+            .unwrap_or_default(),
+        native_tls: request
+            .extensions()
+            .get::<ConnectInfo<crate::tls::TlsConnectionInfo>>()
+            .is_some(),
+        is_preflight: request.method() == http::Method::OPTIONS,
+        group_version_missing: matches!(protocol, DataPlaneProtocol::Grpc)
+            && !request.headers().contains_key("x-api-version"),
+        route_endpoint_check: protocol == DataPlaneProtocol::Rest,
+        endpoint_required: matches!(protocol, DataPlaneProtocol::Rest | DataPlaneProtocol::Soap),
     };
 
     let documents = if let Some(injected) = &state.policy_documents {
@@ -116,36 +222,71 @@ pub async fn rest_policy_then_proxy(
         Err("shared policy storage is unavailable".to_owned())
     };
     let result = match documents {
-        Ok(mut documents) => match evaluate_rest_policy(
-            &mut documents,
-            &policy_request,
-            &state.config.shared_storage,
-            &PolicyRuntime::default(),
-        ) {
-            Ok(Some(mut decision)) => {
-                if let Some(storage) = &state.storage {
-                    evaluate_shared_effects(
-                        &documents,
-                        &policy_request,
-                        &mut decision,
-                        storage,
-                        true,
+        Ok(mut documents) => {
+            // The pinned tier middleware runs before routing, for every gateway
+            // request whose token verifies.
+            let mut tier_status = None;
+            let tier_user = (!state.config.shared_storage.skip_tier_rate_limit
+                && !policy_request.is_preflight)
+                .then(|| {
+                    crate::policy::auth::verify_request_token(
+                        &policy_request.headers,
+                        &state.config.shared_storage,
                     )
-                    .await
-                    .map(|()| Some(decision))
-                } else if state.policy_documents.is_some() {
-                    Ok(Some(decision))
-                } else {
-                    Err(crate::policy::PolicyFailure::new(
-                        crate::policy::PolicyStage::Resolution,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "GTW006",
-                        "Gateway state store unavailable",
-                    ))
+                    .ok()
+                    .and_then(|claims| claims.sub)
+                })
+                .flatten();
+            let tier_result = match (&state.storage, tier_user.as_deref()) {
+                (Some(storage), Some(user)) => crate::policy::tier::enforce(
+                    &documents,
+                    storage,
+                    user,
+                    policy_request.now_millis / 1_000,
+                    true,
+                )
+                .await
+                .map(|status| tier_status = status),
+                _ => Ok(()),
+            };
+            match tier_result.and_then(|()| {
+                evaluate_rest_policy_staged(
+                    &mut documents,
+                    &policy_request,
+                    &state.config.shared_storage,
+                    &PolicyRuntime {
+                        tls_profiles: state.tls_snapshot().profiles.clone(),
+                        ..PolicyRuntime::default()
+                    },
+                )
+            }) {
+                Ok(Some(mut decision)) => {
+                    decision.tier_rate_limit_enabled = false;
+                    decision.tier_limit_status = tier_status.clone();
+                    if let Some(storage) = &state.storage {
+                        evaluate_shared_effects(
+                            &documents,
+                            &policy_request,
+                            &mut decision,
+                            storage,
+                            true,
+                        )
+                        .await
+                        .map(|()| Some(decision))
+                    } else if state.policy_documents.is_some() {
+                        Ok(Some(decision))
+                    } else {
+                        Err(crate::policy::PolicyFailure::new(
+                            crate::policy::PolicyStage::Resolution,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "GTW006",
+                            "Gateway state store unavailable",
+                        ))
+                    }
                 }
+                other => other,
             }
-            other => other,
-        },
+        }
         Err(error) => {
             tracing::error!(error = %error, "rust policy storage unavailable");
             Err(crate::policy::PolicyFailure::new(
@@ -156,6 +297,13 @@ pub async fn rest_policy_then_proxy(
             ))
         }
     };
+    // Tier limits (applied above as shared effects) precede the service-level checks.
+    let result = result.and_then(|decision| match decision {
+        Some(decision) if decision.deferred_failure.is_some() => {
+            Err(decision.deferred_failure.expect("checked above"))
+        }
+        other => Ok(other),
+    });
     match result {
         Ok(Some(decision)) => {
             if request.method() == http::Method::OPTIONS {
@@ -193,6 +341,13 @@ pub async fn rest_policy_then_proxy(
                 });
             Ok(response)
         }
+        // The pinned SOAP service renders its not-found error as XML too.
+        Ok(None) if protocol == DataPlaneProtocol::Soap => Ok((
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/xml")],
+            "<error><error_code>GTW001</error_code><error_message>API does not exist for the requested name and version</error_message></error>",
+        )
+            .into_response()),
         Ok(None) => Ok((
             StatusCode::NOT_FOUND,
             Json(PolicyErrorBody {
@@ -211,7 +366,7 @@ pub async fn rest_policy_then_proxy(
                             "1" | "true" | "yes" | "on"
                         )
                     })
-                && failure.error_code == "GTW003"
+                && matches!(failure.error_code.as_str(), "GTW002" | "GTW003")
             {
                 return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
             }
@@ -220,6 +375,22 @@ pub async fn rest_policy_then_proxy(
                 let mut response = (failure.status, Json(body)).into_response();
                 apply_tier_headers(&mut response, Some(&status));
                 return Ok(response);
+            }
+            // The pinned SOAP service renders its own 400/403/404 errors as
+            // an XML <error> document (process_soap_response).
+            if protocol == DataPlaneProtocol::Soap
+                && failure.stage == crate::policy::PolicyStage::Resolution
+                && matches!(failure.status.as_u16(), 400 | 403 | 404)
+            {
+                return Ok((
+                    failure.status,
+                    [(header::CONTENT_TYPE, "application/xml")],
+                    format!(
+                        "<error><error_code>{}</error_code><error_message>{}</error_message></error>",
+                        failure.error_code, failure.error_message
+                    ),
+                )
+                    .into_response());
             }
             Ok((
                 failure.status,
@@ -322,11 +493,40 @@ async fn execute_rest(
         )
             .into_response());
     };
+    if !matches!(
+        protocol,
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb
+    ) && decision
+        .upstream_tls_profile_id
+        .as_deref()
+        .and_then(|id| state.tls_snapshot().profiles.upstreams.get(id).cloned())
+        .is_some_and(|profile| profile.server_name.is_some())
+    {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(PolicyErrorBody {
+                error_code: "TLS004".to_owned(),
+                error_message: "HTTP upstream TLS server-name override is unsupported".to_owned(),
+            }),
+        )
+            .into_response());
+    }
+    let Some(proxy_client) = state.proxy_client_for(decision.upstream_tls_profile_id.as_deref())
+    else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(PolicyErrorBody {
+                error_code: "TLS004".to_owned(),
+                error_message: "Upstream TLS profile is unavailable".to_owned(),
+            }),
+        )
+            .into_response());
+    };
     if !circuit_allows(&state.runtime.circuits, &circuit_key) {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(PolicyErrorBody {
-                error_code: "GTW006".to_owned(),
+                error_code: "GTW999".to_owned(),
                 error_message: "Upstream circuit open".to_owned(),
             }),
         )
@@ -513,8 +713,7 @@ async fn execute_rest(
     let mut attempt = 0_u32;
     let upstream = loop {
         attempt += 1;
-        let result = state
-            .proxy_client
+        let result = proxy_client
             .request(parts.method.clone(), target.clone())
             .headers(headers.clone())
             .timeout(std::time::Duration::from_millis(
@@ -533,6 +732,15 @@ async fn execute_rest(
                 retry_backoff(attempt).await;
             }
             Ok(response) => break response,
+            Err(error) if error.is_timeout() && attempt < attempts => {
+                record_failure(&state.runtime.circuits, &circuit_key);
+                state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .runtime
+                    .upstream_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                retry_backoff(attempt).await;
+            }
             Err(_) if attempt < attempts => {
                 record_failure(&state.runtime.circuits, &circuit_key);
                 state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
@@ -565,7 +773,7 @@ async fn execute_rest(
     } else {
         record_success(&state.runtime.circuits, &circuit_key);
     }
-    if status == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND && protocol != DataPlaneProtocol::Graphql {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(PolicyErrorBody {
@@ -608,32 +816,52 @@ async fn execute_rest(
         status,
         decision.response_transform.as_ref(),
     );
-    // GraphQL clients expect execution failures in a valid `errors` envelope,
-    // even when an upstream incorrectly reports that envelope with a 5xx status.
-    // Preserve transport failures and malformed/non-GraphQL responses as errors.
-    let status = if protocol == DataPlaneProtocol::Graphql
-        && status.is_server_error()
-        && serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|body| body.get("errors").and_then(Value::as_array).cloned())
-            .is_some_and(|errors| !errors.is_empty())
-    {
-        StatusCode::OK
+    // The pinned GraphQL gateway always answers 200 with a GraphQL envelope:
+    // an upstream error status without `errors` is wrapped, and a body that is
+    // not JSON becomes a BAD_RESPONSE error.
+    let (status, bytes) = if protocol == DataPlaneProtocol::Graphql {
+        let envelope = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) if status != StatusCode::OK && value.get("errors").is_none() => json!({
+                "errors": [{
+                    "message": value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+                    "extensions": {"code": format!("HTTP_{}", status.as_u16())},
+                }]
+            }),
+            Ok(value) => value,
+            Err(error) => json!({
+                "errors": [{
+                    "message": format!("Invalid JSON from upstream: {error}"),
+                    "extensions": {"code": "BAD_RESPONSE"},
+                }]
+            }),
+        };
+        (
+            StatusCode::OK,
+            serde_json::to_vec(&envelope).unwrap_or_default(),
+        )
     } else {
-        status
+        (status, bytes)
     };
     let is_json = upstream_headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
+    // A HEAD (or any bodiless) reply legitimately carries a JSON content type
+    // with no payload; only a non-empty body can be malformed.
     if protocol == DataPlaneProtocol::Rest
         && is_json
+        && parts.method != http::Method::HEAD
+        && !bytes.is_empty()
         && serde_json::from_slice::<Value>(&bytes).is_err()
     {
         return Ok(policy_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "GTW006",
-            "Invalid JSON response from upstream",
+            "Malformed JSON from upstream",
         ));
     }
     let upstream_content_type = upstream_headers
@@ -646,10 +874,12 @@ async fn execute_rest(
         })
         .to_owned();
     let (body, content_type) = match protocol {
-        DataPlaneProtocol::Soap
-        | DataPlaneProtocol::Graphql
-        | DataPlaneProtocol::Grpc
-        | DataPlaneProtocol::GrpcWeb => (bytes.to_vec(), upstream_content_type),
+        // The pinned SOAP gateway always answers with application/xml.
+        DataPlaneProtocol::Soap => (bytes.to_vec(), "application/xml".to_owned()),
+        DataPlaneProtocol::Graphql => (bytes.to_vec(), "application/json".to_owned()),
+        DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => {
+            (bytes.to_vec(), upstream_content_type)
+        }
         DataPlaneProtocol::Rest if !is_json => (
             serde_json::to_vec(&String::from_utf8_lossy(&bytes))
                 .unwrap_or_else(|_| b"null".to_vec()),
@@ -743,7 +973,10 @@ async fn execute_crud(
                 }
             }
             http::Method::POST => {
-                let mut value = parse_crud_body(&body)?;
+                let mut value = parse_crud_body(&body);
+                if !value.is_object() {
+                    return Ok(crud_internal_error(&crud_post_non_object_message(&value)));
+                }
                 if value.get("_id").is_none() {
                     value["_id"] = Value::String(uuid::Uuid::new_v4().to_string());
                 }
@@ -761,7 +994,36 @@ async fn execute_crud(
                         "Resource ID required for update",
                     ));
                 };
-                let value = parse_crud_body(&body)?;
+                let value = parse_crud_body(&body);
+                if !value.is_object() {
+                    let has_schema = decision
+                        .crud_schema
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .is_some_and(|schema| !schema.is_empty());
+                    if has_schema {
+                        return Ok(crud_internal_error(&format!(
+                            "'{}' object has no attribute 'get'",
+                            python_type_name(&value)
+                        )));
+                    }
+                    // Python checks existence first, then `$set`s the raw body.
+                    let Some(existing) = storage.crud_find_one(collection, resource_id).await?
+                    else {
+                        return Ok(policy_error_response(
+                            StatusCode::NOT_FOUND,
+                            "CRUD404",
+                            "Resource not found",
+                        ));
+                    };
+                    if python_truthy(&value) {
+                        return Ok(crud_internal_error(&format!(
+                            "'{}' object has no attribute 'items'",
+                            python_type_name(&value)
+                        )));
+                    }
+                    return Ok(crud_success(StatusCode::OK, existing));
+                }
                 validate_crud_schema(decision.crud_schema.as_ref(), &value, true)?;
                 storage
                     .crud_update(collection, resource_id, &value)
@@ -814,11 +1076,14 @@ async fn execute_crud(
         Ok(response) => Ok(response),
         Err(crate::storage::runtime::StorageError::InvalidDocument(error)) => {
             tracing::debug!(error = %error, "CRUD validation failed");
-            Ok(policy_error_response(
+            Ok((
                 StatusCode::BAD_REQUEST,
-                "CRUD400",
-                "Validation failed",
-            ))
+                Json(serde_json::json!({
+                    "error_code": "CRUD400",
+                    "error_message": "Validation failed",
+                })),
+            )
+                .into_response())
         }
         Err(error) => {
             tracing::error!(error = %error, "CRUD storage operation failed");
@@ -850,14 +1115,59 @@ fn crud_resource_id(path: &str) -> Option<&str> {
     (endpoint.len() > 1).then(|| *endpoint.last().expect("endpoint is non-empty"))
 }
 
-fn parse_crud_body(body: &[u8]) -> Result<Value, crate::storage::runtime::StorageError> {
-    let value: Value = serde_json::from_slice(body)?;
-    if !value.is_object() {
-        return Err(crate::storage::runtime::StorageError::InvalidDocument(
-            "CRUD request body must be a JSON object".to_owned(),
-        ));
+fn parse_crud_body(body: &[u8]) -> Value {
+    // Python treats request.json() failures as an empty object for CRUD REST.
+    serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn python_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(number) if number.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
     }
-    Ok(value)
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_none_or(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// The exception text Python's `CrudService.handle_rest` raises for a
+/// non-object POST body (`'_id' not in body`, then `body['_id'] = ...`).
+fn crud_post_non_object_message(value: &Value) -> String {
+    let has_id = match value {
+        Value::Array(items) => items.iter().any(|item| item.as_str() == Some("_id")),
+        Value::String(text) => text.contains("_id"),
+        _ => false,
+    };
+    match value {
+        Value::Array(_) => "list indices must be integers or slices, not str".to_owned(),
+        Value::String(_) if has_id => "string indices must be integers, not 'str'".to_owned(),
+        Value::String(_) => "'str' object does not support item assignment".to_owned(),
+        other => format!(
+            "argument of type '{}' is not iterable",
+            python_type_name(other)
+        ),
+    }
+}
+
+fn crud_internal_error(message: &str) -> Response {
+    policy_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "CRUD999",
+        &format!("Internal CRUD error: {message}"),
+    )
 }
 
 pub(crate) fn validate_crud_schema(
@@ -911,8 +1221,12 @@ fn validate_crud_fields(
         let expected = rules.get("type").and_then(Value::as_str);
         let valid_type = match expected {
             Some("string") => field_value.is_string(),
-            Some("number") => field_value.is_number(),
-            Some("integer") => field_value.as_i64().is_some() || field_value.as_u64().is_some(),
+            Some("number") => field_value.is_number() || field_value.is_boolean(),
+            Some("integer") => {
+                field_value.as_i64().is_some()
+                    || field_value.as_u64().is_some()
+                    || field_value.is_boolean()
+            }
             Some("boolean") => field_value.is_boolean(),
             Some("array") => field_value.is_array(),
             Some("object") => field_value.is_object(),
@@ -931,19 +1245,61 @@ fn validate_crud_fields(
                 .and_then(Value::as_u64)
                 .is_some_and(|min| text.chars().count() < min as usize)
             {
-                errors.push(format!("Field '{path}' is shorter than min_length"));
+                errors.push(format!(
+                    "Field '{path}' must be at least {} characters",
+                    rules["min_length"]
+                ));
             }
             if rules
                 .get("max_length")
                 .and_then(Value::as_u64)
                 .is_some_and(|max| text.chars().count() > max as usize)
             {
-                errors.push(format!("Field '{path}' is longer than max_length"));
+                errors.push(format!(
+                    "Field '{path}' must be at most {} characters",
+                    rules["max_length"]
+                ));
+            }
+            if let Some(pattern) = rules.get("pattern").and_then(Value::as_str)
+                && let Some(pattern) =
+                    crate::validation::json::cached_pattern(&format!("^(?:{pattern})"))
+                && !pattern.is_match(text)
+            {
+                errors.push(format!(
+                    "Field '{path}' does not match pattern {}",
+                    rules["pattern"].as_str().unwrap_or_default()
+                ));
+            }
+            if let Some(allowed) = rules.get("enum").and_then(Value::as_array)
+                && !allowed.contains(field_value)
+            {
+                errors.push(format!(
+                    "Field '{path}' must be one of: {}",
+                    allowed
+                        .iter()
+                        .map(|value| value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
         }
-        if let Some(allowed) = rules.get("enum").and_then(Value::as_array) {
-            if !allowed.contains(field_value) {
-                errors.push(format!("Field '{path}' is not an allowed value"));
+        let numeric_value = field_value.as_f64().or_else(|| {
+            field_value
+                .as_bool()
+                .map(|value| if value { 1.0 } else { 0.0 })
+        });
+        if let Some(numeric_value) = numeric_value {
+            if let Some(minimum) = rules.get("min_value").and_then(Value::as_f64)
+                && numeric_value < minimum
+            {
+                errors.push(format!("Field '{path}' must be >= {}", rules["min_value"]));
+            }
+            if let Some(maximum) = rules.get("max_value").and_then(Value::as_f64)
+                && numeric_value > maximum
+            {
+                errors.push(format!("Field '{path}' must be <= {}", rules["max_value"]));
             }
         }
         if let (Some(properties), Some(object)) = (
@@ -1090,9 +1446,11 @@ fn validate_protocol_request_with_registry(
 }
 
 fn graphql_validation_schema(schema: &Value, query: &str) -> Value {
-    let Some(operation) = regex::Regex::new(r"(?:query|mutation)\s+(\w+)")
-        .ok()
-        .and_then(|regex| regex.captures(query))
+    static OPERATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:query|mutation)\s+(\w+)").expect("static GraphQL operation regex")
+    });
+    let Some(operation) = OPERATION
+        .captures(query)
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str())
     else {
@@ -1105,13 +1463,17 @@ fn graphql_validation_schema(schema: &Value, query: &str) -> Value {
     let Some(mapping) = mapping else {
         return serde_json::json!({});
     };
-    let prefix = format!("{operation}.");
+    // Python: `field_path.startswith(operation)` then `field_path[len(operation) + 1:]`,
+    // which skips one character whether or not it is the `.` separator.
     Value::Object(
         mapping
             .iter()
             .filter_map(|(path, rules)| {
-                path.strip_prefix(&prefix)
-                    .map(|path| (path.to_owned(), rules.clone()))
+                path.strip_prefix(operation).map(|rest| {
+                    let mut rest = rest.chars();
+                    rest.next();
+                    (rest.as_str().to_owned(), rules.clone())
+                })
             })
             .collect(),
     )
@@ -1181,9 +1543,18 @@ async fn retry_backoff(attempt: u32) {
         .map(|seconds| (seconds * 1000.0) as u64)
         .unwrap_or(2_000);
     let delay_ms = base_ms
-        .saturating_mul(1_u64 << attempt.saturating_sub(1).min(20))
+        .saturating_mul(1_u64 << attempt.min(20))
         .min(maximum_ms);
-    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    let jitter_ms = if delay_ms == 0 {
+        0
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % (delay_ms + 1)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -1445,7 +1816,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["error_code"], "GTW006");
-        assert_eq!(body["error_message"], "Invalid JSON response from upstream");
+        assert_eq!(body["error_message"], "Malformed JSON from upstream");
         server.abort();
     }
 
@@ -1793,6 +2164,19 @@ mod tests {
     }
 
     #[test]
+    fn graphql_scope_uses_python_startswith_and_skips_one_character() {
+        let schema = json!({"validation_schema": {
+            "getUser.id": {"required": true},
+            "getUserX/name": {"required": true},
+            "getOther.id": {"required": true}
+        }});
+        assert_eq!(
+            graphql_validation_schema(&schema, "query getUser($id: ID){ user }"),
+            json!({"id": {"required": true}, "/name": {"required": true}})
+        );
+    }
+
+    #[test]
     fn rejects_unsafe_soap_but_preserves_legacy_passthrough_without_a_schema() {
         let legacy = br#"<Envelope/>"#;
         assert!(
@@ -1892,6 +2276,30 @@ mod tests {
 
         let wrong_type = json!({ "name": "Ada", "count": "two" });
         assert!(validate_crud_schema(Some(&schema), &wrong_type, false).is_err());
+
+        let constraints = json!({
+            "code": {"type": "string", "pattern": "[A-Z]{2}", "enum": ["AB", "CD"]},
+            "score": {"type": "number", "min_value": 1, "max_value": 5},
+            "integer": {"type": "integer"}
+        });
+        assert!(
+            validate_crud_schema(
+                Some(&constraints),
+                &json!({"code": "AB", "score": 3, "integer": true}),
+                false
+            )
+            .is_ok()
+        );
+        let error = validate_crud_schema(
+            Some(&constraints),
+            &json!({"code": "zz", "score": 8, "integer": false}),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not match pattern"));
+        assert!(error.contains("must be one of: AB, CD"));
+        assert!(error.contains("must be <= 5"));
         assert_eq!(
             crud_resource_id("/api/rest/demo/v1/items/resource-1"),
             Some("resource-1")

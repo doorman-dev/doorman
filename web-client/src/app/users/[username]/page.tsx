@@ -108,7 +108,7 @@ const UserDetailPage = () => {
     // Fetch available tiers
     const fetchTiers = async () => {
       try {
-        const tiers = await fetchJson(`${SERVER_URL}/platform/tiers`)
+        const tiers = await fetchJson(`${SERVER_URL}/platform/tiers/`)
         // Ensure tiers is an array
         setAvailableTiers(Array.isArray(tiers) ? tiers : [])
       } catch (err) {

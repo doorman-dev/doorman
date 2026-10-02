@@ -149,6 +149,22 @@ async fn self_service_updates_cannot_escalate_privileges() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{user}");
     let limited = login_as(&app, "limited@example.com", password).await;
+    let (status, users) = json_request(
+        &app,
+        Some(&limited),
+        Method::GET,
+        "/platform/user/all?page=1&page_size=100",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    assert!(
+        users["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|user| user["role"] != "admin")
+    );
     for payload in [
         json!({"role": "admin"}),
         json!({"groups": ["ALL", "admin"]}),
@@ -275,7 +291,7 @@ async fn admin_can_read_list_update_and_delete_administrator_resources() {
     .await;
     assert_eq!(status, StatusCode::OK, "{roles}");
     assert!(
-        roles["response"]["roles"]
+        roles["roles"]
             .as_array()
             .unwrap()
             .iter()
@@ -292,7 +308,7 @@ async fn admin_can_read_list_update_and_delete_administrator_resources() {
     .await;
     assert_eq!(status, StatusCode::OK, "{users}");
     assert!(
-        users["response"]["users"]
+        users["users"]
             .as_array()
             .unwrap()
             .iter()

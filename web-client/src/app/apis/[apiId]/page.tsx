@@ -232,7 +232,7 @@ const ApiDetailPage = () => {
     } else {
       (async () => {
         try {
-          const data = await fetchJson(`${SERVER_URL}/platform/api/all?page=1&page_size=1000`)
+          const data = await fetchJson(`${SERVER_URL}/platform/api/all?page=1&page_size=200`)
           const list = Array.isArray(data) ? data : (data as any).apis || (data as any).response?.apis || []
           const found = (list as any[]).find((a: any) => String(a.api_id) === String(apiId))
           if (found) {
@@ -590,7 +590,7 @@ const ApiDetailPage = () => {
       let version = (api as any)?.api_version as string | undefined
       if (!name || !version) {
         try {
-          const data = await fetchJson(`${SERVER_URL}/platform/api/all?page=1&page_size=1000`)
+          const data = await fetchJson(`${SERVER_URL}/platform/api/all?page=1&page_size=200`)
           const list = Array.isArray(data) ? data : (data as any).apis || (data as any).response?.apis || []
           const found = (list as any[]).find((a: any) => String(a.api_id) === String(apiId))
           if (found) {

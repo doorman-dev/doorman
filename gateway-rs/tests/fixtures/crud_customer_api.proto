@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package customer_api;
+
+service Customer_apiService {
+  rpc CreateItem (CreateItemRequest) returns (CreateItemResponse);
+  rpc ListItems (ListItemsRequest) returns (ListItemsResponse);
+}
+
+message CreateItemRequest {
+  string name = 1;
+  int32 age = 2;
+  double score = 3;
+  bool ok = 4;
+  repeated string tags = 5;
+  string meta = 6;
+}
+
+message CreateItemResponse {
+  string result = 1; // JSON string of created object
+}
+
+message ListItemsRequest {}
+
+message ListItemsResponse {
+  string items = 1; // JSON string of list
+}
