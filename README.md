@@ -25,7 +25,7 @@ Get started: [Quick Demo](#get-started-quick-demo) or [Self-Hosting](#get-starte
 
 The built-in control plane centralizes gateway configuration, access management, traffic controls, and operations in one self-hosted interface.
 
-![Doorman API catalog](docs/images/api-catalog.png)
+![Doorman control plane](docs/images/control-plane.png)
 
 - **API lifecycle:** catalog and visual builder, protocol and endpoint configuration, schema validation, and API discovery.
 - **Access and consumption:** authentication, users, roles, groups, subscriptions, credits, tiers, and quotas.
