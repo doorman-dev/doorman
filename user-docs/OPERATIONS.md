@@ -107,6 +107,23 @@ Release Candidate Runbook
   deployment is not required to launch. The Python-to-Rust steps below are
   compatibility rehearsals using synthetic fixtures, not production migration
   prerequisites. V2 backup, restore, and deployment recovery still require proof.
+- Behavior changes from the Python gateway (review before reusing a v1 configuration):
+  - Tier and rate-limit-rule management now require the `manage_tiers` /
+    `manage_rate_limits` permissions (Python left them unauthenticated). Grant
+    these to any automation that calls those APIs.
+  - Gateway subscription bypass applies only to platform-admin roles, not to
+    every role with `manage_gateway`.
+  - JWT `iss`/`aud` claims are always required and expiry has no leeway.
+  - gRPC-Web requests run the full authentication and policy chain.
+  - `MEM_AUTO_SAVE_ENABLED` is honored; memory-mode deployments that relied on
+    Python's unconditional periodic dumps must set it to `true`.
+  - An invalid `JWT_KEYS` value refuses startup instead of falling back to
+    `JWT_SECRET_KEY`.
+  - `GATEWAY_TIMEOUT`, `RETRY_ENABLED`, and `RETRY_MAX_ATTEMPTS` are applied.
+  - MongoDB: on first start the gateway replaces the `apis.api_id_1` unique
+    index with a partial unique index (`api_id_present_1`) so APIs without an
+    `api_id` no longer collide. No manual step is needed; the account needs
+    index-management privileges on the database.
 - Scope: Run this against the exact immutable image digest proposed for release,
   a production-like MongoDB replica set, and a separate Redis instance. Keep
   the generated artifacts under `release-evidence/` and do not overwrite a

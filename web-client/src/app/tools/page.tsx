@@ -1,11 +1,13 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import InfoTooltip from '@/components/InfoTooltip'
 import Layout from '@/components/Layout'
 import { SERVER_URL, WEB_URL } from '@/utils/config'
 import { postJson } from '@/utils/api'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
+import ImportExportPanel from '@/components/ImportExportPanel'
+import { SignalPageHeader } from '@/components/signal/Signal'
 
 interface CorsResult {
   config: {
@@ -38,6 +40,9 @@ interface CorsResult {
 }
 
 const ToolsPage = () => {
+  const [tab, setTab] = useState<'cors' | 'import-export'>('cors')
+  useEffect(() => { if (window.location.hash === '#import-export') setTab('import-export') }, [])
+  const selectTab = (id: 'cors' | 'import-export') => { setTab(id); try { window.history.replaceState(null, '', `#${id}`) } catch {} }
   const [origin, setOrigin] = useState(WEB_URL)
   const [method, setMethod] = useState('GET')
   const [headersText, setHeadersText] = useState('Content-Type, Authorization')
@@ -70,11 +75,16 @@ const ToolsPage = () => {
     <ProtectedRoute>
       <Layout>
         <div className="space-y-6">
-          <div>
-            <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">Tools</h1>
-            <p className="text-sm text-gray-600 dark:text-gray-300">Diagnostics and helpers for operating your gateway.</p>
+          <SignalPageHeader kicker="Operations" title="Tools" description="Diagnostics, import and export for operating your gateway." />
+          <div role="tablist" aria-label="Tools sections" className="flex gap-1 border-b border-gray-200">
+            {([['cors', 'CORS checker'], ['import-export', 'Import / Export']] as const).map(([id, label]) => (
+              <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => selectTab(id)}
+                className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium ${tab === id ? 'border-primary-600 text-primary-700' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{label}</button>
+            ))}
           </div>
 
+          {tab === 'import-export' && <ImportExportPanel />}
+          {tab === 'cors' && (
           <section className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
             <h2 className="text-lg font-medium text-gray-900 dark:text-white mb-3">CORS Checker</h2>
             <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">For /api/* routes, Doorman applies per-API CORS. Platform routes (/platform/*) use environment settings.</p>
@@ -154,6 +164,7 @@ const ToolsPage = () => {
               </div>
             )}
           </section>
+          )}
         </div>
       </Layout>
     </ProtectedRoute>

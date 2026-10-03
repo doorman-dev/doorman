@@ -569,20 +569,20 @@ export default function LogsPage() {
                   onClick={toggleSecurityAudit}
                   className={`signal-button text-xs ${
                     securityAuditActive
-                      ? '!bg-signal-terra font-bold !text-white border-2 border-signal-ink shadow-[2px_2px_0px_0px_rgba(25,32,28,1)]'
+                      ? 'signal-button--primary'
                       : 'btn-secondary'
                   }`}
                   title="Filter logs for security events (401, 403, 429, errors, blocks)"
                 >
-                  {securityAuditActive ? '🛡️ SECURITY AUDIT ACTIVE' : '🛡️ SECURITY AUDIT'}
+                  {securityAuditActive ? 'Security audit: on' : 'Security audit'}
                 </button>
                 <button
                   type="button"
                   onClick={() => setAutoRefreshInterval(prev => prev ? null : 5)}
-                  className={`signal-button text-xs ${autoRefreshInterval ? 'bg-signal-lime font-bold text-signal-ink border-2 border-signal-ink shadow-[2px_2px_0px_0px_rgba(25,32,28,1)]' : 'btn-secondary'}`}
+                  className={`signal-button text-xs ${autoRefreshInterval ? 'signal-button--primary' : 'btn-secondary'}`}
                   title="Toggle 5-second automatic log polling"
                 >
-                  {autoRefreshInterval ? '● LIVE POLLING (5s)' : '▶ AUTO-REFRESH OFF'}
+                  {autoRefreshInterval ? 'Auto-refresh: every 5s' : 'Auto-refresh: off'}
                 </button>
                 <button
                   type="button"
@@ -591,7 +591,7 @@ export default function LogsPage() {
                   className="signal-button btn-secondary text-xs"
                   title="Fetch latest logs now"
                 >
-                  {loading ? 'REFRESHING...' : 'REFRESH NOW'}
+                  {loading ? 'Refreshing…' : 'Refresh now'}
                 </button>
               </div>
             }

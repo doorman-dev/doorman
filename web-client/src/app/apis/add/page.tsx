@@ -12,6 +12,40 @@ import ConfirmModal from '@/components/ConfirmModal'
 import { getJson } from '@/utils/api'
 import SearchableSelect from '@/components/SearchableSelect'
 
+const STEPS = [
+  { id: 'basics', title: 'Basics', hint: 'Name and protocol' },
+  { id: 'upstream', title: 'Upstream', hint: 'Servers and routing' },
+  { id: 'access', title: 'Access', hint: 'Who can call it' },
+  { id: 'policies', title: 'Policies', hint: 'IP rules, headers, credits' },
+  { id: 'review', title: 'Review', hint: 'Confirm and create' },
+]
+
+function Field({ label, htmlFor, hint, tip, required, children }: { label: string; htmlFor?: string; hint?: React.ReactNode; tip?: string; required?: boolean; children: React.ReactNode }) {
+  return <div>
+    <label htmlFor={htmlFor} className="block text-sm font-medium text-gray-800 mb-1">{label}{required && <span className="text-red-600"> *</span>}{tip && <InfoTooltip text={tip} />}</label>
+    {children}
+    {hint && <p className="text-xs text-gray-500 mt-1">{hint}</p>}
+  </div>
+}
+
+function Toggle({ id, name, checked, onChange, disabled, title, description, tip }: { id: string; name: string; checked: boolean; onChange: (e: React.ChangeEvent<HTMLInputElement>) => void; disabled?: boolean; title: string; description?: React.ReactNode; tip?: string }) {
+  return <div className="flex items-start gap-3 py-2">
+    <input id={id} name={name} type="checkbox" className="mt-1 h-4 w-4 rounded border-gray-300" checked={checked} onChange={onChange} disabled={disabled} />
+    <label htmlFor={id} className="flex-1 cursor-pointer">
+      <span className="block text-sm font-medium text-gray-800">{title}{tip && <InfoTooltip text={tip} />}</span>
+      {description && <span className="block text-xs font-normal text-gray-500">{description}</span>}
+    </label>
+  </div>
+}
+
+function Chip({ text, onRemove }: { text: string; onRemove: () => void }) {
+  return <span className="inline-flex items-center gap-2 rounded border border-gray-300 bg-gray-50 px-2 py-1 text-sm">{text}<button type="button" onClick={onRemove} className="text-gray-500 hover:text-gray-800" aria-label={`Remove ${text}`}>×</button></span>
+}
+
+function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+  return <section className="space-y-4"><div className="border-b border-gray-200 pb-2"><h3 className="text-sm font-semibold text-gray-900">{title}</h3>{description && <p className="text-xs text-gray-500">{description}</p>}</div>{children}</section>
+}
+
 const AddApiPage = () => {
   const router = useRouter()
   const [loading, setLoading] = useState(false)
@@ -52,6 +86,7 @@ const AddApiPage = () => {
   const [clientIpXff, setClientIpXff] = useState('')
   const [protoFile, setProtoFile] = useState<File | null>(null)
   const [uploadProto, setUploadProto] = useState(false)
+  const [step, setStep] = useState(0)
 
   React.useEffect(() => {
     (async () => {
@@ -93,8 +128,8 @@ const AddApiPage = () => {
     setIpWhitelistText(prev => (prev && prev.trim().length > 0) ? `${prev.trim()}\n${effectiveIp}` : effectiveIp)
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault()
     setLoading(true)
     setError(null)
 
@@ -115,7 +150,8 @@ const AddApiPage = () => {
       if (!Array.isArray(payload.api_allowed_groups) || payload.api_allowed_groups.length === 0) {
         payload.api_allowed_groups = ['ALL']
       }
-      await postJson(`${SERVER_URL}/platform/api`, payload)
+      const created = await postJson<any>(`${SERVER_URL}/platform/api`, payload)
+      const createdApi = created?.api || created?.response?.api || created
       
       // Upload proto file if provided
       if (uploadProto && protoFile) {
@@ -135,9 +171,15 @@ const AddApiPage = () => {
         }
       }
       
-      router.push('/apis')
+      const newId = createdApi?.api_id
+      if (newId) {
+        try { sessionStorage.setItem('selectedApi', JSON.stringify(createdApi)) } catch {}
+        router.push(`/apis/${encodeURIComponent(String(newId))}/endpoints?add=1`)
+      } else {
+        router.push('/apis')
+      }
     } catch (err) {
-      setError('Network error. Please try again.')
+      setError(err instanceof Error && err.message ? err.message : 'Unable to create the API. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -226,642 +268,242 @@ const AddApiPage = () => {
     setFormData(prev => ({ ...prev, api_allowed_headers: prev.api_allowed_headers.filter((_, i) => i !== index) }))
   }
 
+  const parseList = (t: string) => t.split(/\r?\n|,/).map(s => s.trim()).filter(Boolean)
+  const ipWarning = (() => {
+    const effectiveIp = (((formData as any).api_trust_x_forwarded_for && clientIpXff) ? clientIpXff : clientIp)
+    const wl = parseList(ipWhitelistText)
+    const bl = parseList(ipBlacklistText)
+    const isIPv6 = (s: string) => s.includes(':')
+    const toIPv4 = (s: string) => { const parts = s.split('.'); if (parts.length !== 4) return null as any; return parts.reduce((a, p) => (a << 8n) + (BigInt(parseInt(p, 10) & 255)), 0n) }
+    const expandIPv6 = (ip: string) => { if (ip.indexOf('::') !== -1) { const [h, t] = ip.split('::'); const hp = h ? h.split(':') : []; const tp = t ? t.split(':') : []; const missing = 8 - (hp.length + tp.length); return [...hp, ...Array(Math.max(0, missing)).fill('0'), ...tp].map(x => x || '0') } return ip.split(':') }
+    const toIPv6 = (s: string) => { const parts = expandIPv6(s); if (parts.length !== 8) return null as any; try { return parts.reduce((acc, h) => (acc << 16n) + BigInt(parseInt(h || '0', 16)), 0n) } catch { return null as any } }
+    const matches = (ip: string, patterns: string[]) => {
+      if (!ip) return false
+      const v6 = isIPv6(ip)
+      const ipVal = v6 ? toIPv6(ip) : toIPv4(ip)
+      return patterns.some(raw => {
+        const p = raw.trim(); if (!p) return false
+        if (p.includes('/')) {
+          const [net, maskStr] = p.split('/'); const m = parseInt(maskStr, 10)
+          const n6 = isIPv6(net); if (n6 !== v6) return false
+          const netVal = n6 ? toIPv6(net) : toIPv4(net); if (netVal === null || ipVal === null || isNaN(m as any)) return false
+          const bits = n6 ? 128 : 32
+          const shift = BigInt(bits - Math.min(Math.max(m, 0), bits))
+          const mask = ((1n << BigInt(bits)) - 1n) ^ ((1n << shift) - 1n)
+          return ((ipVal & mask) === (netVal & mask))
+        }
+        return p.toLowerCase() === ip.toLowerCase()
+      })
+    }
+    const warnWL = formData.api_ip_mode === 'whitelist' && wl.length > 0 && !matches(effectiveIp, wl)
+    const warnBL = matches(effectiveIp, bl)
+    if (!(warnWL || warnBL)) return null
+    return { text: warnBL ? 'Your current IP is in the blocked list. You may lose access after saving.' : 'Your current IP is not in the allowed list. You may lose access after saving.', ip: effectiveIp || 'unknown', xff: !!formData.api_trust_x_forwarded_for }
+  })()
+
+  const fd = formData as any
+  const nameOk = formData.api_name.trim().length > 0 && formData.api_version.trim().length > 0
+  const stepError = step === 0 && !nameOk ? 'Enter an API name and version to continue.' : null
+  const isLast = step === STEPS.length - 1
+  const goNext = () => { if (stepError) { setError(stepError); return } setError(null); setStep(s => Math.min(s + 1, STEPS.length - 1)) }
+  const goBack = () => { setError(null); setStep(s => Math.max(s - 1, 0)) }
+  const jump = (i: number) => { if (i > 0 && !nameOk) { setError('Enter an API name and version to continue.'); setStep(0); return } setError(null); setStep(i) }
+
+  const yesNo = (v: boolean) => (v ? 'Yes' : 'No')
+  const reviewRows: [string, React.ReactNode][] = [
+    ['Name / version', `${formData.api_name || '—'} / ${formData.api_version || '—'}`],
+    ['Protocol', formData.api_type],
+    ['Enabled on creation', yesNo(!!formData.active)],
+    ['Upstream servers', formData.api_servers.length ? formData.api_servers.join(', ') : 'None (add later)'],
+    ['Custom hostname', formData.api_hostname || '—'],
+    ['Retry attempts', String(formData.api_allowed_retry_count)],
+    ['Authentication required', yesNo(!!formData.api_auth_required)],
+    ['Public access', yesNo(!!fd.api_public)],
+    ['Allowed groups', formData.api_allowed_groups.join(', ') || 'ALL'],
+    ['Allowed roles', formData.api_allowed_roles.join(', ') || 'Any'],
+    ['IP policy', formData.api_ip_mode === 'whitelist' ? `Allow list only (${parseList(ipWhitelistText).length} entries)` : 'Allow all'],
+    ['Blocked IPs', String(parseList(ipBlacklistText).length)],
+    ['Credits', formData.api_credits_enabled ? `On (${formData.api_credit_group || 'no group'})` : 'Off'],
+    ['gRPC proto file', uploadProto && protoFile ? protoFile.name : '—'],
+  ]
+
   return (
     <Layout>
-      <div className="space-y-6">
+      <div className="space-y-5 max-w-4xl">
         <div className="page-header">
           <div>
             <h1 className="page-title">Add API</h1>
-            <p className="text-gray-600 dark:text-gray-400 mt-1">
-              Define a new API and its default upstream servers
-            </p>
+            <p className="text-gray-600 mt-1">Step {step + 1} of {STEPS.length}: {STEPS[step].hint}</p>
           </div>
-          <Link href="/apis" className="btn btn-secondary">
-            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
-            Back to APIs
-          </Link>
+          <Link href="/apis" className="btn btn-secondary">Cancel</Link>
         </div>
 
-        {error && (
-          <div className="rounded-lg bg-error-50 border border-error-200 p-4 dark:bg-error-900/20 dark:border-error-800">
-            <div className="flex">
-              <svg className="h-5 w-5 text-error-400 dark:text-error-500 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <div className="ml-3">
-                <p className="text-sm text-error-700 dark:text-error-300">{error}</p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Basic Information</h3>
-              <FormHelp docHref="/docs/using-fields.html#apis">Fill API name/version; these form the base path clients call.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              {((formData as any).api_public && (formData as any).api_credits_enabled) && (
-                <div className="rounded-lg bg-warning-50 border border-warning-200 p-3 text-warning-800 dark:bg-warning-900/20 dark:border-warning-800 dark:text-warning-200">
-                  Public + Credits: Anyone can call this API and the group API key will be injected. Per-user deductions/keys are skipped.
-                </div>
-              )}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Public API <InfoTooltip text="Anyone with the URL can call this API. Auth, subscription, and group checks are skipped." /></label>
-                <div className="flex items-center">
-                  <input
-                    id="api_public"
-                    name="api_public"
-                    type="checkbox"
-                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                    checked={(formData as any).api_public || false}
-                    onChange={handleChange}
-                    disabled={loading || ((formData as any).api_credits_enabled === true)}
-                  />
-                  <label htmlFor="api_public" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
-                    Anyone with the URL can call this API
-                  </label>
-                </div>
-                {((formData as any).api_credits_enabled === true) && (
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Disable Credits to change Public status.</p>
-                )}
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Use with care. Authentication, subscriptions, and group checks are skipped.</p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Active</label>
-                <div className="flex items-center">
-                  <input
-                    id="active"
-                    name="active"
-                    type="checkbox"
-                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                    checked={formData.active as any}
-                    onChange={handleChange}
-                    disabled={loading}
-                  />
-                  <label htmlFor="active" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
-                    Enable this API
-                  </label>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div>
-                <label htmlFor="api_name" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  API Name *
-                </label>
-                <input
-                  id="api_name"
-                  name="api_name"
-                  type="text"
-                  required
-                  className="input"
-                  placeholder="e.g., user-service"
-                  value={formData.api_name}
-                  onChange={handleChange}
-                  disabled={loading}
-                />
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  A unique identifier for your API
-                </p>
-              </div>
-
-              <div>
-                <label htmlFor="api_version" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Version *
-                </label>
-                <input
-                  id="api_version"
-                  name="api_version"
-                  type="text"
-                  required
-                  className="input"
-                  placeholder="e.g., v1"
-                  value={formData.api_version}
-                  onChange={handleChange}
-                  disabled={loading}
-                />
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  API version (e.g., v1, v2)
-                </p>
-              </div>
-              </div>
-              <div>
-                <label htmlFor="api_type" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  API Type*
-                </label>
-                <select
-                  id="api_type"
-                  name="api_type"
-                  required
-                  className="input"
-                  value={formData.api_type}
-                  onChange={handleChange}
-                  disabled={loading}
-                >
-                  <option value="REST">REST</option>
-                  <option value="GraphQL">GraphQL</option>
-                  <option value="gRPC">gRPC</option>
-                  <option value="SOAP">SOAP</option>
-                </select>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">The protocol type for this API</p>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Retry Count
-                </label>
-                <input
-                  type="number"
-                  name="api_allowed_retry_count"
-                  className="input"
-                  min={0}
-                  value={formData.api_allowed_retry_count}
-                  onChange={handleChange}
-                  disabled={loading}
-                />
-              </div>
-              <div>
-                <label htmlFor="api_description" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Description</label>
-                <textarea id="api_description" name="api_description" rows={4} className="input resize-none" placeholder="Describe what this API does..." value={formData.api_description} onChange={handleChange} disabled={loading} />
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Optional description of the API's purpose</p>
-              </div>
-            </div>
-              <div>
-                <label htmlFor="api_hostname" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Hostname Routing
-                  <InfoTooltip text="Optional client-facing hostname for transparent routing. Requests with this Host header are routed to this API while preserving the original path and query." />
-                </label>
-                <input
-                  id="api_hostname"
-                  name="api_hostname"
-                  type="text"
-                  className="input"
-                  placeholder="foo.mydomain.com"
-                  value={formData.api_hostname}
-                  onChange={handleChange}
-                  disabled={loading}
-                />
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  Leave blank for the normal Doorman path-based URL.
-                </p>
-              </div>
-          </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">IP Access Control</h3>
-              <FormHelp docHref="/docs/using-fields.html#api-ip-policy">Control IP access per API (whitelist or deny specific IPs/CIDRs).</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              {(() => {
-                const effectiveIp = (((formData as any).api_trust_x_forwarded_for && clientIpXff) ? clientIpXff : clientIp)
-                const listFromText = (t: string) => t.split(/\r?\n|,/).map(s=>s.trim()).filter(Boolean)
-                const wl = listFromText(ipWhitelistText)
-                const bl = listFromText(ipBlacklistText)
-                const isIPv6 = (s: string) => s.includes(':')
-                const toIPv4 = (s: string) => { const parts = s.split('.'); if (parts.length !== 4) return null as any; return parts.reduce((a,p)=> (a<<8n)+(BigInt(parseInt(p,10)&255)),0n) }
-                const expandIPv6 = (ip: string) => { if (ip.indexOf('::') !== -1) { const [head, tail] = ip.split('::'); const headParts = head ? head.split(':') : []; const tailParts = tail ? tail.split(':') : []; const missing = 8 - (headParts.length + tailParts.length); const zeros = Array(Math.max(0, missing)).fill('0'); return [...headParts, ...zeros, ...tailParts].map(h=>h || '0') } return ip.split(':') }
-                const toIPv6 = (s: string) => { const parts = expandIPv6(s); if (parts.length !== 8) return null as any; try { return parts.reduce((acc, h) => (acc<<16n) + BigInt(parseInt(h || '0', 16)), 0n) } catch { return null as any } }
-                const matches = (ip: string, patterns: string[]) => {
-                  if (!ip) return false
-                  const v6 = isIPv6(ip)
-                  const ipVal = v6 ? toIPv6(ip) : toIPv4(ip)
-                  return patterns.some(raw => {
-                    const p = raw.trim(); if (!p) return false
-                    if (p.includes('/')) {
-                      const [net, maskStr] = p.split('/'); const m = parseInt(maskStr,10)
-                      const n6 = isIPv6(net); if (n6 !== v6) return false
-                      const netVal = n6 ? toIPv6(net) : toIPv4(net); if (netVal === null || ipVal === null || isNaN(m as any)) return false
-                      const bits = n6 ? 128 : 32
-                      const shift = BigInt(bits - Math.min(Math.max(m,0), bits))
-                      const mask = ((1n << BigInt(bits)) - 1n) ^ ((1n << shift) - 1n)
-                      return ((ipVal & mask) === (netVal & mask))
-                    }
-                    return p.toLowerCase() === ip.toLowerCase()
-                  })
-                }
-                const warnWL = ((formData as any).api_ip_mode === 'whitelist') && wl.length > 0 && !matches(effectiveIp, wl)
-                const warnBL = matches(effectiveIp, bl)
-                if (!(warnWL || warnBL)) return null
-                return (
-                  <div className="rounded-md bg-warning-50 border border-warning-200 p-3 text-warning-800 dark:bg-warning-900/20 dark:border-warning-800 dark:text-warning-200">
-                    {warnBL ? 'Warning: Your current IP appears in the blacklist and you may lose access after saving.' : 'Warning: Your current IP is not in the whitelist and you may lose access after saving.'}
-                    <div className="text-xs mt-1">Your IP: {effectiveIp || 'unknown'} {((formData as any).api_trust_x_forwarded_for ? '(using X-Forwarded-For)' : '')}</div>
-                  </div>
-                )
-              })()}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Policy</label>
-                  <select name="api_ip_mode" className="input" value={formData.api_ip_mode}
-                    onChange={(e)=>setFormData(p=>({...p, api_ip_mode: e.target.value as any}))}>
-                    <option value="allow_all">Allow All</option>
-                    <option value="whitelist">Whitelist</option>
-                  </select>
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    When set to <span className="font-semibold">Whitelist</span>, only IPs/CIDRs in the whitelist can call this API. The blacklist below is
-                    <span className="font-semibold"> always evaluated first</span> and will deny matching IPs regardless of policy.
-                  </p>
-                </div>
-                <div className="md:col-span-2 flex items-center gap-2">
-                  <input id="api_trust_x_forwarded_for" type="checkbox" className="h-4 w-4" checked={!!(formData as any).api_trust_x_forwarded_for} onChange={(e)=>setFormData(p=>({...p, api_trust_x_forwarded_for: e.target.checked}))} />
-                  <label htmlFor="api_trust_x_forwarded_for" className="text-sm text-gray-700 dark:text-gray-300">Trust X-Forwarded-For (behind proxy)</label>
-                  <InfoTooltip text="If enabled, the effective IP for this API is taken from X-Forwarded-For (first hop) or X-Real-IP when present. Platform 'Trusted Proxies' must include the direct source; otherwise headers are ignored to prevent spoofing." />
-                </div>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <div className="flex items-center justify-between">
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Whitelist (IPs/CIDRs; one per line or comma-separated)</label>
-                    <button type="button" className="btn btn-ghost btn-xs" onClick={addMyIpToWhitelist}>Add My IP</button>
-                  </div>
-                  <textarea
-                    className="input min-h-[120px]"
-                    value={ipWhitelistText}
-                    onChange={(e)=>setIpWhitelistText(e.target.value)}
-                    placeholder={'10.0.0.0/8\n192.168.1.100'}
-                  />
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Used only when Policy is <span className="font-semibold">Whitelist</span>. Clients must match one of these IPs/CIDRs (after global platform IP rules).
-                  </p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Blacklist (IPs/CIDRs; one per line or comma-separated)</label>
-                  <textarea
-                    className="input min-h-[120px]"
-                    value={ipBlacklistText}
-                    onChange={(e)=>setIpBlacklistText(e.target.value)}
-                    placeholder={'203.0.113.0/24\n203.0.113.50'}
-                  />
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Always evaluated first. Any matching IP/CIDR is denied before whitelist or other checks.
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Configuration</h3>
-              <FormHelp docHref="/docs/using-fields.html#api-config">Set credits, auth header mapping, and validations.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Auth Required <InfoTooltip text="When enabled (default), requests must be authenticated and pass subscription/group checks. Disable to allow unauthenticated access (not public)." /></label>
-                <div className="flex items-center">
-                  <input
-                    id="api_auth_required"
-                    name="api_auth_required"
-                    type="checkbox"
-                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                    checked={(formData as any).api_auth_required}
-                    onChange={handleChange}
-                    disabled={loading}
-                  />
-                  <label htmlFor="api_auth_required" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
-                    Require platform auth (JWT) for this API
-                  </label>
-                </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Disable to accept unauthenticated requests. Not public — but subscription/group checks are skipped without auth.</p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Anonymous Access
-                  <InfoTooltip text="Allow unauthenticated requests to use an anonymous identity keyed by client IP, such as anon:203.0.113.42. Requires Auth Required to be disabled." />
-                </label>
-                <div className="flex items-center">
-                  <input
-                    id="api_anonymous_allowed"
-                    name="api_anonymous_allowed"
-                    type="checkbox"
-                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                    checked={formData.api_anonymous_allowed}
-                    onChange={handleChange}
-                    disabled={loading || formData.api_auth_required}
-                  />
-                  <label htmlFor="api_anonymous_allowed" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
-                    Track unauthenticated callers as anonymous users by IP
-                  </label>
-                </div>
-                {formData.api_auth_required && (
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Disable Auth Required to enable anonymous access.</p>
-                )}
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Credits Enabled
-                  <InfoTooltip text="When enabled, each request to this API deducts credits before proxying. Note: Public APIs skip credit deductions and per-user keys." />
-                </label>
-                <div className="flex items-center">
-                  <input
-                    id="api_credits_enabled"
-                    name="api_credits_enabled"
-                    type="checkbox"
-                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                    checked={formData.api_credits_enabled}
-                    onChange={handleChange}
-                    disabled={loading || ((formData as any).api_public === true)}
-                  />
-                  <label htmlFor="api_credits_enabled" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
-                    Enable API credits
-                  </label>
-                </div>
-                {((formData as any).api_public === true) && (
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Disable Public to enable Credits.</p>
-                )}
-              </div>
-              {formData.api_credits_enabled && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Credit Group
-                    <InfoTooltip text="Configured credit group (e.g., ai-basic). Determines the API key header injected. Per-user keys apply only when Auth Required is enabled." />
-                  </label>
-                  <input
-                    type="text"
-                    name="api_credit_group"
-                    className="input"
-                    placeholder="ai-group-1"
-                    value={formData.api_credit_group}
-                    onChange={handleChange}
-                    disabled={loading}
-                  />
-                </div>
-              )}
-              {formData.api_credits_enabled && formData.api_anonymous_allowed && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Anonymous Credit Group
-                    <InfoTooltip text="Optional credit group used for anonymous callers. If blank, anonymous callers use the API Credit Group." />
-                  </label>
-                  <input
-                    type="text"
-                    name="api_anonymous_credit_group"
-                    className="input"
-                    placeholder={formData.api_credit_group || 'foo-anon'}
-                    value={formData.api_anonymous_credit_group}
-                    onChange={handleChange}
-                    disabled={loading}
-                  />
-                </div>
-              )}
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Authorization Field Swap
-                  <InfoTooltip text="Map inbound Authorization header into a different header name expected by the upstream service. Example: X-Api-Key." />
-                </label>
-                <input type="text" name="api_authorization_field_swap" className="input" placeholder="backend-auth-header" value={formData.api_authorization_field_swap} onChange={handleChange} disabled={loading} />
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Servers</h3>
-              <FormHelp docHref="/docs/using-fields.html#servers">Add one or more upstream base URLs used for proxying.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                API Servers
-                <InfoTooltip text="Base URLs for upstreams. Include scheme and port. Example: http://localhost:8080" />
-              </label>
-              <div className="flex gap-2">
-                <input type="text" className="input flex-1" placeholder="e.g., http://localhost:8080" value={newServer} onChange={(e) => setNewServer(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && addServer()} disabled={loading} />
-                <button type="button" onClick={addServer} className="btn btn-secondary" disabled={loading}>Add</button>
-              </div>
-              <div className="mt-2 space-y-2">
-                {formData.api_servers.map((srv, idx) => (
-                  <div key={idx} className="flex items-center justify-between bg-gray-100 dark:bg-gray-800 px-3 py-2 rounded">
-                    <span className="text-sm font-mono text-gray-800 dark:text-gray-200">{srv}</span>
-                    <button type="button" onClick={() => removeServer(idx)} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
-                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                    </button>
-                  </div>
-                ))}
-                {formData.api_servers.length === 0 && (
-                  <p className="text-xs text-gray-500 dark:text-gray-400">No servers added yet</p>
-                )}
-              </div>
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">These are the default upstreams for this API. You can override per-endpoint later.</p>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Allowed Roles</h3>
-              <FormHelp docHref="/docs/using-fields.html#access-control">Grant access by platform roles and groups.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Allowed Roles
-                  <InfoTooltip text="Only enforced when Auth Required is enabled. Users must have any of these platform roles." />
-                </label>
-                <SearchableSelect
-                  value={newRole}
-                  onChange={setNewRole}
-                  onAdd={addRole}
-                  onKeyPress={(e) => e.key === 'Enter' && addRole()}
-                  placeholder="Select role"
-                  fetchOptions={fetchRoles}
-                  disabled={loading}
-                  addButtonText="Add"
-                  restrictToOptions
-                />
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {formData.api_allowed_roles.map((r, i) => (
-                    <div key={i} className="flex items-center gap-2 bg-blue-100 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200 px-3 py-1 rounded-full">
-                      <span className="text-sm">{r}</span>
-                      <button type="button" onClick={() => removeRole(i)} className="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-200">
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="1 1 22 22">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Allowed Groups</h3>
-              <FormHelp docHref="/docs/using-fields.html#access-control">Restrict by user groups; use ALL to allow any group.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Allowed Groups
-                  <InfoTooltip text="Only enforced when Auth Required is enabled. User must belong to any listed group (e.g., ALL)." />
-                </label>
-                <SearchableSelect
-                  value={newGroup}
-                  onChange={setNewGroup}
-                  onAdd={addGroup}
-                  onKeyPress={(e) => e.key === 'Enter' && addGroup()}
-                  placeholder="Select group"
-                  fetchOptions={fetchGroups}
-                  disabled={loading}
-                  addButtonText="Add"
-                  restrictToOptions
-                />
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {formData.api_allowed_groups.map((g, i) => (
-                    <div key={i} className="flex items-center gap-2 bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-200 px-3 py-1 rounded-full">
-                      <span className="text-sm">{g}</span>
-                      <button type="button" onClick={() => removeGroup(i)} className="text-green-600 hover:text-green-800 dark:text-green-400 dark:hover:text-green-200">
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="1 1 22 22">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-              <div className="card-header flex items-center justify-between">
-              <h3 className="card-title">Allowed Headers</h3>
-              <FormHelp docHref="/docs/using-fields.html#header-forwarding">Choose which upstream response headers are forwarded.</FormHelp>
-            </div>
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Allowed Headers
-                  <InfoTooltip text={
-                    formData.api_type === 'SOAP'
-                      ? 'Response headers from upstream that Doorman may forward back to the client. Use lowercase names; examples: x-rate-limit, retry-after. Note: For SOAP APIs, Doorman auto-allows common request headers (Content-Type, SOAPAction, Accept, User-Agent), so you typically do not need to add them.'
-                      : 'Response headers from upstream that Doorman may forward back to the client. Use lowercase names; examples: x-rate-limit, retry-after.'
-                  } />
-                </label>
-                <div className="flex gap-2">
-                  <input type="text" className="input flex-1" placeholder="e.g., Authorization" value={newHeader} onChange={(e) => setNewHeader(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && addHeader()} disabled={loading} />
-                  <button type="button" onClick={addHeader} className="btn btn-secondary" disabled={loading}>Add</button>
-                </div>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {formData.api_allowed_headers.map((h, i) => (
-                    <div key={i} className="flex items-center gap-2 bg-purple-100 dark:bg-purple-900/20 text-purple-800 dark:text-purple-200 px-3 py-1 rounded-full">
-                      <span className="text-sm">{h}</span>
-                      <button type="button" onClick={() => removeHeader(i)} className="text-purple-600 hover:text-purple-800 dark:text-purple-400 dark:hover:text-purple-200">
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="1 1 22 22">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header">
-              <h3 className="card-title">gRPC Proto Configuration (Optional)</h3>
-              <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Upload a Protocol Buffer definition for gRPC APIs</p>
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="flex items-center gap-3 p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
-                <input
-                  type="checkbox"
-                  id="upload_proto"
-                  checked={uploadProto}
-                  onChange={(e) => {
-                    setUploadProto(e.target.checked)
-                    if (!e.target.checked) setProtoFile(null)
-                  }}
-                  className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                />
-                <label htmlFor="upload_proto" className="flex-1 cursor-pointer">
-                  <p className="font-medium text-gray-900 dark:text-white">Upload Proto File</p>
-                  <p className="text-sm text-gray-600 dark:text-gray-400">
-                    Enable gRPC support by uploading a .proto file after API creation
-                  </p>
-                </label>
-              </div>
-
-              {uploadProto && (
-                <div className="space-y-3">
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Select Proto File
-                  </label>
-                  <div className="flex items-center gap-3">
-                    <label className="btn btn-secondary cursor-pointer">
-                      <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                      </svg>
-                      Choose File
-                      <input
-                        type="file"
-                        accept=".proto,text/plain"
-                        style={{ display: 'none' }}
-                        onChange={(e) => {
-                          const file = e.target.files?.[0]
-                          if (file) {
-                            if (!file.name.endsWith('.proto')) {
-                              alert('Please select a .proto file')
-                              e.target.value = ''
-                              return
-                            }
-                            setProtoFile(file)
-                          }
-                        }}
-                      />
-                    </label>
-                    {protoFile && (
-                      <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                        <svg className="h-5 w-5 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                        <span className="font-medium">{protoFile.name}</span>
-                        <button
-                          type="button"
-                          onClick={() => setProtoFile(null)}
-                          className="text-error-600 hover:text-error-800 dark:text-error-400"
-                        >
-                          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                          </svg>
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">
-                    The proto file will be uploaded and compiled automatically after the API is created successfully.
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="flex gap-4">
-              <button
-                type="submit"
-                disabled={loading}
-                className="btn btn-primary flex-1"
-              >
-                {loading ? (
-                  <div className="flex items-center justify-center">
-                    <div className="spinner mr-2"></div>
-                    Creating API...
-                  </div>
-                ) : (
-                  'Create API'
-                )}
+        <ol className="flex items-center gap-2" aria-label="Progress">
+          {STEPS.map((s, i) => (
+            <li key={s.id} className="flex flex-1 items-center gap-2">
+              <button type="button" onClick={() => jump(i)} aria-current={i === step ? 'step' : undefined}
+                className={`flex w-full items-center gap-2 rounded border px-3 py-2 text-left text-sm ${i === step ? 'border-primary-600 bg-primary-50 text-gray-900' : i < step ? 'border-gray-300 bg-white text-gray-700' : 'border-gray-200 bg-white text-gray-500'}`}>
+                <span className={`flex h-5 w-5 flex-none items-center justify-center rounded-full text-xs font-semibold ${i === step ? 'bg-primary-600 text-white' : i < step ? 'bg-gray-700 text-white' : 'bg-gray-200 text-gray-600'}`}>{i < step ? '✓' : i + 1}</span>
+                <span className="font-medium">{s.title}</span>
               </button>
-              <Link href="/apis" className="btn btn-secondary flex-1">
-                Cancel
-              </Link>
+            </li>
+          ))}
+        </ol>
+
+        {error && <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{error}</div>}
+
+        <form onSubmit={(e) => { e.preventDefault(); if (isLast) handleSubmit(); else goNext() }} className="card space-y-6 !p-6">
+          {step === 0 && (
+            <Section title="Basics" description="These identify the API and form the base path clients call, e.g. /name/version.">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <Field label="API name" htmlFor="api_name" required hint="Unique identifier, e.g. user-service">
+                  <input id="api_name" name="api_name" type="text" className="input" placeholder="user-service" value={formData.api_name} onChange={handleChange} disabled={loading} autoFocus />
+                </Field>
+                <Field label="Version" htmlFor="api_version" required hint="e.g. v1, v2">
+                  <input id="api_version" name="api_version" type="text" className="input" placeholder="v1" value={formData.api_version} onChange={handleChange} disabled={loading} />
+                </Field>
+              </div>
+              <Field label="Protocol" htmlFor="api_type" hint="The protocol this API speaks to its upstream servers.">
+                <select id="api_type" name="api_type" className="input md:w-1/2" value={formData.api_type} onChange={handleChange} disabled={loading}>
+                  <option value="REST">REST</option><option value="GraphQL">GraphQL</option><option value="gRPC">gRPC</option><option value="SOAP">SOAP</option>
+                </select>
+              </Field>
+              <Field label="Description" htmlFor="api_description" hint="Optional. Shown in the API list.">
+                <textarea id="api_description" name="api_description" rows={3} className="input resize-none" placeholder="What does this API do?" value={formData.api_description} onChange={handleChange} disabled={loading} />
+              </Field>
+              <Toggle id="active" name="active" checked={!!formData.active} onChange={handleChange} disabled={loading} title="Enable this API" description="Disabled APIs reject all requests until switched on." />
+            </Section>
+          )}
+
+          {step === 1 && (<>
+            <Section title="Upstream servers" description="Base URLs that requests are proxied to. You can override these per endpoint later.">
+              <Field label="Server URL" hint="Include scheme and port, e.g. http://localhost:8080. Press Enter to add." tip="Base URLs for upstreams. Include scheme and port.">
+                <div className="flex gap-2">
+                  <input type="text" className="input flex-1" placeholder="http://localhost:8080" value={newServer} onChange={(e) => setNewServer(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addServer() } }} disabled={loading} />
+                  <button type="button" onClick={addServer} className="btn btn-secondary" disabled={loading}>Add server</button>
+                </div>
+              </Field>
+              <div className="flex flex-wrap gap-2">
+                {formData.api_servers.map((srv, idx) => <Chip key={idx} text={srv} onRemove={() => removeServer(idx)} />)}
+                {formData.api_servers.length === 0 && <p className="text-xs text-gray-500">No servers added yet.</p>}
+              </div>
+            </Section>
+            <Section title="Routing and requests">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <Field label="Custom hostname (optional)" htmlFor="api_hostname" tip="Requests with this Host header are routed to this API, preserving the original path and query." hint="Leave blank to use the standard path-based URL.">
+                  <input id="api_hostname" name="api_hostname" type="text" className="input" placeholder="api.example.com" value={formData.api_hostname} onChange={handleChange} disabled={loading} />
+                </Field>
+                <Field label="Retry attempts" htmlFor="api_allowed_retry_count" hint="Retries on upstream failure. 0 disables retries.">
+                  <input id="api_allowed_retry_count" type="number" name="api_allowed_retry_count" className="input" min={0} value={formData.api_allowed_retry_count} onChange={handleChange} disabled={loading} />
+                </Field>
+              </div>
+              <Field label="Forward Authorization as header (optional)" htmlFor="api_authorization_field_swap" tip="Copies the inbound Authorization header into a different header name expected by the upstream, e.g. X-Api-Key." hint="Header name the upstream expects instead of Authorization.">
+                <input id="api_authorization_field_swap" type="text" name="api_authorization_field_swap" className="input md:w-1/2" placeholder="X-Api-Key" value={formData.api_authorization_field_swap} onChange={handleChange} disabled={loading} />
+              </Field>
+            </Section>
+            {formData.api_type === 'gRPC' && (
+              <Section title="gRPC proto file (optional)" description="Uploaded and compiled automatically after the API is created.">
+                <Toggle id="upload_proto" name="upload_proto" checked={uploadProto} onChange={(e) => { setUploadProto(e.target.checked); if (!e.target.checked) setProtoFile(null) }} title="Upload a .proto file" />
+                {uploadProto && (
+                  <div className="flex items-center gap-3">
+                    <label className="btn btn-secondary cursor-pointer">Choose file
+                      <input type="file" accept=".proto,text/plain" style={{ display: 'none' }} onChange={(e) => {
+                        const file = e.target.files?.[0]
+                        if (file) {
+                          if (!file.name.endsWith('.proto')) { alert('Please select a .proto file'); e.target.value = ''; return }
+                          setProtoFile(file)
+                        }
+                      }} />
+                    </label>
+                    {protoFile && <span className="text-sm">{protoFile.name} <button type="button" className="ml-2 text-red-700" onClick={() => setProtoFile(null)}>Remove</button></span>}
+                  </div>
+                )}
+              </Section>
+            )}
+          </>)}
+
+          {step === 2 && (<>
+            <Section title="Authentication" description="Controls whether callers must sign in.">
+              <Toggle id="api_auth_required" name="api_auth_required" checked={!!formData.api_auth_required} onChange={handleChange} disabled={loading} title="Require authentication" description="Callers must present a valid platform token and pass subscription and group checks." />
+              <Toggle id="api_anonymous_allowed" name="api_anonymous_allowed" checked={!!formData.api_anonymous_allowed} onChange={handleChange} disabled={loading || !!formData.api_auth_required} title="Allow anonymous access" description={formData.api_auth_required ? 'Turn off “Require authentication” to enable.' : 'Unauthenticated callers are tracked as anonymous users by IP.'} />
+              {fd.api_public && fd.api_credits_enabled && <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">Public + credits: anyone can call this API and the group API key is injected. Per-user deductions are skipped.</div>}
+              <Toggle id="api_public" name="api_public" checked={!!fd.api_public} onChange={handleChange} disabled={loading || fd.api_credits_enabled === true} title="Public access" description={fd.api_credits_enabled ? 'Turn off credits to change this.' : 'Anyone with the URL can call this API. Authentication, subscription and group checks are skipped. Use with care.'} />
+            </Section>
+            <Section title="Who can call it" description="Enforced only when authentication is required.">
+              <Field label="Allowed groups" tip="Users must belong to at least one listed group. ALL allows any group." hint="Add ALL to allow every group.">
+                <SearchableSelect value={newGroup} onChange={setNewGroup} onAdd={addGroup} onKeyPress={(e) => e.key === 'Enter' && addGroup()} placeholder="Select a group" fetchOptions={fetchGroups} disabled={loading} addButtonText="Add" restrictToOptions />
+                <div className="mt-2 flex flex-wrap gap-2">{formData.api_allowed_groups.map((g, i) => <Chip key={i} text={g} onRemove={() => removeGroup(i)} />)}</div>
+              </Field>
+              <Field label="Allowed roles" tip="Users must have at least one listed platform role." hint="Leave empty to allow any role.">
+                <SearchableSelect value={newRole} onChange={setNewRole} onAdd={addRole} onKeyPress={(e) => e.key === 'Enter' && addRole()} placeholder="Select a role" fetchOptions={fetchRoles} disabled={loading} addButtonText="Add" restrictToOptions />
+                <div className="mt-2 flex flex-wrap gap-2">{formData.api_allowed_roles.map((r, i) => <Chip key={i} text={r} onRemove={() => removeRole(i)} />)}</div>
+              </Field>
+            </Section>
+          </>)}
+
+          {step === 3 && (<>
+            <Section title="IP access control" description="Optional network restrictions for this API.">
+              {ipWarning && <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">{ipWarning.text}<div className="text-xs mt-1">Your IP: {ipWarning.ip}{ipWarning.xff ? ' (from X-Forwarded-For)' : ''}</div></div>}
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <Field label="Access policy" htmlFor="api_ip_mode" hint="With “Allow list only”, only listed IPs can call this API. The blocked list is always checked first.">
+                  <select id="api_ip_mode" name="api_ip_mode" className="input" value={formData.api_ip_mode} onChange={(e) => setFormData(p => ({ ...p, api_ip_mode: e.target.value as any }))}>
+                    <option value="allow_all">Allow all</option><option value="whitelist">Allow list only</option>
+                  </select>
+                </Field>
+                <Toggle id="api_trust_x_forwarded_for" name="api_trust_x_forwarded_for" checked={!!formData.api_trust_x_forwarded_for} onChange={(e) => setFormData(p => ({ ...p, api_trust_x_forwarded_for: e.target.checked }))} title="Trust X-Forwarded-For" description="Use when Doorman is behind a proxy. The proxy must be in the platform's trusted proxies." />
+              </div>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <Field label="Allowed IPs / CIDRs" hint="One per line or comma-separated. Used only with “Allow list only”.">
+                  <textarea className="input min-h-[110px]" value={ipWhitelistText} onChange={(e) => setIpWhitelistText(e.target.value)} placeholder={'10.0.0.0/8\n192.168.1.100'} />
+                  <button type="button" className="btn btn-ghost btn-xs mt-1" onClick={addMyIpToWhitelist}>Add my IP</button>
+                </Field>
+                <Field label="Blocked IPs / CIDRs" hint="Always checked first; matches are denied.">
+                  <textarea className="input min-h-[110px]" value={ipBlacklistText} onChange={(e) => setIpBlacklistText(e.target.value)} placeholder={'203.0.113.0/24\n203.0.113.50'} />
+                </Field>
+              </div>
+            </Section>
+            <Section title="Forwarded response headers" description="Upstream response headers Doorman may pass back to the client.">
+              <Field label="Header name" tip={formData.api_type === 'SOAP' ? 'Use lowercase names, e.g. x-rate-limit, retry-after. For SOAP, common request headers (Content-Type, SOAPAction, Accept, User-Agent) are allowed automatically.' : 'Use lowercase names, e.g. x-rate-limit, retry-after.'}>
+                <div className="flex gap-2">
+                  <input type="text" className="input flex-1" placeholder="x-rate-limit" value={newHeader} onChange={(e) => setNewHeader(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addHeader() } }} disabled={loading} />
+                  <button type="button" onClick={addHeader} className="btn btn-secondary" disabled={loading}>Add header</button>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2">{formData.api_allowed_headers.map((h, i) => <Chip key={i} text={h} onRemove={() => removeHeader(i)} />)}</div>
+              </Field>
+            </Section>
+            <Section title="Credits" description="Charge credits for each request.">
+              <Toggle id="api_credits_enabled" name="api_credits_enabled" checked={!!formData.api_credits_enabled} onChange={handleChange} disabled={loading || fd.api_public === true} title="Charge credits per request" description={fd.api_public ? 'Turn off public access to enable.' : 'Each request deducts credits before it is proxied.'} />
+              {formData.api_credits_enabled && (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Field label="Credit group" htmlFor="api_credit_group" tip="Determines which API key header is injected, e.g. ai-basic.">
+                    <input id="api_credit_group" type="text" name="api_credit_group" className="input" placeholder="ai-group-1" value={formData.api_credit_group} onChange={handleChange} disabled={loading} />
+                  </Field>
+                  {formData.api_anonymous_allowed && (
+                    <Field label="Anonymous credit group (optional)" htmlFor="api_anonymous_credit_group" hint="Defaults to the credit group.">
+                      <input id="api_anonymous_credit_group" type="text" name="api_anonymous_credit_group" className="input" placeholder={formData.api_credit_group || 'anon-group'} value={formData.api_anonymous_credit_group} onChange={handleChange} disabled={loading} />
+                    </Field>
+                  )}
+                </div>
+              )}
+            </Section>
+          </>)}
+
+          {step === 4 && (
+            <Section title="Review" description="Check the details below. After you create the API you can add its endpoints right away.">
+              <dl className="divide-y divide-gray-100 rounded border border-gray-200">
+                {reviewRows.map(([k, v]) => <div key={k} className="grid grid-cols-3 gap-4 px-4 py-2 text-sm"><dt className="text-gray-500">{k}</dt><dd className="col-span-2 break-words text-gray-900">{v}</dd></div>)}
+              </dl>
+              {formData.api_servers.length === 0 && <p className="text-sm text-amber-800">No upstream servers are set. Requests will fail until you add one.</p>}
+            </Section>
+          )}
+
+          <div className="flex items-center justify-between border-t border-gray-200 pt-4">
+            <button type="button" className="btn btn-secondary" onClick={goBack} disabled={step === 0 || loading}>Back</button>
+            {isLast ? (
+              <button type="submit" disabled={loading || !nameOk} className="btn btn-primary">{loading ? 'Creating…' : 'Create API and add endpoints'}</button>
+            ) : (
+              <button type="submit" className="btn btn-primary" disabled={loading}>Continue</button>
+            )}
           </div>
         </form>
       </div>

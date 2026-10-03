@@ -39,6 +39,7 @@ services:
       WEB_PORT: 3000
     restart: "no"
     network_mode: "host"
+    networks: !reset []
     volumes:
       - type: tmpfs
         target: /app/data

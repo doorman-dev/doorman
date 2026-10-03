@@ -10,7 +10,7 @@ interface LayoutProps { children: React.ReactNode }
 interface MenuItem { label: string; href: string; permission?: string }
 
 const menuItems: MenuItem[] = [
-  { label: 'Dashboard', href: '/dashboard' }, { label: 'Analytics', href: '/analytics', permission: 'view_analytics' }, { label: 'Logs', href: '/logging', permission: 'view_logs' }, { label: 'APIs', href: '/apis', permission: 'manage_apis' }, { label: 'Documentation', href: '/documentation' }, { label: 'Users', href: '/users', permission: 'manage_users' }, { label: 'Groups', href: '/groups', permission: 'manage_groups' }, { label: 'Roles', href: '/roles', permission: 'manage_roles' }, { label: 'Subscriptions', href: '/authorizations', permission: 'manage_subscriptions' }, { label: 'Credits', href: '/credits', permission: 'manage_credits' }, { label: 'Tiers', href: '/tiers', permission: 'manage_tiers' }, { label: 'Routings', href: '/routings', permission: 'manage_routings' }, { label: 'Auth Control', href: '/auth-admin', permission: 'manage_auth' }, { label: 'Security', href: '/security', permission: 'manage_security' }, { label: 'TLS', href: '/tls', permission: 'manage_security' }, { label: 'Tools', href: '/tools', permission: 'manage_security' }, { label: 'Import / Export', href: '/import-export', permission: 'manage_gateway' }, { label: 'Settings', href: '/settings' },
+  { label: 'Dashboard', href: '/dashboard' }, { label: 'Analytics', href: '/analytics', permission: 'view_analytics' }, { label: 'Logs', href: '/logging', permission: 'view_logs' }, { label: 'APIs', href: '/apis', permission: 'manage_apis' }, { label: 'Documentation', href: '/documentation' }, { label: 'Users', href: '/users', permission: 'manage_users' }, { label: 'Groups', href: '/groups', permission: 'manage_groups' }, { label: 'Roles', href: '/roles', permission: 'manage_roles' }, { label: 'Subscriptions', href: '/authorizations', permission: 'manage_subscriptions' }, { label: 'Credits', href: '/credits', permission: 'manage_credits' }, { label: 'Tiers', href: '/tiers', permission: 'manage_tiers' }, { label: 'Routings', href: '/routings', permission: 'manage_routings' }, { label: 'Security', href: '/security', permission: 'manage_security' }, { label: 'TLS', href: '/tls', permission: 'manage_security' }, { label: 'Tools', href: '/tools', permission: 'manage_security' }, { label: 'Settings', href: '/settings' },
 ]
 
 export default function Layout({ children }: LayoutProps) {
@@ -38,6 +38,7 @@ export default function Layout({ children }: LayoutProps) {
   
   const filteredMenuItems = menuItems.filter(item => {
     if (item.href === '/logging' && !logsEnabled) return false
+    if (item.href === '/tools') return !!(permissions?.manage_security || permissions?.manage_gateway)
     return !item.permission || permissions?.[item.permission]
   })
   const isActive = (href: string) => pathname === href || (href !== '/dashboard' && pathname.startsWith(`${href}/`))

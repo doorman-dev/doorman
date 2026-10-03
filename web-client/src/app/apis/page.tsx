@@ -39,6 +39,7 @@ const APIsPage = () => {
   const [hasNext, setHasNext] = useState(false)
   const [ignorePagingAllCache, setIgnorePagingAllCache] = useState<API[] | null>(null)
   const [backendIgnoresPaging, setBackendIgnoresPaging] = useState(false)
+  const [selected, setSelected] = useState<API | null>(null)
 
   useEffect(() => {
     fetchApis()
@@ -224,6 +225,7 @@ const APIsPage = () => {
           </div>
         ) : (
           /* APIs Table */
+          <div className="signal-split"><div className="signal-split-main">
           <SignalPanel tone="white" title="Configured APIs" kicker="Gateway registry">
               <SignalTable>
                 <thead>
@@ -240,8 +242,9 @@ const APIsPage = () => {
                   {apis.map((api, index) => (
                     <tr
                       key={String(api.api_id) || `${api.api_name}-${api.api_version}-${index}`}
-                      onClick={() => handleApiClick(api)}
-                      className="group cursor-pointer hover:bg-gray-50 dark:hover:bg-dark-surfaceHover transition-colors"
+                      onClick={() => setSelected(selected && selected.api_id === api.api_id ? null : api)}
+                      aria-selected={selected?.api_id === api.api_id}
+                      className={`group cursor-pointer transition-colors ${selected?.api_id === api.api_id ? 'signal-row-selected' : ''}`}
                     >
                       <td data-label="API">
                         <div className="flex items-center">
@@ -345,6 +348,27 @@ const APIsPage = () => {
               <SignalEmptyState title="No APIs found" action={<SignalPrimaryLink href="/apis/add">Add API</SignalPrimaryLink>}>{searchTerm ? 'Try adjusting your search terms.' : 'Get started by creating your first API.'}</SignalEmptyState>
             )}
           </SignalPanel>
+          </div>
+          {selected && (
+            <aside className="signal-detail-pane" aria-label="API details">
+              <div className="flex items-start justify-between gap-2">
+                <div><h3>{selected.api_name}</h3><p className="signal-detail-sub">v{selected.api_version} · {selected.api_type}</p></div>
+                <button className="signal-detail-close" onClick={() => setSelected(null)} aria-label="Close details">×</button>
+              </div>
+              <dl>
+                <div><dt>API ID</dt><dd>{selected.api_id}</dd></div>
+                <div><dt>Type</dt><dd>{selected.api_type}</dd></div>
+                <div><dt>Version</dt><dd>{selected.api_version}</dd></div>
+                <div><dt>Servers</dt><dd>{selected.api_servers && selected.api_servers.length ? selected.api_servers.join(', ') : '—'}</dd></div>
+                <div><dt>Description</dt><dd>{selected.api_description || '—'}</dd></div>
+              </dl>
+              <div className="flex flex-col gap-2 mt-4">
+                <button className="btn btn-primary" onClick={() => handleApiClick(selected)}>Open API</button>
+                <button className="btn" onClick={(e) => handleViewEndpoints(e, selected)}>View endpoints</button>
+              </div>
+            </aside>
+          )}
+          </div>
         )}
       </div>
     </Layout>

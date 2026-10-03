@@ -10,11 +10,11 @@ export default {
   theme: {
     extend: {
       colors: {
-        signal: { ink: '#19201c', warm: '#f3f1e8', lime: '#e1e783', blue: '#a9ced8', terra: '#d87458', mist: '#65756c' },
+        signal: { ink: '#111827', warm: '#f6f7f9', lime: '#dbeafe', blue: '#eff6ff', terra: '#2563eb', mist: '#6b7280' },
         // Kept as aliases so existing page behavior can be restyled without changing markup.
         primary: {
-          50: '#f7f8cf', 100: '#eef2a7', 200: '#e1e783', 300: '#d2dc68', 400: '#bfcc51',
-          500: '#a6b53f', 600: '#8a9930', 700: '#6e7a25', 800: '#53601d', 900: '#394315', 950: '#19201c',
+          50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa',
+          500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a', 950: '#172554',
         },
         blue: {
           50: '#DEEBFF',
