@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import Layout from '@/components/Layout'
 import { SERVER_URL } from '@/utils/config'
-import { getJson } from '@/utils/api'
+import { getJson, postJson } from '@/utils/api'
 import ConfirmModal from '@/components/ConfirmModal'
 import {
   SignalBreadcrumbs,
@@ -14,7 +14,6 @@ import {
   SignalMethodFilter,
   SignalPageHeader,
   SignalPanel,
-  SignalPrimaryLink,
   SignalSearchInput,
   SignalTable
 } from '@/components/signal/Signal'
@@ -260,6 +259,46 @@ export default function ApiEndpointsPage() {
   const [deleteConfirmation, setDeleteConfirmation] = useState('')
   const [endpointToDelete, setEndpointToDelete] = useState<EndpointItem | null>(null)
   const [methodFilter, setMethodFilter] = useState('ALL')
+  const [adding, setAdding] = useState(false)
+  const [draft, setDraft] = useState({ method: 'GET', uri: '', clientUri: '', description: '' })
+  const [draftBusy, setDraftBusy] = useState(false)
+  const [draftError, setDraftError] = useState<string | null>(null)
+  const draftUriRef = React.useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    try { if (new URLSearchParams(window.location.search).get('add') === '1') setAdding(true) } catch {}
+  }, [])
+  useEffect(() => { if (adding) draftUriRef.current?.focus() }, [adding])
+
+  const submitDraft = async (keepOpen: boolean) => {
+    const uri = draft.uri.trim()
+    if (!uri) { setDraftError('Enter a URI for the endpoint.'); draftUriRef.current?.focus(); return }
+    setDraftBusy(true); setDraftError(null)
+    try {
+      const body: any = {
+        api_name: apiName,
+        api_version: apiVersion,
+        endpoint_method: draft.method,
+        endpoint_uri: uri.startsWith('/') ? uri : '/' + uri,
+        endpoint_description: draft.description.trim() || `${draft.method} ${uri}`
+      }
+      if (draft.clientUri.trim()) body.client_uri = draft.clientUri.trim()
+      await postJson(`${SERVER_URL}/platform/endpoint`, body)
+      setSuccess(`Added ${draft.method} ${body.endpoint_uri}`)
+      setTimeout(() => setSuccess(null), 2000)
+      setDraft(d => ({ ...d, uri: '', clientUri: '', description: '' }))
+      await loadEndpoints()
+      if (keepOpen) draftUriRef.current?.focus(); else setAdding(false)
+    } catch (e: any) {
+      setDraftError(e?.message || 'Failed to add endpoint')
+    } finally {
+      setDraftBusy(false)
+    }
+  }
+  const draftKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitDraft(true) }
+    if (e.key === 'Escape') { setAdding(false); setDraftError(null) }
+  }
 
   const methodCounts = useMemo(() => {
     const counts: Record<string, number> = { ALL: allEndpoints.length }
@@ -443,9 +482,9 @@ export default function ApiEndpointsPage() {
           description="Create, edit, and delete endpoints. Precedence: Routing (client-key) → Endpoint servers → API servers."
           actions={
             <div className="flex gap-2">
-              <SignalPrimaryLink href={`/apis/${encodeURIComponent(apiId)}/endpoints/add`}>
+              <button type="button" className="signal-button signal-button--primary" onClick={() => setAdding(true)} disabled={adding}>
                 Add Endpoint
-              </SignalPrimaryLink>
+              </button>
               <Link href={`/apis/${encodeURIComponent(apiId)}`} className="signal-button btn-secondary">
                 Back to API
               </Link>
@@ -514,17 +553,37 @@ export default function ApiEndpointsPage() {
               </tr>
             </thead>
             <tbody>
+              {adding && (<>
+                <tr className="signal-draft-row">
+                  <td></td>
+                  <td>
+                    <select className="input" aria-label="Method" value={draft.method} onChange={e => setDraft(d => ({ ...d, method: e.target.value }))} disabled={draftBusy}>
+                      {['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  </td>
+                  <td><input ref={draftUriRef} className="input" aria-label="Backend URI" placeholder="/backend/path/{id}" value={draft.uri} onChange={e => setDraft(d => ({ ...d, uri: e.target.value }))} onKeyDown={draftKey} disabled={draftBusy} /></td>
+                  <td><input className="input" aria-label="Client URI" placeholder="Same as backend" value={draft.clientUri} onChange={e => setDraft(d => ({ ...d, clientUri: e.target.value }))} onKeyDown={draftKey} disabled={draftBusy} /></td>
+                  <td><input className="input" aria-label="Description" placeholder="Description (optional)" value={draft.description} onChange={e => setDraft(d => ({ ...d, description: e.target.value }))} onKeyDown={draftKey} disabled={draftBusy} /></td>
+                  <td className="text-xs text-gray-500">Default</td>
+                  <td className="text-xs text-gray-500">API servers</td>
+                  <td>
+                    <div className="flex gap-1">
+                      <button type="button" className="btn btn-primary btn-xs" onClick={() => submitDraft(true)} disabled={draftBusy} title="Add and start another (Enter)">{draftBusy ? '…' : 'Add'}</button>
+                      <button type="button" className="btn btn-ghost btn-xs" onClick={() => { setAdding(false); setDraftError(null) }} disabled={draftBusy} aria-label="Cancel">✕</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr className="signal-draft-hint"><td></td><td colSpan={7} className="text-xs text-gray-500">{draftError ? <span className="text-red-700">{draftError}</span> : 'Press Enter to add and keep going; Esc or ✕ to close. Use {param} for path variables. Upstream servers can be overridden per endpoint after adding.'}</td></tr>
+              </>)}
               {loading ? (
                 <tr><td colSpan={8} className="text-center py-8 font-mono text-sm text-signal-mist">Loading endpoints...</td></tr>
-              ) : filtered.length === 0 ? (
+              ) : filtered.length === 0 && adding ? null : filtered.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="p-0">
                     <SignalEmptyState
                       title="No Endpoints Found"
                       action={
-                        <SignalPrimaryLink href={`/apis/${encodeURIComponent(apiId)}/endpoints/add`}>
-                          Add Endpoint
-                        </SignalPrimaryLink>
+                        <button type="button" className="signal-button signal-button--primary" onClick={() => setAdding(true)}>Add Endpoint</button>
                       }
                     >
                       {searchTerm || methodFilter !== 'ALL' ? 'Try adjusting your search terms or method filter.' : 'Get started by creating your first endpoint for this API.'}
@@ -548,7 +607,7 @@ export default function ApiEndpointsPage() {
                             </button>
                           </td>
                           <td>
-                            <span className={`badge ${ep.endpoint_method === 'GET' ? 'badge-success' : ep.endpoint_method === 'POST' ? 'badge-primary' : 'badge-warning'}`}>{ep.endpoint_method}</span>
+                            <span className={`badge ${ep.endpoint_method === 'GET' ? 'badge-success' : ep.endpoint_method === 'POST' ? 'badge-primary' : ep.endpoint_method === 'DELETE' ? 'badge-error' : 'badge-warning'}`}>{ep.endpoint_method}</span>
                           </td>
                           <td className="font-mono text-sm" title="Backend URI">{ep.endpoint_uri}</td>
                           <td className="text-sm">

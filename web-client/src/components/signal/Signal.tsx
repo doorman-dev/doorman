@@ -1,13 +1,20 @@
 'use client'
 
 import Link from 'next/link'
-import { useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from 'react'
+import React, { cloneElement, isValidElement, useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from 'react'
 
 type Tone = 'ink' | 'white' | 'lime' | 'terracotta' | 'blue' | 'dark'
 type Status = 'healthy' | 'attention' | 'info' | 'critical' | 'neutral'
 
+function stripDot(n: ReactNode): ReactNode {
+  if (typeof n === 'string') return n.replace(/\.\s*$/, '')
+  if (Array.isArray(n)) return n.map((c, i) => (i === n.length - 1 ? stripDot(c) : c))
+  if (isValidElement(n) && (n.props as { children?: ReactNode }).children !== undefined) return cloneElement(n as React.ReactElement<{ children?: ReactNode }>, undefined, stripDot((n.props as { children?: ReactNode }).children))
+  return n
+}
+
 export function SignalPageHeader({ kicker, title, description, actions, className = '' }: { kicker: string; title: ReactNode; description?: ReactNode; actions?: ReactNode; className?: string }) {
-  return <header className={`signal-page-header ${className}`}><div><p className="signal-kicker">{kicker}</p><h1 className="signal-page-title">{title}</h1>{description && <p className="signal-page-description">{description}</p>}</div>{actions && <div className="signal-page-actions">{actions}</div>}</header>
+  return <header className={`signal-page-header ${className}`}><div><p className="signal-kicker">{kicker}</p><h1 className="signal-page-title">{stripDot(title)}</h1>{description && <p className="signal-page-description">{description}</p>}</div>{actions && <div className="signal-page-actions">{actions}</div>}</header>
 }
 
 export function SignalPanel({ children, tone = 'white', title, kicker, className = '', ...props }: HTMLAttributes<HTMLElement> & { tone?: Tone; title?: ReactNode; kicker?: ReactNode }) {
@@ -148,7 +155,7 @@ export function SignalMethodFilter({
     if (m === 'GET') return 'bg-[#38bdf8] text-signal-ink'
     if (m === 'POST') return 'bg-signal-lime text-signal-ink'
     if (m === 'PUT') return 'bg-[#fbbf24] text-signal-ink'
-    if (m === 'DELETE') return 'bg-signal-terra text-white'
+    if (m === 'DELETE') return 'bg-red-500/10 text-red-700'
     if (m === 'PATCH') return 'bg-[#c084fc] text-signal-ink'
     return 'bg-white text-signal-ink'
   }

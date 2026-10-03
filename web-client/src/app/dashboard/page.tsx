@@ -5,7 +5,6 @@ import Layout from '@/components/Layout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { SERVER_URL } from '@/utils/config'
 import { useAuth } from '@/contexts/AuthContext'
-import { SignalMetric, SignalPageHeader, SignalPanel, SignalSidebarRail, SignalStatusTag, SignalTable } from '@/components/signal/Signal'
 
 interface DashboardData {
   totalRequests: number
@@ -39,21 +38,32 @@ function Dashboard() {
   const values = months.map(month => dashboardData.monthlyUsage[month] || 0)
   const maxValue = Math.max(...values, 1)
 
-  return <ProtectedRoute><Layout><div className="space-y-7">
-    <SignalPageHeader kicker="Gateway overview" title={<>API<br className="sm:hidden" /> Gateway.</>} description="Live configuration, traffic, and access-control signals from this Doorman deployment." actions={<button onClick={fetchData} disabled={loading} className="signal-button">{loading ? 'Refreshing' : 'Refresh data'}</button>} />
-    {error && <SignalPanel tone="terracotta" title="Gateway data unavailable"><p className="font-mono text-sm">{error}</p></SignalPanel>}
-    {loading ? <SignalPanel tone="blue" title="Reading gateway telemetry"><p className="font-mono text-sm">Loading live configuration and usage data…</p></SignalPanel> : <>
-      <section className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_300px]">
-        <SignalPanel tone="white" title="API Gateway" kicker="Traffic health"><div className="grid gap-3 sm:grid-cols-2"><SignalMetric label="Total requests" value={dashboardData.totalRequests.toLocaleString()} tone="lime" detail="Reported by gateway dashboard" /><SignalMetric label="Active users" value={dashboardData.activeUsers.toLocaleString()} tone="blue" detail="Current reporting period" /></div><div className="mt-5 flex items-center justify-between border-t-2 border-signal-ink pt-4"><span className="font-mono text-xs uppercase tracking-wide">Route activity</span><SignalStatusTag status="healthy">Live data</SignalStatusTag></div></SignalPanel>
-        <SignalPanel tone="terracotta" title="AI service posture" kicker="Protocol capability"><div className="grid gap-3 sm:grid-cols-2"><SignalMetric label="New API definitions" value={dashboardData.newApis.toLocaleString()} tone="white" detail="Current reporting period" /><div className="border-[3px] border-signal-ink bg-white p-4"><p className="font-mono text-[11px] font-bold uppercase tracking-[.08em]">Configured traffic</p><p className="mt-5 text-2xl font-extrabold tracking-tight">REST · GraphQL<br />gRPC · SOAP</p><p className="mt-3 font-mono text-xs text-signal-mist">Use API configuration to govern supported service traffic.</p></div></div></SignalPanel>
-        <SignalSidebarRail title="System assurance"><h2 className="mt-2 text-2xl font-extrabold tracking-tight">Gateway ready.</h2><ul className="mt-4 list-none p-0"><li><SignalStatusTag status="healthy">Healthy</SignalStatusTag></li><li>Apache 2.0 licensed</li><li>Self-hosted control plane</li><li>Cloud or private network</li><li>Multi-protocol gateway</li><li>Built-in auth and policy</li></ul></SignalSidebarRail>
-      </section>
-      <section className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1.65fr)_minmax(280px,0.8fr)]">
-        <SignalPanel tone="white" title="Request volume" kicker="Deployment summary"><div className="flex h-64 items-end gap-2 border-b-[3px] border-signal-ink px-2 pb-8">{months.map(month => { const value = dashboardData.monthlyUsage[month] || 0; return <div key={month} className="group flex h-full flex-1 flex-col justify-end"><div className="bg-signal-lime border-[2px] border-signal-ink transition-colors group-hover:bg-signal-terra" style={{ height: `${Math.max((value / maxValue) * 190, 4)}px` }} title={`${month}: ${value}`} /><span className="mt-2 text-center font-mono text-[10px] text-signal-mist">{month}</span></div> })}</div></SignalPanel>
-        <SignalPanel tone="blue" title="Active users" kicker="Access activity"><div className="divide-y-2 divide-signal-ink">{dashboardData.activeUsersList.length ? dashboardData.activeUsersList.map(user => <div className="py-3" key={user.username}><p className="font-bold">{user.username}</p><p className="mt-1 font-mono text-xs text-signal-mist">{user.requests} requests · {user.subscribers} subscribers</p></div>) : <p className="font-mono text-sm">No active-user records for this period.</p>}</div></SignalPanel>
-      </section>
-      <SignalPanel tone="white" title="Popular APIs" kicker="Route activity"><SignalTable><thead><tr><th>API</th><th>Requests</th><th>Subscribers</th></tr></thead><tbody>{dashboardData.popularApis.length ? dashboardData.popularApis.map(api => <tr key={api.name}><td data-label="API" className="font-bold">{api.name}</td><td data-label="Requests">{api.requests}</td><td data-label="Subscribers">{api.subscribers}</td></tr>) : <tr><td colSpan={3} className="text-center font-mono">No API activity for this period.</td></tr>}</tbody></SignalTable></SignalPanel>
-    </>}
+  const card = 'rounded border border-gray-200 bg-white'
+  return <ProtectedRoute><Layout><div className="space-y-4">
+    <div className="flex items-end justify-between">
+      <div><h1 className="text-[22px] font-bold text-gray-900">Dashboard</h1><p className="text-sm text-gray-500">Live traffic and access signals from this Doorman deployment</p></div>
+      <button onClick={fetchData} disabled={loading} className="btn btn-primary">{loading ? 'Refreshing…' : 'Refresh'}</button>
+    </div>
+    {error && <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">Gateway data unavailable: {error}</div>}
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      {[['Total requests', dashboardData.totalRequests], ['Active users', dashboardData.activeUsers], ['New APIs', dashboardData.newApis]].map(([label, value]) => <div key={String(label)} className={`${card} p-4`}><div className="text-xs text-gray-500">{label}</div><div className="text-[26px] font-semibold leading-tight text-gray-900">{loading ? '—' : Number(value).toLocaleString()}</div></div>)}
+    </div>
+    <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div className={`${card} p-4`}>
+        <div className="mb-3 flex items-center justify-between"><strong className="text-gray-900">Popular APIs</strong><span className="text-xs text-gray-500">Route activity</span></div>
+        <table className="w-full border-collapse text-sm"><thead><tr className="text-left text-gray-500"><th className="border-b border-gray-200 px-1 py-2 font-medium">API</th><th className="border-b border-gray-200 px-1 py-2 font-medium">Requests</th><th className="border-b border-gray-200 px-1 py-2 font-medium">Subscribers</th></tr></thead>
+          <tbody>{dashboardData.popularApis.length ? dashboardData.popularApis.map(api => <tr key={api.name}><td className="border-b border-gray-100 px-1 py-2">{api.name}</td><td className="border-b border-gray-100 px-1 py-2">{api.requests}</td><td className="border-b border-gray-100 px-1 py-2">{api.subscribers}</td></tr>) : <tr><td colSpan={3} className="px-1 py-6 text-center text-gray-500">{loading ? 'Loading…' : 'No API activity yet'}</td></tr>}</tbody></table>
+      </div>
+      <div className={`${card} p-4`}>
+        <strong className="text-gray-900">Active users</strong>
+        <div className="mt-2">{dashboardData.activeUsersList.length ? dashboardData.activeUsersList.map(u => <div key={u.username} className="flex items-center justify-between border-b border-gray-100 py-2 text-sm"><span>{u.username}</span><span className="text-gray-500">{u.requests} req</span></div>) : <p className="py-6 text-center text-sm text-gray-500">{loading ? 'Loading…' : 'No active users'}</p>}</div>
+      </div>
+    </div>
+    <div className={`${card} p-4`}>
+      <div className="mb-3 flex items-center justify-between"><strong className="text-gray-900">Request volume</strong><span className="text-xs text-gray-500">Monthly</span></div>
+      <div className="flex h-48 items-end gap-2 border-b border-gray-200 px-1">{months.map((month, i) => <div key={month} className="flex flex-1 flex-col items-center justify-end gap-1" title={`${month}: ${values[i].toLocaleString()}`}><div className="w-full rounded-t bg-primary-600/80" style={{ height: `${Math.max((values[i] / maxValue) * 100, values[i] ? 3 : 0)}%` }} /></div>)}</div>
+      <div className="mt-1 flex gap-2 px-1 text-xs text-gray-500">{months.map(m => <span key={m} className="flex-1 text-center">{m}</span>)}</div>
+    </div>
   </div></Layout></ProtectedRoute>
 }
 

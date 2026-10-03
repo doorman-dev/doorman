@@ -8,6 +8,7 @@ import { SERVER_URL } from '@/utils/config'
 import { getJson, postJson, putJson, delJson } from '@/utils/api'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { useAuth } from '@/contexts/AuthContext'
+import AuthControlPanel from '@/components/AuthControlPanel'
 
 interface ApiKey {
   id: string
@@ -62,6 +63,12 @@ const SecurityPage = () => {
   const [ipWhitelist, setIpWhitelist] = useState<IpWhitelist[]>([])
   const [securityPolicies, setSecurityPolicies] = useState<SecurityPolicy[]>([])
   const [activeTab, setActiveTab] = useState('')
+  const [secTab, setSecTab] = useState<'memory' | 'network' | 'gateway' | 'auth'>('memory')
+  useEffect(() => {
+    const h = window.location.hash.replace('#', '')
+    if (h === 'memory' || h === 'network' || h === 'gateway' || h === 'auth') setSecTab(h)
+  }, [])
+  const selectSecTab = (id: 'memory' | 'network' | 'gateway' | 'auth') => { setSecTab(id); try { window.history.replaceState(null, '', `#${id}`) } catch {} }
   const tabs: { id: string; label: string; icon: string }[] = []
   const [settingsLoading, setSettingsLoading] = useState(true)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -343,16 +350,20 @@ const SecurityPage = () => {
             <div className="card">
               <div className="p-6 space-y-6">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <h3 className="text-lg font-medium text-gray-900 dark:text-white">Memory & Security Settings</h3>
-                    {memoryOnly && (
-                      <span className="badge badge-gray">Memory Mode</span>
-                    )}
+                  <div role="tablist" aria-label="Security sections" className="flex gap-1 border-b border-gray-200 flex-1">
+                    {([['memory', 'Memory & persistence'], ['network', 'Network access'], ['gateway', 'Gateway'], ['auth', 'Auth control']] as const).filter(([id]) => id === 'auth' ? !!permissions?.manage_auth : (id !== 'gateway' || permissions?.manage_gateway || permissions?.manage_security)).map(([id, label]) => (
+                      <button key={id} type="button" role="tab" aria-selected={secTab === id} onClick={() => selectSecTab(id)}
+                        className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium ${secTab === id ? 'border-primary-600 text-primary-700' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{label}</button>
+                    ))}
                   </div>
-                  <FormHelp docHref="/docs/using-fields.html#security">Configure encrypted memory dumps and clear caches safely.</FormHelp>
+                  <div className="flex items-center gap-3 ml-4">
+                    <FormHelp docHref="/docs/using-fields.html#security">Configure encrypted memory dumps and clear caches safely.</FormHelp>
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {secTab === 'auth' && <AuthControlPanel />}
+                <div className={`grid grid-cols-1 md:grid-cols-2 gap-6 ${secTab === 'auth' ? 'hidden' : ''}`}>
+                  {secTab === 'memory' && (<>
                   <div className="space-y-2">
                     <label className={`block text-sm font-medium ${memoryOnly ? 'text-gray-400 dark:text-gray-500' : 'text-gray-700 dark:text-gray-300'}`}>
                       Enable Auto-save
@@ -415,7 +426,9 @@ const SecurityPage = () => {
                     </button>
                     <button onClick={handleDumpNow} className="btn btn-secondary">Dump Now</button>
                   </div>
+                  </>)}
 
+                  {secTab === 'network' && (<>
                       <div className="md:col-span-2 border-t border-gray-200 dark:border-gray-700 pt-4">
                     <h4 className="text-md font-medium text-gray-900 dark:text-white mb-2">IP Access Control <InfoTooltip text="Effective IP: if 'Trust X-Forwarded-For' is enabled and the request includes X-Forwarded-For, the first IP in that header is used. Otherwise the direct client IP is used. Warnings and enforcement follow this rule." /></h4>
                     {(() => {
@@ -513,7 +526,12 @@ const SecurityPage = () => {
                       </div>
                     </div>
                   </div>
+                  <div className="md:col-span-2 flex gap-3">
+                    <button onClick={handleSaveSettings} disabled={settingsSaving || settingsLoading} className="btn btn-primary">{settingsSaving ? 'Saving…' : 'Save settings'}</button>
+                  </div>
+                  </>)}
 
+                  {secTab === 'memory' && (<>
                   <div className="md:col-span-2">
                     <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                       Restore From Path
@@ -531,7 +549,9 @@ const SecurityPage = () => {
                     </div>
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Requires MEM_ENCRYPTION_KEY to be configured on server.</p>
                   </div>
+                  </>)}
 
+                  {secTab === 'gateway' && (<>
                   {(permissions?.manage_gateway || permissions?.manage_security) && (
                     <div className="md:col-span-2">
                       <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Gateway</label>
@@ -545,6 +565,7 @@ const SecurityPage = () => {
                       </div>
                     </div>
                   )}
+                  </>)}
                 </div>
               </div>
             </div>
