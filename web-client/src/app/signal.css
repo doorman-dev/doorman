@@ -476,3 +476,51 @@ input[type='file']:hover::file-selector-button, .signal-file-picker:hover::file-
 
 /* Cards already pad themselves; drop the extra inner padding so tables/forms span the full card width */
 .card > .p-6, .card > .p-4, .card > .p-5 { padding-left: 0 !important; padding-right: 0 !important; padding-bottom: 0 !important; padding-top: 4px !important; }
+
+/* ---- Shared site header (1:1 with doorman-site Navbar) ---- */
+.sh { font-size: 16px; letter-spacing: normal; line-height: 1.5; position: sticky; top: 0; z-index: 50; width: 100%; background: rgba(255,255,255,.95) !important; backdrop-filter: blur(8px); border-bottom: 1px solid #dfe3e8 !important; font-family: 'Segoe UI', 'Helvetica Neue', Arial, system-ui, sans-serif; }
+.sh-container { width: 100%; padding: 0 1.25rem; margin: 0 auto; }
+.sh-inner { display: flex; height: 60px; align-items: center; justify-content: space-between; }
+.sh-brand { display: flex; align-items: center; gap: .75rem; text-decoration: none; }
+.sh-brand img { width: 40px; height: 40px; display: block; flex: none; }
+.sh-name { display: block; font-size: 18px; font-weight: 700; line-height: 1; letter-spacing: -.025em; color: #111827; }
+.sh-sub { display: block; margin-top: 4px; font-size: 10px; font-weight: 600; line-height: 1; letter-spacing: .13em; text-transform: uppercase; color: #66727f; }
+.sh-nav { display: none; align-items: center; gap: 1.75rem; }
+.sh-nav a { font-size: 14px; line-height: 20px; font-weight: 500; color: #1f2933; text-decoration: none; }
+.sh-actions { display: flex; align-items: center; gap: .625rem; }
+.sh-gh { display: none; width: 40px; height: 40px; align-items: center; justify-content: center; border-radius: 8px !important; color: #55616d; transition: background .15s, color .15s; }
+.sh-gh:hover { background: #f2f4f7; color: #111827; }
+.sh-btn { display: none; min-height: 44px; align-items: center; justify-content: center; padding: 10px 20px; border: 1px solid #1d4ed8; border-radius: 3px; background: #fff; color: #1d4ed8; font-size: 14px; line-height: 20px; font-weight: 600; text-decoration: none; box-shadow: 0 1px 1px rgba(16,24,40,.03); transition: background .15s, color .15s; cursor: pointer; }
+.sh-btn:hover { background: #eff6ff; color: #1e40af; }
+.sh-btn--primary { background: #1d4ed8; color: #fff; }
+.sh-btn--primary:hover { background: #1d4ed8; color: #fff; }
+.sh-burger { display: inline-flex; width: 40px; height: 40px; align-items: center; justify-content: center; border: 1px solid #dfe3e8; border-radius: 8px !important; background: transparent; color: #3b4753; cursor: pointer; padding: 0; }
+.sh-mobile { display: none; border-top: 1px solid #dfe3e8; padding: 1rem 0; }
+.sh-mobile.open { display: block; }
+.sh-mobile a { display: block; padding: .75rem; border-radius: 8px; font-size: 14px; font-weight: 600; color: #1f2933; text-decoration: none; }
+.sh-mobile a:hover { background: #f2f4f7; }
+.sh-mobile .sh-btn { display: flex; margin-top: .75rem; color: #fff; }
+.login-signal { min-height: calc(100vh - 61px); }
+@media (min-width: 640px) { .sh-gh { display: inline-flex; } .sh-btn { display: inline-flex; } .sh-mobile .sh-btn { display: flex; } }
+@media (min-width: 768px) { .sh-container { width: 80%; padding: 0 2rem; } .sh-nav { display: flex; } .sh-burger, .sh-mobile { display: none !important; } }
+@media (min-width: 1024px) { .sh-btn--primary { display: inline-flex; } }
+@media (max-width: 1023px) { .sh-actions > .sh-btn--primary { display: none; } }
+@media (max-width: 767px) { .sh-mobile .sh-btn--primary { display: flex; } }
+
+.login-signal { place-items: start center; align-content: start; padding-top: 39px; padding-bottom: 56px; }
+
+/* ---- Login card: same format as the wrapper signup card ---- */
+.login-signal { padding-top: 39px; }
+.login-signal__panel { width: min(100%, 520px); border: 1px solid #dfe3e8; border-radius: 6px; box-shadow: 0 2px 6px rgba(16, 24, 40, .08); }
+.login-signal__header { display: flex; flex-direction: column; gap: 5px; padding: 28px 32px 20px; border-bottom: 1px solid #eceff3; }
+.login-signal__header .signal-kicker { margin: 0; color: #1d4ed8; font-size: 12px; font-weight: 600; letter-spacing: .02em !important; text-transform: none !important; }
+.login-signal__header h1 { margin: 0; font-size: 22px; font-weight: 600; line-height: 1.2; letter-spacing: 0; color: #111827; }
+.login-signal__header > p:last-child { max-width: none; margin: 2px 0 0; color: #66727f; font-size: 14px; line-height: 1.45; }
+.login-signal__form { gap: 20px; padding: 24px 32px 32px; }
+.login-signal__form > div { gap: 6px; }
+.login-signal__form .input { padding: 10px 12px; font-size: 14px; border-radius: 4px !important; }
+.login-signal__form label { font-size: 13px; font-weight: 600; color: #1f2933 !important; }
+.login-signal__form .signal-button { width: 100%; min-height: 44px; font-size: 14px !important; font-weight: 600 !important; }
+.login-signal footer { padding: 14px 32px; border-top: 1px solid #eceff3; font-size: 12px; color: #66727f; }
+.login-signal footer a { color: #1d4ed8; font-weight: 500; text-decoration: none; }
+.login-signal footer a:hover { text-decoration: underline; }
