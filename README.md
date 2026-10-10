@@ -10,7 +10,7 @@
 
 A Rust API gateway and control plane for REST, SOAP, GraphQL, gRPC, gRPC-Web, and AI APIs.
 
-Get started: [Quick Demo](#get-started-quick-demo) or [Self-Hosting](#get-started-self-hosting).
+Get started: [Quick Demo](#get-started-quick-demo), [Self-Hosting](#get-started-self-hosting), or [Let Us Manage For You!](https://app.doorman.dev/signup)
 
 ## Key features
 
