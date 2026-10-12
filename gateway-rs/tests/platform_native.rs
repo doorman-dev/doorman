@@ -30,6 +30,19 @@ static PAGINATION_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TRACE_CAPTURE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn trace_capture_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    // Tracing's max-level filter and callsite interest are process-global and
+    // only count live dispatchers. Keep one that wants every level alive for
+    // the whole run so parallel tests dropping their dispatchers can't collapse
+    // the cache to "off" while a scoped capture subscriber is active.
+    static KEEPALIVE: OnceLock<tracing::Dispatch> = OnceLock::new();
+    KEEPALIVE.get_or_init(|| {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(io::sink)
+                .finish(),
+        )
+    });
     TRACE_CAPTURE_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()

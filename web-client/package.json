@@ -46,6 +46,7 @@
     "source-map-js": "^1.2.2",
     "js-yaml": "^4.1.0",
     "brace-expansion": "^2.0.2",
-    "@eslint/plugin-kit": "^0.3.4"
+    "@eslint/plugin-kit": "^0.3.4",
+    "postcss-selector-parser": "^7.1.6"
   }
 }
