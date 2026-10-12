@@ -438,6 +438,13 @@ def command(
     return completed.stdout
 
 
+
+def docker_env(settings: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """`docker run` flags that pass settings by name, plus the environment that
+    supplies their values, so secrets never land on disk or in argv."""
+    flags = [flag for key in settings for flag in ("--env", key)]
+    return flags, {**os.environ, **settings}
+
 def git_state() -> tuple[str, str]:
     commit = command(["git", "rev-parse", "HEAD"]).strip()
     status = command(["git", "status", "--porcelain=v1", "--untracked-files=all"])
@@ -674,11 +681,7 @@ class Runtime:
             "REGISTER_ACCOUNT_RATE_LIMIT": "1000000",
         }
         self.candidate_settings = dict(settings)
-        env_file = self.evidence / "candidate.env"
-        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
-        # Bind-mounted into a container that runs as its own user; the file is
-        # removed when the run finishes.
-        env_file.chmod(0o644)
+        env_flags, env = docker_env(settings)
         command(
             [
                 "docker", "run", "--detach", "--name", name,
@@ -686,10 +689,11 @@ class Runtime:
                 "--network", f"doorman-system-{self.run_id}",
                 "--publish", f"127.0.0.1:{api_port}:3001",
                 "--publish", f"127.0.0.1:{web_port}:3000",
-                "--mount", f"type=bind,src={env_file},dst=/env/system.env,readonly",
+                *env_flags,
                 "--mount", f"type=volume,src={volume},dst=/app/data",
                 self.report["candidate_image_id"],
-            ]
+            ],
+            env=env,
         )
         self.resources.names.append(name)
         base = f"http://127.0.0.1:{api_port}"
@@ -961,16 +965,14 @@ class Runtime:
             "TLS_PROFILES_FILE": "/run/tls/profiles.yaml",
             "TLS_SECRET_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode(),
         }
-        env_file = self.evidence / "native-tls.env"
-        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
-        env_file.chmod(0o644)
+        env_flags, env = docker_env(settings)
         command([
             "docker", "run", "--detach", "--name", name, "--label", f"{LABEL}={self.run_id}",
             "--network", f"doorman-system-{self.run_id}", "--publish", f"127.0.0.1:{port}:3001",
-            "--mount", f"type=bind,src={env_file},dst=/env/system.env,readonly",
+            *env_flags,
             "--mount", f"type=bind,src={tls_dir},dst=/run/tls,readonly",
             self.report["candidate_image_id"],
-        ])
+        ], env=env)
         self.resources.names.append(name)
         base = f"https://127.0.0.1:{port}"
         context = ssl.create_default_context(cafile=str(root.with_suffix(".crt")))
@@ -1006,14 +1008,12 @@ class Runtime:
         name = f"doorman-system-{self.run_id}-{suffix}"
         settings = {**self.candidate_settings, "HOST": "0.0.0.0", "PORT": "8000", "THREADS": "1",
                     "MEM_DUMP_PATH": "/tmp/oracle-dump.bin", **(storage or {})}
-        env_file = self.evidence / f"{suffix}.env"
-        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
-        env_file.chmod(0o600)
+        env_flags, env = docker_env(settings)
         command([
             "docker", "run", "--detach", "--name", name,
             "--label", f"{LABEL}={self.run_id}", "--network", f"doorman-system-{self.run_id}",
-            "--publish", f"127.0.0.1:{port}:8000", "--env-file", str(env_file), str(image),
-        ])
+            "--publish", f"127.0.0.1:{port}:8000", *env_flags, str(image),
+        ], env=env)
         self.resources.names.append(name)
         base = f"http://127.0.0.1:{port}"
         wait_json(base + "/platform/monitor/liveness", {"status": "alive"}, timeout=180)
@@ -1064,16 +1064,14 @@ class Runtime:
         """An additional candidate container using external storage."""
         port = free_port()
         name = f"doorman-system-{self.run_id}-{suffix}"
-        env_file = self.evidence / f"{suffix}.env"
         settings = {**self.candidate_settings, **storage}
-        env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()) + "\n")
-        env_file.chmod(0o644)
+        env_flags, env = docker_env(settings)
         command([
             "docker", "run", "--detach", "--name", name, "--label", f"{LABEL}={self.run_id}",
             "--network", f"doorman-system-{self.run_id}", "--publish", f"127.0.0.1:{port}:3001",
-            "--mount", f"type=bind,src={env_file},dst=/env/system.env,readonly",
+            *env_flags,
             self.report["candidate_image_id"],
-        ])
+        ], env=env)
         self.resources.names.append(name)
         base = f"http://127.0.0.1:{port}"
         wait_json(base + "/platform/monitor/liveness", {"status": "alive"}, timeout=180)
@@ -1352,9 +1350,6 @@ UI: {self.report['ui_coverage']['covered']} / {self.report['ui_coverage']['total
 
     def finish(self, status: str) -> None:
         cleanup_errors = self.resources.cleanup(self.evidence)
-        # Every env file carries run secrets (candidate, extra nodes, oracles).
-        for secret_file in self.evidence.glob("*.env"):
-            secret_file.unlink()
         shutil.rmtree(self.evidence / "tls", ignore_errors=True)
         self.report["infrastructure_errors"].extend(cleanup_errors)
         elapsed = time.monotonic() - self.started
