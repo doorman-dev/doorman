@@ -14955,7 +14955,9 @@ mod tests {
         let uppercase = char::from_u32(0xC0 + u32::from(bytes[0] % 0x17)).unwrap();
         let lowercase = char::from_u32(0xE0 + u32::from(bytes[1] % 0x17)).unwrap();
         let digit = char::from(bytes[2] % 10 + b'0');
-        let special = char::from(bytes[3] % 15 + b'!');
+        // Draw from the policy's own set: the padding has no '-' to fall back on.
+        let specials = b"!@#$%^&*()-_=+[]{};:,.<>?/";
+        let special = char::from(specials[usize::from(bytes[3]) % specials.len()]);
         let padding = Uuid::new_v4()
             .simple()
             .to_string()
