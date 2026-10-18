@@ -452,7 +452,7 @@ mod tests {
     fn validation_uses_fastapi_pydantic_error_shape() {
         let errors = normalize_create_api(&json!({
             "api_name": "",
-            "api_version": "version-too-long"
+            "api_version": "version-is-too-long"
         }))
         .unwrap_err();
         assert_eq!(errors.len(), 2);
