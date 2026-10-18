@@ -1386,3 +1386,205 @@ async fn external_storage_unavailable_dependencies_fail_closed() {
         Ok(Err(_)) | Err(_)
     ));
 }
+
+#[tokio::test]
+async fn external_lifecycle_round_trip_clears_dates_and_reaches_second_router() {
+    if !enabled() {
+        eprintln!("set DOORMAN_EXTERNAL_STORAGE_TEST=1 to run external storage coverage");
+        return;
+    }
+
+    let mongo_port =
+        std::env::var("DOORMAN_TEST_MONGO_PORT").unwrap_or_else(|_| "27018".to_owned());
+    let redis_port =
+        std::env::var("DOORMAN_TEST_REDIS_PORT").unwrap_or_else(|_| "16379".to_owned());
+    let nonce = Uuid::new_v4().simple().to_string();
+    let storage_config = SharedStorageConfig {
+        storage_mode: "REDIS".to_owned(),
+        mongo_uri_override: Some(format!("mongodb://127.0.0.1:{mongo_port}/?replicaSet=rs0")),
+        mongo_database: format!("doorman_external_lifecycle_{nonce}"),
+        redis_host: "127.0.0.1".to_owned(),
+        redis_port: redis_port.parse().unwrap(),
+        redis_password: None,
+        ..Default::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/items",
+                axum::routing::get(|| async { axum::Json(json!({"ok": true})) }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+
+    let first = SharedStorage::connect(&storage_config).await.unwrap();
+    let second = SharedStorage::connect(&storage_config).await.unwrap();
+    let username = format!("external-lifecycle-{nonce}");
+    let password = "ExternalPassword123!";
+    first
+        .insert_one(
+            "roles",
+            json!({"role_name": "lifecycle-admin", "manage_apis": true}),
+        )
+        .await
+        .unwrap();
+    first
+        .insert_one(
+            "users",
+            json!({
+                "username": username,
+                "email": format!("{username}@example.test"),
+                "password": bcrypt::hash(password, bcrypt::DEFAULT_COST).unwrap(),
+                "role": "lifecycle-admin",
+                "groups": ["ALL"],
+                "active": true,
+                "ui_access": true
+            }),
+        )
+        .await
+        .unwrap();
+    first
+        .insert_one(
+            "apis",
+            json!({
+                "api_name": "orders", "api_version": "v1.0.0", "api_id": format!("orders-{nonce}"),
+                "api_type": "REST", "api_public": true, "api_allowed_groups": ["ALL"],
+                "api_servers": [upstream_url], "active": true, "api_lifecycle_status": "active",
+            }),
+        )
+        .await
+        .unwrap();
+    first
+        .insert_one(
+            "endpoints",
+            json!({
+                "api_name": "orders", "api_version": "v1.0.0", "endpoint_method": "GET",
+                "endpoint_uri": "/items", "client_uri": "/items"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut first_config = Config::for_test("removed-internal-backend".to_owned());
+    first_config.shared_storage = storage_config.clone();
+    let mut first_state = AppState::new(first_config).unwrap();
+    first_state.storage = Some(Arc::new(first));
+    let first_app = build_router(first_state);
+    let mut second_config = Config::for_test("removed-internal-backend".to_owned());
+    second_config.shared_storage = storage_config;
+    let mut second_state = AppState::new(second_config).unwrap();
+    second_state.storage = Some(Arc::new(second.clone()));
+    let second_app = build_router(second_state);
+
+    let login = first_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/platform/authorization")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"email": format!("{username}@example.test"), "password": password})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookies = login
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let csrf = cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("csrf_token="))
+        .map(str::to_owned);
+    let cookie_header = cookies.join("; ");
+    let lifecycle = |payload: serde_json::Value| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/platform/api/orders/v1/lifecycle")
+            .header(header::COOKIE, &cookie_header)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(csrf) = &csrf {
+            request = request.header("x-csrf-token", csrf);
+        }
+        first_app
+            .clone()
+            .oneshot(request.body(Body::from(payload.to_string())).unwrap())
+    };
+    // Waits out the policy cache on the second router until it reports `status`.
+    let gateway_status = |status: &'static str| {
+        let app = second_app.clone();
+        async move {
+            for _ in 0..30 {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/rest/orders/v1/items")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if response.headers()["x-api-lifecycle-status"] == status {
+                    return response;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            panic!("second router never reported lifecycle status {status}");
+        }
+    };
+    let stored = || async {
+        second
+            .find_one(
+                "apis",
+                &json!({"api_name": "orders", "api_version": "v1.0.0"}),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    let response = gateway_status("active").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("sunset").is_none());
+
+    let response = lifecycle(json!({"status": "deprecated", "retirement_date": "2999-05-01"}))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = stored().await;
+    assert_eq!(record["api_lifecycle_status"], "deprecated");
+    assert!(record["api_retirement_date"].is_string());
+    assert!(record["api_deprecated_at"].is_string());
+    let response = gateway_status("deprecated").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["sunset"],
+        "Wed, 01 May 2999 00:00:00 GMT"
+    );
+
+    let response = lifecycle(json!({"status": "active"})).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = stored().await;
+    assert_eq!(record["api_lifecycle_status"], "active");
+    assert!(record["api_retirement_date"].is_null());
+    assert!(record["api_deprecated_at"].is_null());
+    assert_eq!(record["api_lifecycle_history"].as_array().unwrap().len(), 2);
+    let response = gateway_status("active").await;
+    assert!(response.headers().get("sunset").is_none());
+    assert!(response.headers().get("deprecation").is_none());
+    let _ = to_bytes(response.into_body(), 64 * 1024).await;
+    upstream.abort();
+}

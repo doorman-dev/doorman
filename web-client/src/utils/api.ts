@@ -64,12 +64,18 @@ export async function fetchAllPaginated<T = any>(
     const out: T[] = []
     try {
       let page = 1
+      let previousBatch: string | undefined
       while (true) {
         const url = buildUrl(page, size)
         const data = await getJson<any>(url)
         const batch = extractItems(data) || []
+        if (!Number.isFinite(maxPages)) {
+          const signature = JSON.stringify(batch)
+          if (signature === previousBatch) break
+          previousBatch = signature
+        }
         out.push(...batch)
-        if (!Array.isArray(batch) || batch.length < size) break
+        if (!Array.isArray(batch) || batch.length !== size) break
         page += 1
         if (page > maxPages) break
       }

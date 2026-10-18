@@ -10,6 +10,7 @@ import { putJson, getJson, fetchAllPaginated } from '@/utils/api'
 import { useToast } from '@/contexts/ToastContext'
 import { SERVER_URL } from '@/utils/config'
 import InfoTooltip from '@/components/InfoTooltip'
+import ApiLifecyclePanel from '@/components/ApiLifecyclePanel'
 import FormHelp from '@/components/FormHelp'
 import SearchableSelect from '@/components/SearchableSelect'
 import { SignalBreadcrumbs, SignalCopyButton } from '@/components/signal/Signal'
@@ -1105,6 +1106,8 @@ const ApiDetailPage = () => {
                 </div>
               </div>
             </div>
+
+          <ApiLifecyclePanel apiName={api.api_name} apiVersion={api.api_version} />
 
           {/* IP Access Control */}
           <div className="card">

@@ -3970,6 +3970,9 @@ async fn api_routes(
         .split('/')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
+    if parts.len() == 3 && matches!(parts[2], "lifecycle" | "versions") {
+        return api_lifecycle_routes(state, &parts, method, payload, username, request_id).await;
+    }
     if parts.len() >= 3 {
         return api_discovery_routes(state, &parts, method, username, request_id).await;
     }
@@ -6945,6 +6948,8 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/platform/monitor/report"),
     ("GET", "/platform/logging/logs/download"),
     ("POST", "/platform/tools/rate-limit-simulator"),
+    ("POST", "/platform/api/{api_name}/{api_version}/lifecycle"),
+    ("GET", "/platform/api/{api_name}/{api_version}/versions"),
 ];
 
 /// `Allow` answered by the pinned server for multi-route platform paths.
@@ -9278,6 +9283,26 @@ async fn config_import(
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
+    // Import is an admin restore, so any lifecycle status is allowed without
+    // transition rules, but it must still be one the gateway understands.
+    if let Some(Value::Array(apis)) = payload.get("apis")
+        && apis.iter().any(|api| {
+            api.get("api_lifecycle_status").is_some_and(|status| {
+                !status.is_null()
+                    && !matches!(
+                        status.as_str(),
+                        Some("draft" | "active" | "deprecated" | "retired")
+                    )
+            })
+        })
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API014",
+            "api_lifecycle_status must be one of draft, active, deprecated, retired",
+            request_id,
+        );
+    }
     let mut snapshot_data = Map::new();
     for collection in ["apis", "endpoints", "roles", "groups", "routings"] {
         let values = match storage.find_many(collection, &json!({})).await {
@@ -10074,17 +10099,12 @@ async fn subscription_routes(
         let apis = storage
             .find_many("apis", &json!({}))
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|api| {
-                json!({
-                    "api_name": api.get("api_name"),
-                    "api_version": api.get("api_version"),
-                    "api_description": api.get("api_description")
-                })
-            })
-            .collect::<Vec<_>>();
-        return success(StatusCode::OK, json!({"apis": apis}), request_id);
+            .unwrap_or_default();
+        return success(
+            StatusCode::OK,
+            json!({"apis": subscribable_api_lines(apis)}),
+            request_id,
+        );
     }
     if method == Method::GET && path.starts_with("/subscription/subscriptions") {
         let target = path
@@ -10151,15 +10171,24 @@ async fn subscription_routes(
             .get("api_version")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let api_document = match storage
-            .find_one(
-                "apis",
-                &json!({"api_name": api_name, "api_version": api_version}),
-            )
+        // Subscriptions name a major line (`demo/v1`) or an exact release;
+        // drafts cannot be subscribed to, and retired versions can only be left.
+        let resolved = match storage
+            .find_many("apis", &json!({"api_name": api_name}))
             .await
         {
-            Ok(Some(api)) => api,
-            _ => {
+            Ok(apis) => match crate::storage::models::resolve_api(&apis, api_name, api_version) {
+                crate::storage::models::ApiResolution::Found(api) => Some(api.clone()),
+                crate::storage::models::ApiResolution::Retired(api) if !subscribe => {
+                    Some(api.clone())
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let api_document = match resolved {
+            Some(api) => api,
+            None => {
                 // group_required raises HTTPException(404, 'API not found'),
                 // which the route re-renders under its generic error code.
                 return error(
@@ -11385,6 +11414,298 @@ fn discovery_target(server: &str, path: &str) -> Result<String, String> {
     base.join(path)
         .map(|url| url.to_string())
         .map_err(|_| "Discovery URL must be relative to the API server".to_owned())
+}
+
+/// Collapses semver releases into one subscribable entry per major line
+/// (`demo/v1`), described by its newest routable release, and hides drafts and
+/// retired versions. Non-semver versions are listed as they are.
+fn subscribable_api_lines(apis: Vec<Value>) -> Vec<Value> {
+    use crate::{
+        gateway::resolution::ApiVersion,
+        storage::models::{api_lifecycle_status, string_field},
+    };
+
+    type Release = Option<(u64, u64, u64)>;
+    let mut lines: Vec<(Value, Release)> = Vec::new();
+    for api in &apis {
+        let status = api_lifecycle_status(api);
+        if matches!(status, "draft" | "retired") {
+            continue;
+        }
+        let version = string_field(api, "api_version").unwrap_or_default();
+        let parsed = ApiVersion::parse(version);
+        let listed_version = parsed.map_or_else(|| version.to_owned(), |v| format!("v{}", v.major));
+        let entry = json!({
+            "api_name": api.get("api_name"),
+            "api_version": listed_version,
+            "api_description": api.get("api_description"),
+            "api_lifecycle_status": status,
+        });
+        let release = parsed.map(|v| v.release());
+        match lines.iter_mut().find(|(existing, _)| {
+            existing["api_name"] == entry["api_name"]
+                && existing["api_version"] == entry["api_version"]
+        }) {
+            Some(slot) if release > slot.1 => *slot = (entry, release),
+            Some(_) => {}
+            None => lines.push((entry, release)),
+        }
+    }
+    lines.into_iter().map(|(entry, _)| entry).collect()
+}
+
+/// Version lifecycle management for one release (`v1.2.0`) or a whole major
+/// line (`v1`): `GET .../versions` lists the line and what it resolves to, and
+/// `POST .../lifecycle` moves releases between draft, active, deprecated and
+/// retired.
+async fn api_lifecycle_routes(
+    state: &AppState,
+    parts: &[&str],
+    method: &Method,
+    payload: Value,
+    username: &str,
+    request_id: &str,
+) -> Response {
+    use crate::{
+        gateway::resolution::ApiVersion,
+        policy::lifecycle::{format_lifecycle_date, parse_lifecycle_date, transition_allowed},
+        storage::models::{ApiResolution, api_lifecycle_status, resolve_api, string_field},
+    };
+
+    let Some(storage) = &state.storage else {
+        return unexpected(request_id);
+    };
+    let (name, version) = (parts[0], parts[1]);
+    let line = ApiVersion::parse(version).filter(|parsed| parsed.major_only);
+    let Ok(apis) = storage.find_many("apis", &json!({"api_name": name})).await else {
+        return unexpected(request_id);
+    };
+    let mut targets: Vec<&Value> = apis
+        .iter()
+        .filter(|api| {
+            let candidate = string_field(api, "api_version");
+            candidate == Some(version)
+                || line.is_some_and(|line| {
+                    candidate
+                        .and_then(ApiVersion::parse)
+                        .is_some_and(|parsed| parsed.major == line.major)
+                })
+        })
+        .collect();
+    targets.sort_by_key(|api| {
+        string_field(api, "api_version")
+            .and_then(ApiVersion::parse)
+            .map(|parsed| parsed.release())
+    });
+    if targets.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API003",
+            "API does not exist for the requested name and version",
+            request_id,
+        );
+    }
+
+    if parts[2] == "versions" {
+        if method != Method::GET {
+            return error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GTW004",
+                "Method not allowed",
+                request_id,
+            );
+        }
+        let (resolution, resolved) = match resolve_api(&apis, name, version) {
+            ApiResolution::Found(api) => ("found", string_field(api, "api_version")),
+            ApiResolution::Retired(api) => ("retired", string_field(api, "api_version")),
+            ApiResolution::NotFound => ("not_found", None),
+        };
+        let versions: Vec<Value> = targets
+            .iter()
+            .map(|api| {
+                json!({
+                    "api_version": api.get("api_version"),
+                    "api_lifecycle_status": api_lifecycle_status(api),
+                    "api_deprecated_at": api.get("api_deprecated_at"),
+                    "api_retirement_date": api.get("api_retirement_date"),
+                    "api_successor_version": api.get("api_successor_version"),
+                    "api_lifecycle_history": api.get("api_lifecycle_history").cloned().unwrap_or_else(|| json!([])),
+                    "active": api.get("active"),
+                })
+            })
+            .collect();
+        return success(
+            StatusCode::OK,
+            json!({
+                "api_name": name,
+                "requested_version": version,
+                "resolution": resolution,
+                "resolved_version": resolved,
+                "versions": versions,
+            }),
+            request_id,
+        );
+    }
+
+    if method != Method::POST {
+        return error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GTW004",
+            "Method not allowed",
+            request_id,
+        );
+    }
+    if !has_permission(state, username, "manage_apis").await {
+        return error(
+            StatusCode::FORBIDDEN,
+            "API008",
+            "You do not have permission to update APIs",
+            request_id,
+        );
+    }
+    let Some(target) = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "draft" | "active" | "deprecated" | "retired"))
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API014",
+            "status must be one of draft, active, deprecated or retired",
+            request_id,
+        );
+    };
+    let note = payload
+        .get("note")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if note.chars().count() > 255 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API014",
+            "note must be at most 255 characters",
+            request_id,
+        );
+    }
+    let now = time::OffsetDateTime::now_utc();
+    let requested_date = match payload.get("retirement_date") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().and_then(parse_lifecycle_date) {
+            Some(date) => Some(date),
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "API015",
+                    "retirement_date must be an ISO-8601 date such as 2027-05-01",
+                    request_id,
+                );
+            }
+        },
+    };
+    // Absent keeps the saved successor; an empty string or null clears it.
+    let successor_update = match payload.get("successor_version") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(value) => Some(value.as_str().filter(|successor| !successor.is_empty())),
+    };
+    if let Some(Some(successor)) = successor_update
+        && !matches!(resolve_api(&apis, name, successor), ApiResolution::Found(_))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API016",
+            "successor_version must name a routable version of this API",
+            request_id,
+        );
+    }
+
+    // A major-line request moves every release that can make the transition;
+    // an exact release must be able to make it itself.
+    let movable: Vec<&Value> = targets
+        .iter()
+        .copied()
+        .filter(|api| transition_allowed(api_lifecycle_status(api), target))
+        .collect();
+    if movable.is_empty() {
+        let from = api_lifecycle_status(targets[0]);
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API014",
+            &format!("Cannot change lifecycle from {from} to {target}"),
+            request_id,
+        );
+    }
+    // Build and validate every release's update before the first write, so a
+    // rejected major-line request leaves the whole line unchanged.
+    let mut planned = Vec::new();
+    for api in movable {
+        let from = api_lifecycle_status(api);
+        let Some(api_version) = string_field(api, "api_version") else {
+            continue;
+        };
+        let mut updates = json!({"api_lifecycle_status": target});
+        if target == "deprecated" {
+            let date = requested_date.or_else(|| {
+                string_field(api, "api_retirement_date").and_then(parse_lifecycle_date)
+            });
+            let Some(date) = date.filter(|date| from == "retired" || *date > now) else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "API015",
+                    "Deprecating a version requires a future retirement_date",
+                    request_id,
+                );
+            };
+            updates["api_retirement_date"] = json!(format_lifecycle_date(date));
+            if from == "active" {
+                updates["api_deprecated_at"] = json!(format_lifecycle_date(now));
+            }
+        } else if target == "active" {
+            updates["api_retirement_date"] = Value::Null;
+            updates["api_deprecated_at"] = Value::Null;
+        }
+        if let Some(successor) = successor_update {
+            updates["api_successor_version"] = json!(successor);
+        }
+        let mut history = api
+            .get("api_lifecycle_history")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        history.push(json!({
+            "from": from,
+            "status": target,
+            "at": format_lifecycle_date(now),
+            "actor": username,
+            "note": note,
+        }));
+        updates["api_lifecycle_history"] = Value::Array(history);
+        planned.push((api_version, from, updates));
+    }
+    let mut updated = Vec::new();
+    for (api_version, from, updates) in planned {
+        let filter = json!({"api_name": name, "api_version": api_version});
+        if storage.update_one("apis", &filter, &updates).await.is_err() {
+            return unexpected(request_id);
+        }
+        audit::management_mutation(
+            username,
+            "api.lifecycle",
+            &format!("{name}/{api_version} {from}->{target}"),
+            "success",
+        );
+        updated.push(api_version.to_owned());
+    }
+    success(
+        StatusCode::OK,
+        json!({
+            "message": "API lifecycle updated",
+            "api_name": name,
+            "api_lifecycle_status": target,
+            "updated_versions": updated,
+        }),
+        request_id,
+    )
 }
 
 async fn api_discovery_routes(
@@ -14308,6 +14629,27 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribable_api_lines_collapse_releases_and_hide_unroutable_ones() {
+        let lines = subscribable_api_lines(vec![
+            json!({"api_name": "orders", "api_version": "v1.0.0", "api_description": "old"}),
+            json!({"api_name": "orders", "api_version": "v1.2.0", "api_description": "new",
+                "api_lifecycle_status": "deprecated"}),
+            json!({"api_name": "orders", "api_version": "v1.3.0", "api_lifecycle_status": "draft"}),
+            json!({"api_name": "orders", "api_version": "v2.0.0", "api_lifecycle_status": "retired"}),
+            json!({"api_name": "legacy", "api_version": "beta"}),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                json!({"api_name": "orders", "api_version": "v1", "api_description": "new",
+                    "api_lifecycle_status": "deprecated"}),
+                json!({"api_name": "legacy", "api_version": "beta", "api_description": null,
+                    "api_lifecycle_status": "active"}),
+            ]
+        );
+    }
 
     #[test]
     fn only_pinned_log_file_patterns_are_read_as_logs() {

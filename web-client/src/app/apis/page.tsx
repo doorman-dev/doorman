@@ -4,7 +4,8 @@ import React, { useState, useEffect } from 'react'
 import InfoTooltip from '@/components/InfoTooltip'
 import { useRouter } from 'next/navigation'
 import { SERVER_URL } from '@/utils/config'
-import { getJson } from '@/utils/api'
+import { fetchAllPaginated } from '@/utils/api'
+import { LIFECYCLE_BADGE, type LifecycleStatus } from '@/components/ApiLifecyclePanel'
 import Layout from '@/components/Layout'
 import Pagination from '@/components/Pagination'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
@@ -12,6 +13,7 @@ import { SignalCopyButton, SignalEmptyState, SignalPageHeader, SignalPanel, Sign
 
 interface API {
   api_version: React.ReactNode
+  api_lifecycle_status?: string
   api_type: React.ReactNode
   api_description: React.ReactNode
   api_servers?: string[]
@@ -33,119 +35,79 @@ const APIsPage = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
-  const [sortBy, setSortBy] = useState('name')
+  const [sortBy, setSortBy] = useState('api_name')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
-  const [hasNext, setHasNext] = useState(false)
-  const [ignorePagingAllCache, setIgnorePagingAllCache] = useState<API[] | null>(null)
-  const [backendIgnoresPaging, setBackendIgnoresPaging] = useState(false)
   const [selected, setSelected] = useState<API | null>(null)
 
   useEffect(() => {
-    fetchApis()
-  }, [page, pageSize])
-
-  const fetchApis = async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      let fetched: any[] = []
-      let raw: any = null
+    const fetchApis = async () => {
       try {
-        const data = await getJson<any>(`${SERVER_URL}/platform/api/all?page=${page}&page_size=${pageSize}`)
-        raw = data
-        fetched = Array.isArray(data) ? data : (data.apis || data.response?.apis || [])
+        setLoading(true)
+        setError(null)
+        const fetched = await fetchAllPaginated<API>(
+          (page, size) => `${SERVER_URL}/platform/api/all?page=${page}&page_size=${size}`,
+          data => Array.isArray(data) ? data : (data.apis || data.response?.apis || []),
+          undefined,
+          Number.POSITIVE_INFINITY
+        )
+        const seen = new Set<string>()
+        const unique = fetched.filter(api => {
+          const id = String(api.api_id || `${api.api_name}/${api.api_version}`)
+          if (seen.has(id)) return false
+          seen.add(id)
+          return true
+        })
+        setAllApis(unique)
+        setApis(unique)
       } catch {
-        fetched = []
+        setError('Failed to load APIs. Please try again later.')
+      } finally {
+        setLoading(false)
       }
-
-      let display: any[] = fetched
-      let next = false
-      let ignores = false
-      if (Array.isArray(fetched) && fetched.length > pageSize) {
-        ignores = true
-        const total = fetched.length
-        const start = (page - 1) * pageSize
-        const end = start + pageSize
-        display = fetched.slice(start, end)
-        next = end < total
-        setIgnorePagingAllCache(fetched as any)
-      } else if (Array.isArray(fetched)) {
-        const hn = (raw?.meta?.has_next ?? raw?.has_next ?? raw?.response?.has_next)
-        next = typeof hn === 'boolean' ? hn : fetched.length === pageSize
-        setIgnorePagingAllCache(null)
-      }
-      const seen = new Set<string>()
-      const unique = display.filter((a: any) => {
-        const id = String(a.api_id || `${a.api_name}/${a.api_version}`)
-        if (seen.has(id)) return false
-        seen.add(id)
-        return true
-      })
-      unique.sort((a: any, b: any) => String(a.api_name).localeCompare(String(b.api_name)) || String(a.api_version).localeCompare(String(b.api_version)))
-      setAllApis(unique)
-      setApis(unique)
-      setHasNext(next)
-      setBackendIgnoresPaging(ignores)
-    } catch (err) {
-      setError('Failed to load APIs. Please try again later.')
-      setApis([])
-      setAllApis([])
-      setHasNext(false)
-    } finally {
-      setLoading(false)
     }
-  }
+    fetchApis()
+  }, [])
 
-  const changePage = (p: number) => {
-    if (backendIgnoresPaging && ignorePagingAllCache) {
-      const start = (p - 1) * pageSize
-      const end = start + pageSize
-      const slice = ignorePagingAllCache.slice(start, end)
-      setApis(slice as any)
-      setPage(p)
-      setHasNext(end < ignorePagingAllCache.length)
-    } else {
-      setPage(p)
-    }
-  }
-
-  const changePageSize = (s: number) => {
-    setPageSize(s)
+  const changePageSize = (size: number) => {
+    setPageSize(size)
     setPage(1)
   }
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!searchTerm.trim()) {
-      setApis(allApis)
-      return
-    }
-
-    const filteredApis = allApis.filter(api =>
-      (api.api_name as string)?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (api.api_version as string)?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (api.api_type as string)?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      ((api.api_servers || []).join(',').toLowerCase().includes(searchTerm.toLowerCase())) ||
-      (api.api_description as string)?.toLowerCase().includes(searchTerm.toLowerCase())
-    )
-    setApis(filteredApis)
+    const query = searchTerm.trim().toLowerCase()
+    setApis(allApis.filter(api =>
+      [api.api_name, api.api_version, api.api_type, api.api_description, ...(api.api_servers || [])]
+        .some(value => String(value || '').toLowerCase().includes(query))
+    ))
+    setPage(1)
   }
 
   const handleSort = (sortField: string) => {
     setSortBy(sortField)
-    const sortedApis = [...apis].sort((a, b) => {
-      if (sortField === 'api_name') {
-        return (a.api_name as string).localeCompare(b.api_name as string)
-      } else if (sortField === 'api_version') {
-        return (a.api_version as string).localeCompare(b.api_version as string)
-      } else if (sortField === 'api_type') {
-        return (a.api_type as string).localeCompare(b.api_type as string)
-      }
-      return 0
-    })
-    setApis(sortedApis)
+    setPage(1)
   }
+
+  const groups = new Map<string, { name: string; line: string; releases: API[] }>()
+  const sortedApis = [...apis].sort((a, b) => {
+    const field = sortBy as 'api_name' | 'api_version' | 'api_type'
+    return String(a[field]).localeCompare(String(b[field]), undefined, { numeric: true }) ||
+      String(a.api_name).localeCompare(String(b.api_name)) ||
+      String(a.api_version).localeCompare(String(b.api_version), undefined, { numeric: true })
+  })
+  for (const api of sortedApis) {
+    const name = String(api.api_name)
+    const version = String(api.api_version)
+    const line = /^v(\d+)(?:\.\d+){0,2}$/.exec(version)?.[1]
+    const label = line ? `v${line}` : version
+    const key = JSON.stringify([name, label])
+    const group = groups.get(key) || { name, line: label, releases: [] }
+    group.releases.push(api)
+    groups.set(key, group)
+  }
+  const visibleGroups = [...groups.entries()].slice((page - 1) * pageSize, page * pageSize)
+  const hasNext = page * pageSize < groups.size
 
   const handleApiClick = (api: API) => {
     sessionStorage.setItem('selectedApi', JSON.stringify(api))
@@ -171,9 +133,9 @@ const APIsPage = () => {
                 value={searchTerm}
                 onChange={(val) => {
                   setSearchTerm(val)
-                  if (!val) setApis(allApis)
+                  if (!val) { setApis(allApis); setPage(1) }
                 }}
-                onClear={() => setApis(allApis)}
+                onClear={() => { setApis(allApis); setPage(1) }}
                 placeholder="Search APIs by name, version, type, or description..."
               />
             </form>
@@ -239,99 +201,112 @@ const APIsPage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {apis.map((api, index) => (
-                    <tr
-                      key={String(api.api_id) || `${api.api_name}-${api.api_version}-${index}`}
-                      onClick={() => setSelected(selected && selected.api_id === api.api_id ? null : api)}
-                      aria-selected={selected?.api_id === api.api_id}
-                      className={`group cursor-pointer transition-colors ${selected?.api_id === api.api_id ? 'signal-row-selected' : ''}`}
-                    >
-                      <td data-label="API">
-                        <div className="flex items-center">
-                          <div className="h-8 w-8 rounded-lg bg-primary-100 dark:bg-primary-900/20 flex items-center justify-center mr-3">
-                            <svg className="h-4 w-4 text-primary-600 dark:text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            </svg>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <p className="font-medium text-gray-900 dark:text-white">{api.api_name}</p>
-                            <SignalCopyButton text={String(api.api_name)} label="Copy" className="opacity-0 group-hover:opacity-100 transition-opacity" />
-                            {(((api as any).api_ip_mode || 'allow_all') === 'whitelist') && (
-                              <span className="badge badge-secondary">IP Whitelist</span>
+                  {visibleGroups.map(([key, group]) => (
+                    <React.Fragment key={key}>
+                      <tr>
+                        <th colSpan={6} scope="rowgroup" className="!text-left">
+                          {group.name} <span aria-hidden="true">›</span> {group.line}
+                          <span className="ml-2 font-normal">({group.releases.length} releases)</span>
+                        </th>
+                      </tr>
+                      {group.releases.map((api, index) => (
+                        <tr
+                          key={String(api.api_id) || `${api.api_name}-${api.api_version}-${index}`}
+                          onClick={() => setSelected(selected && selected.api_id === api.api_id ? null : api)}
+                          aria-selected={selected?.api_id === api.api_id}
+                          className={`group cursor-pointer transition-colors ${selected?.api_id === api.api_id ? 'signal-row-selected' : ''}`}
+                        >
+                          <td data-label="API">
+                            <div className="flex items-center">
+                              <div className="h-8 w-8 rounded-lg bg-primary-100 dark:bg-primary-900/20 flex items-center justify-center mr-3">
+                                <svg className="h-4 w-4 text-primary-600 dark:text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                </svg>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <p className="font-medium text-gray-900 dark:text-white">{api.api_name}</p>
+                                <SignalCopyButton text={String(api.api_name)} label="Copy" className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                                {(((api as any).api_ip_mode || 'allow_all') === 'whitelist') && (
+                                  <span className="badge badge-secondary">IP Whitelist</span>
+                                )}
+                                {Array.isArray((api as any).api_ip_blacklist) && (api as any).api_ip_blacklist.length > 0 && (
+                                  <span className="badge badge-error">Blacklist</span>
+                                )}
+                                {((api as any).api_public ?? false) && (
+                                  <span className="badge badge-warning flex items-center gap-1" title="This API is public">
+                                    Public
+                                    <InfoTooltip text="Anyone can call this API; auth, subscription, and group checks are skipped." />
+                                  </span>
+                                )}
+                                {!((api as any).api_public ?? false) && ((api as any).api_auth_required === false) && (
+                                  <span className="badge badge-secondary flex items-center gap-1" title="No authentication required">
+                                    No Auth
+                                    <InfoTooltip text="Unauthenticated access is allowed. Subscription and group checks do not apply without auth." />
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                          <td data-label="Version">
+                            <span className="badge badge-primary">{api.api_version}</span>
+                            <span className={`badge ${LIFECYCLE_BADGE[(api.api_lifecycle_status || 'active') as LifecycleStatus] || 'badge-gray'} ml-1`}>
+                              {api.api_lifecycle_status || 'active'}
+                            </span>
+                          </td>
+                          <td data-label="Upstreams">
+                            {Array.isArray((api as any).api_servers) && (api as any).api_servers.length > 0 ? (
+                              <div className="text-sm text-gray-700 dark:text-gray-300 max-w-xs truncate">
+                                {(api as any).api_servers.slice(0, 3).join(', ')}
+                                {(api as any).api_servers.length > 3 && ' …'}
+                              </div>
+                            ) : (
+                              <span className="text-gray-500 dark:text-gray-400 text-sm">None</span>
                             )}
-                            {Array.isArray((api as any).api_ip_blacklist) && (api as any).api_ip_blacklist.length > 0 && (
-                              <span className="badge badge-error">Blacklist</span>
-                            )}
-                            {((api as any).api_public ?? false) && (
-                              <span className="badge badge-warning flex items-center gap-1" title="This API is public">
-                                Public
-                                <InfoTooltip text="Anyone can call this API; auth, subscription, and group checks are skipped." />
-                              </span>
-                            )}
-                            {!((api as any).api_public ?? false) && ((api as any).api_auth_required === false) && (
-                              <span className="badge badge-secondary flex items-center gap-1" title="No authentication required">
-                                No Auth
-                                <InfoTooltip text="Unauthenticated access is allowed. Subscription and group checks do not apply without auth." />
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </td>
-                      <td data-label="Version">
-                        <span className="badge badge-primary">{api.api_version}</span>
-                      </td>
-                      <td data-label="Upstreams">
-                        {Array.isArray((api as any).api_servers) && (api as any).api_servers.length > 0 ? (
-                          <div className="text-sm text-gray-700 dark:text-gray-300 max-w-xs truncate">
-                            {(api as any).api_servers.slice(0, 3).join(', ')}
-                            {(api as any).api_servers.length > 3 && ' …'}
-                          </div>
-                        ) : (
-                          <span className="text-gray-500 dark:text-gray-400 text-sm">None</span>
-                        )}
-                      </td>
-                      <td data-label="Description">
-                        <p className="text-sm text-gray-600 dark:text-gray-400 max-w-xs truncate">
-                          {api.api_description}
-                        </p>
-                      </td>
-                      <td data-label="Protocol">
-                        <span className={`badge ${(api.api_type as string)?.toLowerCase() === 'rest' ? 'badge-success' :
-                          (api.api_type as string)?.toLowerCase() === 'graphql' ? 'badge-warning' :
-                            (api.api_type as string)?.toLowerCase() === 'grpc' ? 'badge-error' :
-                              'badge-gray'
-                          }`}>
-                          {api.api_type}
-                        </span>
-                      </td>
-                      <td data-label="Actions" className="whitespace-nowrap">
-                        <div className="flex items-center gap-2">
-                          <button
-                            className="btn btn-secondary btn-sm"
-                            onClick={(e) => handleViewEndpoints(e, api)}
-                            title="View endpoints for this API"
-                          >
-                            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
-                            </svg>
-                            View Endpoints
-                          </button>
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              handleApiClick(api)
-                            }}
-                            title="Open API details"
-                          >
-                            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                            </svg>
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
+                          </td>
+                          <td data-label="Description">
+                            <p className="text-sm text-gray-600 dark:text-gray-400 max-w-xs truncate">
+                              {api.api_description}
+                            </p>
+                          </td>
+                          <td data-label="Protocol">
+                            <span className={`badge ${(api.api_type as string)?.toLowerCase() === 'rest' ? 'badge-success' :
+                              (api.api_type as string)?.toLowerCase() === 'graphql' ? 'badge-warning' :
+                                (api.api_type as string)?.toLowerCase() === 'grpc' ? 'badge-error' :
+                                  'badge-gray'
+                              }`}>
+                              {api.api_type}
+                            </span>
+                          </td>
+                          <td data-label="Actions" className="whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={(e) => handleViewEndpoints(e, api)}
+                                title="View endpoints for this API"
+                              >
+                                <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                                </svg>
+                                View Endpoints
+                              </button>
+                              <button
+                                className="btn btn-ghost btn-sm"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleApiClick(api)
+                                }}
+                                title="Open API details"
+                              >
+                                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                </svg>
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </React.Fragment>
                   ))}
                 </tbody>
               </SignalTable>
@@ -339,7 +314,7 @@ const APIsPage = () => {
             <Pagination
               page={page}
               pageSize={pageSize}
-              onPageChange={changePage}
+              onPageChange={setPage}
               onPageSizeChange={changePageSize}
               hasNext={hasNext}
             />

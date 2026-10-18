@@ -49,9 +49,41 @@ fn route_parts(api_name: &str, api_version: &str, endpoint_parts: &[&str]) -> Re
 }
 
 fn is_path_version(value: &str) -> bool {
-    value
-        .strip_prefix('v')
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+    ApiVersion::parse(value).is_some()
+}
+
+/// A `v<major>[.<minor>[.<patch>]]` API version. A bare `v1` names the whole
+/// major line; dotted forms name one release within it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub major_only: bool,
+}
+
+impl ApiVersion {
+    pub fn parse(value: &str) -> Option<Self> {
+        let parts: Vec<&str> = value.strip_prefix('v')?.split('.').collect();
+        if parts.len() > 3
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return None;
+        }
+        let number = |index: usize| parts.get(index).map_or(Some(0), |part| part.parse().ok());
+        Some(Self {
+            major: number(0)?,
+            minor: number(1)?,
+            patch: number(2)?,
+            major_only: parts.len() == 1,
+        })
+    }
+
+    pub fn release(&self) -> (u64, u64, u64) {
+        (self.major, self.minor, self.patch)
+    }
 }
 
 pub fn endpoint_pattern_matches(pattern: &str, actual: &str) -> bool {
@@ -92,6 +124,26 @@ mod tests {
         assert_eq!(route.api_name, "demo");
         assert_eq!(route.api_version, "v2");
         assert_eq!(route.endpoint_uri, "/items");
+    }
+
+    #[test]
+    fn resolves_semver_path_versions() {
+        let route = resolve_rest_path("/api/rest/demo/v1.2.3/items", &HeaderMap::new()).unwrap();
+        assert_eq!(route.api_version, "v1.2.3");
+        assert_eq!(route.endpoint_uri, "/items");
+        assert!(resolve_rest_path("/api/rest/demo/v1.x/items", &HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn parses_api_versions() {
+        let major = ApiVersion::parse("v2").unwrap();
+        assert_eq!((major.release(), major.major_only), ((2, 0, 0), true));
+        let release = ApiVersion::parse("v1.4.2").unwrap();
+        assert_eq!((release.release(), release.major_only), ((1, 4, 2), false));
+        assert_eq!(ApiVersion::parse("v1.4").unwrap().release(), (1, 4, 0));
+        for invalid in ["1", "v", "v1.", "v1..2", "v1.2.3.4", "vbeta", "V1"] {
+            assert!(ApiVersion::parse(invalid).is_none(), "{invalid}");
+        }
     }
 
     #[test]

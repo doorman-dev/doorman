@@ -10,6 +10,7 @@ use super::{
     credits::evaluate_credits,
     groups::enforce_group_access,
     ip::enforce_configured_api_ip_policy,
+    lifecycle::ApiLifecycle,
     rate_limit::enforce_rate_limit,
     roles::enforce_allowed_roles,
     subscription::enforce_subscription,
@@ -24,8 +25,8 @@ use crate::{
     storage::{
         cache::{TokenBucketCounter, WindowCounter},
         models::{
-            PolicyDocuments, bool_field, bool_field_default, find_api, find_endpoint, string_field,
-            u64_field,
+            ApiResolution, PolicyDocuments, bool_field, bool_field_default, find_endpoint,
+            resolve_api, string_field, u64_field,
         },
         redis::{bandwidth_key, rate_limit_key, throttle_key},
         runtime::SharedStorage,
@@ -96,9 +97,48 @@ pub fn evaluate_rest_policy_staged(
     let Some(route) = resolve_rest_path(&request.path, &request.headers) else {
         return Ok(None);
     };
-    let Some(api) = find_api(&documents.apis, &route.api_name, &route.api_version).cloned() else {
-        return Ok(None);
+    let (api, retired) = match resolve_api(&documents.apis, &route.api_name, &route.api_version) {
+        ApiResolution::Found(api) => (api.clone(), false),
+        ApiResolution::Retired(api) => (api.clone(), true),
+        ApiResolution::NotFound => return Ok(None),
     };
+    let lifecycle = ApiLifecycle::from_api(&api);
+    // Every failure after the version resolves reports its lifecycle, so
+    // clients see X-API-Lifecycle-Status on 401/403/404/429 responses too.
+    let attach = |failure: PolicyFailure| match failure.lifecycle {
+        Some(_) => failure,
+        None => failure.with_lifecycle(lifecycle.clone()),
+    };
+    match evaluate_resolved_api(
+        documents,
+        request,
+        storage_config,
+        runtime,
+        &route,
+        api,
+        retired,
+        lifecycle.clone(),
+    ) {
+        Ok(Some(mut decision)) => {
+            decision.deferred_failure = decision.deferred_failure.take().map(attach);
+            Ok(Some(decision))
+        }
+        Ok(None) => Ok(None),
+        Err(failure) => Err(attach(failure)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_resolved_api(
+    documents: &mut PolicyDocuments,
+    request: &PolicyRequest,
+    storage_config: &SharedStorageConfig,
+    runtime: &PolicyRuntime,
+    route: &crate::gateway::resolution::RestRouteParts,
+    api: Value,
+    retired: bool,
+    lifecycle: ApiLifecycle,
+) -> Result<Option<PolicyDecision>, PolicyFailure> {
     let settings = documents
         .settings
         .iter()
@@ -183,13 +223,30 @@ pub fn evaluate_rest_policy_staged(
                     .unwrap_or(false)
             });
 
-        enforce_subscription(
-            &format!("{}/{}", route.api_name, route.api_version),
-            &user,
-            &documents.roles,
-            &documents.subscriptions,
-            enforce_admin_sub,
-        )?;
+        // A subscription to the major line (`demo/v1`) covers every release
+        // in it, and an exact-release subscription covers that release.
+        let mut subscription_keys = vec![format!("{}/{}", route.api_name, route.api_version)];
+        if let Some(resolved) = string_field(&api, "api_version") {
+            subscription_keys.push(format!("{}/{resolved}", route.api_name));
+            if let Some(version) = crate::gateway::resolution::ApiVersion::parse(resolved) {
+                subscription_keys.push(format!("{}/v{}", route.api_name, version.major));
+            }
+        }
+        subscription_keys.dedup();
+        let mut subscription = Ok(());
+        for key in &subscription_keys {
+            subscription = enforce_subscription(
+                key,
+                &user,
+                &documents.roles,
+                &documents.subscriptions,
+                enforce_admin_sub,
+            );
+            if subscription.is_ok() {
+                break;
+            }
+        }
+        subscription?;
         if request.group_version_missing {
             return Err(PolicyFailure::new(
                 PolicyStage::Group,
@@ -223,7 +280,17 @@ pub fn evaluate_rest_policy_staged(
         authenticated = Some((username.to_owned(), throttle.delay_ms));
     }
 
-    let deferred = if bool_field(&api, "active") == Some(false) {
+    let deferred = if retired {
+        Some(
+            PolicyFailure::new(
+                PolicyStage::Resolution,
+                StatusCode::GONE,
+                "GTW015",
+                "API version has been retired",
+            )
+            .with_lifecycle(lifecycle.clone()),
+        )
+    } else if bool_field(&api, "active") == Some(false) {
         Some(PolicyFailure::new(
             PolicyStage::Resolution,
             StatusCode::FORBIDDEN,
@@ -266,6 +333,16 @@ pub fn evaluate_rest_policy_staged(
             tier_username,
             tier_rate_limit_enabled: !storage_config.skip_tier_rate_limit,
             deferred_failure: Some(failure),
+            // A retired 410 still answers with the API's CORS headers so
+            // browser clients can read its migration details.
+            cors_allow_origins: optional_string_list(&api, "api_cors_allow_origins"),
+            cors_allow_methods: optional_string_list(&api, "api_cors_allow_methods"),
+            cors_allow_headers: optional_string_list(&api, "api_cors_allow_headers"),
+            cors_allow_credentials: bool_field_default(&api, "api_cors_allow_credentials", false),
+            cors_expose_headers: crate::storage::models::string_list_field(
+                &api,
+                "api_cors_expose_headers",
+            ),
             ..Default::default()
         }));
     }
@@ -298,6 +375,7 @@ pub fn evaluate_rest_policy_staged(
     });
     let mut decision = PolicyDecision {
         route: Some("gateway.rest".to_owned()),
+        lifecycle: Some(lifecycle),
         api_id: string_field(&api, "api_id").map(str::to_owned),
         api_name: string_field(&api, "api_name").map(str::to_owned),
         endpoint_id: endpoint_id.map(str::to_owned),
@@ -794,6 +872,103 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    fn lifecycle_documents(statuses: &[(&str, &str)]) -> PolicyDocuments {
+        PolicyDocuments {
+            apis: statuses
+                .iter()
+                .map(|(version, status)| {
+                    json!({
+                        "api_id": format!("api-{version}"),
+                        "api_name": "demo",
+                        "api_version": version,
+                        "api_public": true,
+                        "api_servers": ["http://upstream"],
+                        "api_lifecycle_status": status,
+                        "api_retirement_date": "2027-05-01",
+                        "api_successor_version": "v2",
+                    })
+                })
+                .collect(),
+            endpoints: statuses
+                .iter()
+                .map(|(version, _)| {
+                    json!({"api_name": "demo", "api_version": version,
+                        "endpoint_method": "GET", "endpoint_uri": "/items"})
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn lifecycle_request(path: &str) -> PolicyRequest {
+        PolicyRequest {
+            method: Method::GET,
+            path: path.to_owned(),
+            headers: HeaderMap::new(),
+            direct_ip: None,
+            now_millis: 0,
+            content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: true,
+        }
+    }
+
+    #[test]
+    fn major_version_routes_to_latest_release_with_lifecycle() {
+        let mut documents = lifecycle_documents(&[
+            ("v1.0.0", "active"),
+            ("v1.1.0", "deprecated"),
+            ("v1.2.0", "draft"),
+        ]);
+        let decision = evaluate_rest_policy(
+            &mut documents,
+            &lifecycle_request("/api/rest/demo/v1/items"),
+            &SharedStorageConfig::default(),
+            &PolicyRuntime::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decision.api_id.as_deref(), Some("api-v1.1.0"));
+        let lifecycle = decision.lifecycle.unwrap();
+        assert_eq!(lifecycle.status, "deprecated");
+        assert_eq!(lifecycle.resolved_version, "v1.1.0");
+        assert!(
+            lifecycle
+                .headers()
+                .iter()
+                .any(|(name, _)| *name == "Sunset")
+        );
+    }
+
+    #[test]
+    fn retired_version_returns_gone_and_drafts_are_hidden() {
+        let mut documents = lifecycle_documents(&[("v1.0.0", "retired"), ("v1.1.0", "draft")]);
+        let failure = evaluate_rest_policy(
+            &mut documents,
+            &lifecycle_request("/api/rest/demo/v1/items"),
+            &SharedStorageConfig::default(),
+            &PolicyRuntime::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (failure.status, failure.error_code.as_str()),
+            (StatusCode::GONE, "GTW015")
+        );
+        assert_eq!(failure.lifecycle.unwrap().status, "retired");
+        let missing = evaluate_rest_policy(
+            &mut documents,
+            &lifecycle_request("/api/rest/demo/v1.1.0/items"),
+            &SharedStorageConfig::default(),
+            &PolicyRuntime::default(),
+        )
+        .unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]

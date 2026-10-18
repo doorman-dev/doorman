@@ -8957,3 +8957,543 @@ async fn demo_seed_denies_non_admin_with_pythons_error_code_and_message() {
     assert_eq!(body["error_code"], "DEMO001");
     assert_eq!(body["error_message"], "Permission denied to run seeder");
 }
+
+#[tokio::test]
+async fn api_version_lifecycle_routes_major_line_and_announces_retirement() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/items", get(|| async { Json(json!({"ok": true})) })),
+        )
+        .await
+        .unwrap();
+    });
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    storage
+        .insert_one(
+            "roles",
+            json!({"role_name": "lifecycle-role", "manage_apis": true}),
+        )
+        .await
+        .unwrap();
+    storage
+        .insert_one(
+            "users",
+            json!({
+                "username": "lifecycle-admin", "email": "lifecycle-admin@doorman.dev",
+                "password": bcrypt::hash(fixture_password(), bcrypt::DEFAULT_COST).unwrap(),
+                "role": "lifecycle-role", "groups": ["ALL"], "active": true, "ui_access": true,
+            }),
+        )
+        .await
+        .unwrap();
+    for (version, status) in [
+        ("v1.0.0", "active"),
+        ("v1.1.0", "active"),
+        ("v1.2.0", "draft"),
+        ("v2.0.0", "active"),
+    ] {
+        storage
+            .insert_one(
+                "apis",
+                json!({
+                    "api_name": "orders", "api_version": version, "api_id": format!("orders-{version}"),
+                    "api_type": "REST", "api_public": true, "api_allowed_groups": ["ALL"],
+                    "api_servers": [upstream_url], "active": true, "api_lifecycle_status": status,
+                }),
+            )
+            .await
+            .unwrap();
+        storage
+            .insert_one(
+                "endpoints",
+                json!({
+                    "api_name": "orders", "api_version": version, "endpoint_method": "GET",
+                    "endpoint_uri": "/items", "client_uri": "/items"
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let app = build_router(state);
+    let (cookie, csrf) = login_as(&app, "lifecycle-admin@doorman.dev", fixture_password()).await;
+    let gateway = |app: axum::Router| async move {
+        app.oneshot(
+            Request::builder()
+                .uri("/api/rest/orders/v1/items")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+
+    let response = gateway(app.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "active");
+    assert_eq!(response.headers()["x-api-resolved-version"], "v1.1.0");
+    assert!(response.headers().get("sunset").is_none());
+
+    let lifecycle = |payload: Value| {
+        platform_request(
+            &app,
+            Method::POST,
+            "/platform/api/orders/v1/lifecycle",
+            Some(&cookie),
+            Some(&csrf),
+            Some(payload),
+        )
+    };
+    let response = lifecycle(json!({"status": "deprecated"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(response).await["error_code"], "API015");
+    let response = lifecycle(json!({"status": "retired"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(response).await["error_code"], "API014");
+
+    let response = lifecycle(json!({
+        "status": "deprecated", "retirement_date": "2999-05-01", "successor_version": "v2",
+        "note": "Move to v2",
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["updated_versions"],
+        json!(["v1.0.0", "v1.1.0"])
+    );
+    let response = gateway(app.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "deprecated");
+    assert_eq!(
+        response.headers()["sunset"],
+        "Wed, 01 May 2999 00:00:00 GMT"
+    );
+    assert!(
+        response.headers()["deprecation"]
+            .to_str()
+            .unwrap()
+            .starts_with('@')
+    );
+    assert_eq!(
+        response.headers()["link"],
+        "</api/rest/orders/v2>; rel=\"successor-version\""
+    );
+
+    let response = lifecycle(json!({"status": "retired"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = gateway(app.clone()).await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "retired");
+    assert_eq!(
+        response.headers()["sunset"],
+        "Wed, 01 May 2999 00:00:00 GMT"
+    );
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error_code": "GTW015", "error_message": "API version has been retired",
+            "retirement_date": "2999-05-01T00:00:00Z", "successor_version": "v2",
+        })
+    );
+
+    let response = platform_request(
+        &app,
+        Method::GET,
+        "/platform/api/orders/v1/versions",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let body = body.get("response").unwrap_or(&body);
+    assert_eq!(body["resolution"], "retired");
+    let statuses: Vec<&str> = body["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|version| version["api_lifecycle_status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["retired", "retired", "draft"]);
+    assert_eq!(
+        body["versions"][0]["api_lifecycle_history"][0]["note"],
+        "Move to v2"
+    );
+    upstream.abort();
+}
+
+async fn insert_lifecycle_release(
+    storage: &SharedStorage,
+    api: Value,
+    endpoint_method: &str,
+    endpoint_uri: &str,
+) {
+    storage
+        .insert_one(
+            "endpoints",
+            json!({
+                "api_name": api["api_name"], "api_version": api["api_version"],
+                "endpoint_method": endpoint_method, "endpoint_uri": endpoint_uri,
+                "client_uri": endpoint_uri,
+            }),
+        )
+        .await
+        .unwrap();
+    storage.insert_one("apis", api).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_version_lifecycle_covers_graphql_and_soap() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/graphql",
+                any(|| async { Json(json!({"data": {"ok": true}})) }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    for version in ["v1.0.0", "v1.1.0"] {
+        insert_lifecycle_release(
+            &storage,
+            json!({
+                "api_name": "catalog", "api_version": version, "api_id": format!("catalog-{version}"),
+                "api_type": "REST", "api_public": true, "api_allowed_groups": ["ALL"],
+                "api_servers": [upstream_url], "active": true, "api_lifecycle_status": "active",
+            }),
+            "POST",
+            "/graphql",
+        )
+        .await;
+    }
+    insert_lifecycle_release(
+        &storage,
+        json!({
+            "api_name": "billing", "api_version": "v1.0.0", "api_id": "billing-v1.0.0",
+            "api_type": "REST", "api_public": true, "api_allowed_groups": ["ALL"],
+            "api_servers": [upstream_url], "active": true, "api_lifecycle_status": "retired",
+            "api_deprecated_at": "2026-01-01T00:00:00Z", "api_retirement_date": "2026-06-01",
+        }),
+        "POST",
+        "/soap",
+    )
+    .await;
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/graphql/catalog")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-version", "v1")
+                .body(Body::from(r#"{"query":"{ ok }"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "active");
+    assert_eq!(response.headers()["x-api-resolved-version"], "v1.1.0");
+    assert_eq!(response_json(response).await, json!({"data": {"ok": true}}));
+
+    let envelope = r#"<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping/></soap:Body></soap:Envelope>"#;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/soap/billing/v1/soap")
+                .header(header::CONTENT_TYPE, "text/xml")
+                .body(Body::from(envelope))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "retired");
+    assert_eq!(
+        response.headers()["sunset"],
+        "Mon, 01 Jun 2026 00:00:00 GMT"
+    );
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("xml")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("GTW015"));
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_version_lifecycle_grpc_loads_resolved_release_descriptor() {
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    // Only the newest release carries a descriptor; an unparseable one proves
+    // the gateway loaded v1.1.0 rather than reporting v1.0.0's missing set.
+    for (version, descriptor) in [("v1.0.0", None), ("v1.1.0", Some("!not-base64!"))] {
+        let mut api = json!({
+            "api_name": "rpc", "api_version": version, "api_id": format!("rpc-{version}"),
+            "api_type": "REST", "api_public": true, "api_allowed_groups": ["ALL"],
+            "api_servers": ["grpc://127.0.0.1:9"], "active": true,
+            "api_lifecycle_status": "active", "api_grpc_web_enabled": true,
+        });
+        if let Some(descriptor) = descriptor {
+            api["api_grpc_descriptor_set"] = json!(descriptor);
+        }
+        insert_lifecycle_release(&storage, api, "POST", "/grpc").await;
+    }
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/grpc/rpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-version", "v1")
+                .body(Body::from(
+                    r#"{"method":"Echo.Echo","message":{"message":"hi"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["x-api-resolved-version"], "v1.1.0");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error_message"], "Invalid stored proto descriptor");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/grpc-web/rpc/acme.Echo/Echo")
+                .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                .header("x-api-version", "v1")
+                .body(Body::from(vec![0u8, 0, 0, 0, 0]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-api-resolved-version"], "v1.1.0");
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Invalid stored proto descriptor"));
+}
+
+#[tokio::test]
+async fn api_version_major_line_subscription_and_import_status_guard() {
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    for version in ["v1.0.0", "v1.1.0"] {
+        storage
+            .insert_one(
+                "apis",
+                json!({"api_name": "orders", "api_version": version, "api_allowed_groups": ["ALL"]}),
+            )
+            .await
+            .unwrap();
+    }
+    let app = build_router(state);
+    let (cookie, _) = login(&app).await;
+
+    let subscribed = platform_request(
+        &app,
+        Method::POST,
+        "/platform/subscription/subscribe",
+        Some(&cookie),
+        None,
+        Some(json!({"username": "admin", "api_name": "orders", "api_version": "v1"})),
+    )
+    .await;
+    assert_eq!(subscribed.status(), StatusCode::OK);
+    let subscription = storage
+        .find_one("subscriptions", &json!({"username": "admin"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(subscription["apis"], json!(["orders/v1"]));
+
+    let import = |status: Value| {
+        platform_request(
+            &app,
+            Method::POST,
+            "/platform/config/import",
+            Some(&cookie),
+            None,
+            Some(json!({"apis": [{
+                "api_name": "orders", "api_version": "v1.1.0", "api_lifecycle_status": status,
+            }]})),
+        )
+    };
+    let rejected = import(json!("sunsetting")).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(rejected).await["error_code"], "API014");
+    let untouched = storage
+        .find_one(
+            "apis",
+            &json!({"api_name": "orders", "api_version": "v1.1.0"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(untouched.get("api_lifecycle_status").is_none());
+
+    // Restores skip transition rules, so jumping straight to retired is fine.
+    let restored = import(json!("retired")).await;
+    assert_eq!(restored.status(), StatusCode::OK);
+    let retired = storage
+        .find_one(
+            "apis",
+            &json!({"api_name": "orders", "api_version": "v1.1.0"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired["api_lifecycle_status"], "retired");
+}
+
+#[tokio::test]
+async fn api_version_lifecycle_review_fixes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/items", get(|| async { Json(json!({"ok": true})) })),
+        )
+        .await
+        .unwrap();
+    });
+    let state = memory_state(false).await;
+    let storage = state.storage.clone().unwrap();
+    for api in [
+        json!({"api_name": "partial", "api_version": "v1.0.0", "api_lifecycle_status": "retired",
+            "api_retirement_date": "2026-01-01T00:00:00Z"}),
+        json!({"api_name": "partial", "api_version": "v1.1.0", "api_lifecycle_status": "active"}),
+        json!({"api_name": "partial", "api_version": "v2.0.0", "api_lifecycle_status": "active"}),
+        json!({"api_name": "gone", "api_version": "v1.0.0", "api_lifecycle_status": "retired",
+            "api_retirement_date": "2026-01-01T00:00:00Z",
+            "api_cors_allow_origins": ["http://client.test"]}),
+        json!({"api_name": "off", "api_version": "v1.0.0", "active": false}),
+    ] {
+        let mut api = api;
+        api["api_id"] = json!(format!("{}-{}", api["api_name"], api["api_version"]));
+        api["api_public"] = json!(true);
+        api["api_allowed_groups"] = json!(["ALL"]);
+        api["api_servers"] = json!([upstream_url]);
+        if api.get("active").is_none() {
+            api["active"] = json!(true);
+        }
+        insert_lifecycle_release(&storage, api, "GET", "/items").await;
+    }
+    let app = build_router(state);
+    let (cookie, _) = login(&app).await;
+    let lifecycle = |path: &'static str, payload: Value| {
+        platform_request(&app, Method::POST, path, Some(&cookie), None, Some(payload))
+    };
+    let stored = |version: &'static str| {
+        let storage = storage.clone();
+        async move {
+            storage
+                .find_one(
+                    "apis",
+                    &json!({"api_name": "partial", "api_version": version}),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+
+    // A rejected major-line request changes no release.
+    let response = lifecycle(
+        "/platform/api/partial/v1/lifecycle",
+        json!({"status": "deprecated"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(response).await["error_code"], "API015");
+    assert_eq!(stored("v1.0.0").await["api_lifecycle_status"], "retired");
+    assert_eq!(stored("v1.1.0").await["api_lifecycle_status"], "active");
+
+    // An absent successor keeps the saved one; an empty string clears it.
+    let response = lifecycle(
+        "/platform/api/partial/v1.1.0/lifecycle",
+        json!({"status": "deprecated", "retirement_date": "2999-05-01", "successor_version": "v2.0.0"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = lifecycle(
+        "/platform/api/partial/v1.1.0/lifecycle",
+        json!({"status": "active"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored("v1.1.0").await["api_successor_version"], "v2.0.0");
+    let response = lifecycle(
+        "/platform/api/partial/v1.1.0/lifecycle",
+        json!({"status": "deprecated", "retirement_date": "2999-05-01", "successor_version": ""}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(stored("v1.1.0").await["api_successor_version"].is_null());
+
+    // A retired 410 keeps the API's CORS headers and exposes the lifecycle ones.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rest/gone/v1/items")
+                .header(header::ORIGIN, "http://client.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "http://client.test"
+    );
+    assert!(
+        response.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-api-lifecycle-status")
+    );
+
+    // Other failures after resolution still report the lifecycle.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rest/off/v1/items")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["x-api-lifecycle-status"], "active");
+    assert_eq!(response.headers()["x-api-resolved-version"], "v1.0.0");
+    assert_eq!(response_json(response).await["error_code"], "GTW012");
+    upstream.abort();
+}

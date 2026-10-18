@@ -298,9 +298,14 @@ pub async fn rest_policy_then_proxy(
         }
     };
     // Tier limits (applied above as shared effects) precede the service-level checks.
+    let mut retired_cors = None;
     let result = result.and_then(|decision| match decision {
-        Some(decision) if decision.deferred_failure.is_some() => {
-            Err(decision.deferred_failure.expect("checked above"))
+        Some(mut decision) if decision.deferred_failure.is_some() => {
+            let failure = decision.deferred_failure.take().expect("checked above");
+            if failure.status == StatusCode::GONE {
+                retired_cors = Some(decision);
+            }
+            Err(failure)
         }
         other => Ok(other),
     });
@@ -325,6 +330,7 @@ pub async fn rest_policy_then_proxy(
             let mut response = execute_rest(&state, request, decision.clone(), protocol).await?;
             apply_tier_headers(&mut response, decision.tier_limit_status.as_ref());
             apply_actual_response(&mut response, &decision, origin.as_deref());
+            apply_lifecycle_headers(&mut response, decision.lifecycle.as_ref());
             response
                 .extensions_mut()
                 .insert(crate::middleware::activity::ActivityContext {
@@ -376,13 +382,25 @@ pub async fn rest_policy_then_proxy(
                 apply_tier_headers(&mut response, Some(&status));
                 return Ok(response);
             }
+            let lifecycle = failure.lifecycle.clone();
+            let origin = request
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let apply_retired_cors = |response: &mut Response| {
+                if let Some(decision) = &retired_cors {
+                    apply_actual_response(response, decision, origin.as_deref());
+                }
+            };
             // The pinned SOAP service renders its own 400/403/404 errors as
-            // an XML <error> document (process_soap_response).
+            // an XML <error> document (process_soap_response); retired (410)
+            // versions follow the same convention.
             if protocol == DataPlaneProtocol::Soap
                 && failure.stage == crate::policy::PolicyStage::Resolution
-                && matches!(failure.status.as_u16(), 400 | 403 | 404)
+                && matches!(failure.status.as_u16(), 400 | 403 | 404 | 410)
             {
-                return Ok((
+                let mut response = (
                     failure.status,
                     [(header::CONTENT_TYPE, "application/xml")],
                     format!(
@@ -390,16 +408,42 @@ pub async fn rest_policy_then_proxy(
                         failure.error_code, failure.error_message
                     ),
                 )
-                    .into_response());
+                    .into_response();
+                apply_retired_cors(&mut response);
+                apply_lifecycle_headers(&mut response, lifecycle.as_deref());
+                return Ok(response);
             }
-            Ok((
+            // Retired versions also say in the body when they retired and
+            // where to go next, for clients that ignore Sunset and Link.
+            if failure.status == StatusCode::GONE
+                && let Some(lifecycle) = lifecycle.as_deref()
+            {
+                let mut response = (
+                    failure.status,
+                    Json(json!({
+                        "error_code": failure.error_code,
+                        "error_message": failure.error_message,
+                        "retirement_date": lifecycle
+                            .retirement_date
+                            .and_then(crate::policy::lifecycle::format_lifecycle_date),
+                        "successor_version": lifecycle.successor_version,
+                    })),
+                )
+                    .into_response();
+                apply_retired_cors(&mut response);
+                apply_lifecycle_headers(&mut response, Some(lifecycle));
+                return Ok(response);
+            }
+            let mut response = (
                 failure.status,
                 Json(PolicyErrorBody {
                     error_code: failure.error_code,
                     error_message: failure.error_message,
                 }),
             )
-                .into_response())
+                .into_response();
+            apply_lifecycle_headers(&mut response, lifecycle.as_deref());
+            Ok(response)
         }
     }
 }
@@ -448,6 +492,49 @@ fn apply_tier_headers(
         ) {
             response.headers_mut().insert(name, value);
         }
+    }
+}
+
+fn apply_lifecycle_headers(
+    response: &mut Response,
+    lifecycle: Option<&crate::policy::lifecycle::ApiLifecycle>,
+) {
+    let Some(lifecycle) = lifecycle else {
+        return;
+    };
+    let headers = response.headers_mut();
+    for (name, value) in lifecycle.headers() {
+        if let Ok(value) = http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
+    // Browsers only reveal these to scripts when CORS exposes them.
+    if !headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+        return;
+    }
+    let exposed = headers
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if exposed.trim() == "*" {
+        return;
+    }
+    let mut names: Vec<&str> = exposed
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    for name in crate::policy::lifecycle::EXPOSED_HEADERS {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name);
+        }
+    }
+    if let Ok(value) = http::HeaderValue::from_str(&names.join(", ")) {
+        headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, value);
     }
 }
 

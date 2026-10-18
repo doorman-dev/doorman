@@ -9,6 +9,7 @@ pub mod evaluator;
 pub mod geo;
 pub mod groups;
 pub mod ip;
+pub mod lifecycle;
 pub mod quota;
 pub mod rate_limit;
 pub mod rate_limit_models;
@@ -39,6 +40,7 @@ pub struct PolicyFailure {
     pub error_code: String,
     pub error_message: String,
     pub tier_limit: Option<Box<(tier::TierLimitBody, tier::TierLimitStatus)>>,
+    pub lifecycle: Option<Box<lifecycle::ApiLifecycle>>,
 }
 
 impl PolicyFailure {
@@ -54,7 +56,13 @@ impl PolicyFailure {
             error_code: error_code.into(),
             error_message: error_message.into(),
             tier_limit: None,
+            lifecycle: None,
         }
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: lifecycle::ApiLifecycle) -> Self {
+        self.lifecycle = Some(Box::new(lifecycle));
+        self
     }
 
     pub fn tier_limit(body: tier::TierLimitBody, status: tier::TierLimitStatus) -> Self {
@@ -64,6 +72,7 @@ impl PolicyFailure {
             error_code: body.error_code.to_owned(),
             error_message: body.message.clone(),
             tier_limit: Some(Box::new((body, status))),
+            lifecycle: None,
         }
     }
 }
@@ -73,6 +82,7 @@ pub struct PolicyDecision {
     /// A service-level failure (API disabled, endpoint missing) to report after
     /// the tier limits the pinned middleware applies first.
     pub deferred_failure: Option<PolicyFailure>,
+    pub lifecycle: Option<lifecycle::ApiLifecycle>,
     pub route: Option<String>,
     pub api_id: Option<String>,
     pub api_name: Option<String>,
