@@ -1,13 +1,14 @@
 'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useCallback, useState, useEffect } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Layout from '@/components/Layout'
 import ConfirmModal from '@/components/ConfirmModal'
+import SearchableSelect from '@/components/SearchableSelect'
 import { SERVER_URL } from '@/utils/config'
 import { fetchJson } from '@/utils/http'
-import { postJson, getJson } from '@/utils/api'
-import SearchableSelect from '@/components/SearchableSelect'
+import { postJson } from '@/utils/api'
+import { LIFECYCLE_BADGE, type LifecycleStatus } from '@/components/ApiLifecyclePanel'
 
 interface Subscription {
   api_name: string
@@ -18,6 +19,7 @@ interface Api {
   api_name: string
   api_version: string
   api_description: string
+  api_lifecycle_status?: LifecycleStatus
 }
 
 const UserSubscriptionsPage = () => {
@@ -38,7 +40,7 @@ const UserSubscriptionsPage = () => {
   const [subscriptionToRevoke, setSubscriptionToRevoke] = useState<Subscription | null>(null)
   const [isRevoking, setIsRevoking] = useState(false)
 
-  const fetchSubscriptions = async () => {
+  const fetchSubscriptions = useCallback(async () => {
     try {
       const data = await fetchJson(`${SERVER_URL}/platform/subscription/subscriptions/${username}`)
       const apis: string[] = (data?.apis)
@@ -52,22 +54,16 @@ const UserSubscriptionsPage = () => {
     } catch (err) {
       setError('Failed to load user subscriptions.')
     }
-  }
+  }, [username])
 
-  const fetchApis = async () => {
+  const fetchApis = useCallback(async () => {
     try {
       const data = await fetchJson(`${SERVER_URL}/platform/subscription/available-apis/${encodeURIComponent(username)}`)
       setAllApis(data.apis || [])
     } catch (err) {
       setError('Failed to load available APIs.')
     }
-  }
-
-  const fetchApiOptions = async (): Promise<string[]> => {
-    const data = await getJson<any>(`${SERVER_URL}/platform/subscription/available-apis/${encodeURIComponent(username)}`)
-    const apis = data.apis || []
-    return apis.map((api: Api) => `${api.api_name}/${api.api_version}`)
-  }
+  }, [username])
 
   useEffect(() => {
     if (username) {
@@ -75,7 +71,7 @@ const UserSubscriptionsPage = () => {
       Promise.all([fetchSubscriptions(), fetchApis()])
         .finally(() => setLoading(false))
     }
-  }, [username])
+  }, [username, fetchSubscriptions, fetchApis])
 
   const handleBack = () => {
     router.push('/authorizations')
@@ -95,7 +91,6 @@ const UserSubscriptionsPage = () => {
     try {
       const [api_name, api_version] = selectedApi.split('/')
       const body = { username, api_name, api_version }
-      const prev = subscriptions
       const optimisticSub = { api_name, api_version }
       setSubscriptions(curr => curr.some(s => s.api_name === api_name && s.api_version === api_version)
         ? curr
@@ -136,7 +131,6 @@ const UserSubscriptionsPage = () => {
     try {
       const { api_name, api_version } = subscriptionToRevoke
       const body = { username, api_name, api_version }
-      const prev = subscriptions
       setSubscriptions(curr => curr.filter(s => !(s.api_name === api_name && s.api_version === api_version)))
 
       await postJson(`${SERVER_URL}/platform/subscription/unsubscribe`, body)
@@ -203,6 +197,11 @@ const UserSubscriptionsPage = () => {
                         <div>
                           <p className="font-medium text-gray-900 dark:text-white">{sub.api_name}</p>
                           <p className="text-sm text-gray-500 dark:text-gray-400">Version: {sub.api_version}</p>
+                          {allApis.filter(api => api.api_name === sub.api_name && api.api_version === sub.api_version).map(api => (
+                            <span key={`${api.api_name}/${api.api_version}`} className={`badge ${LIFECYCLE_BADGE[api.api_lifecycle_status || 'active']}`}>
+                              {api.api_lifecycle_status || 'active'}
+                            </span>
+                          ))}
                         </div>
                         <button
                           onClick={() => handleRevokeClick(sub)}
@@ -231,13 +230,27 @@ const UserSubscriptionsPage = () => {
                     Available APIs
                   </label>
                   <SearchableSelect
+                    key={subscriptions.map(sub => `${sub.api_name}/${sub.api_version}`).join(',')}
                     value={selectedApi}
                     onChange={setSelectedApi}
                     placeholder="Select API"
-                    fetchOptions={fetchApiOptions}
-                    disabled={isAdding}
+                    fetchOptions={async () => availableApis.map(api => ({
+                      value: `${api.api_name}/${api.api_version}`,
+                      label: `${api.api_name}/${api.api_version} (${api.api_lifecycle_status || 'active'})`,
+                    }))}
+                    disabled={loading || isAdding}
                     restrictToOptions
                   />
+                  <ul className="mt-3 space-y-2" aria-label="Available API lifecycles">
+                    {availableApis.map(api => (
+                      <li key={`${api.api_name}/${api.api_version}`} className="flex flex-wrap items-center gap-2 text-sm">
+                        <span>{api.api_name}/{api.api_version}</span>
+                        <span className={`badge ${LIFECYCLE_BADGE[api.api_lifecycle_status || 'active']}`}>
+                          {api.api_lifecycle_status || 'active'}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
                 <button type="submit" className="btn btn-primary w-full" disabled={isAdding || !selectedApi}>
                   {isAdding ? 'Adding...' : 'Add Subscription'}

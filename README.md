@@ -15,6 +15,7 @@ Get started: [Quick Demo](#get-started-quick-demo), [Self-Hosting](#get-started-
 ## Key features
 
 - Multi-protocol gateway: REST, SOAP, GraphQL, native gRPC, and gRPC-Web
+- Semantic API versions with major-line resolution, deprecation, and sunset lifecycle
 - Native control plane: authentication, users, APIs, endpoints, roles, groups, routing, subscriptions, credits, tiers, quotas, security, discovery, and monitoring
 - Traffic policy: rate limits, throttling, bandwidth limits, routing, retries, circuit breaking, credits, and schema validation
 - Dual storage: a self-contained in-memory mode or shared MongoDB and Redis

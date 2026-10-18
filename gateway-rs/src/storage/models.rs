@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+use crate::gateway::resolution::ApiVersion;
+
 pub type Document = Map<String, Value>;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -112,6 +114,65 @@ pub fn find_api<'a>(items: &'a [Value], name: &str, version: &str) -> Option<&'a
     })
 }
 
+/// Lifecycle state of an API version; records without one predate lifecycle
+/// support and are active.
+pub fn api_lifecycle_status(api: &Value) -> &str {
+    match string_field(api, "api_lifecycle_status") {
+        Some(status @ ("draft" | "active" | "deprecated" | "retired")) => status,
+        _ => "active",
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ApiResolution<'a> {
+    Found(&'a Value),
+    Retired(&'a Value),
+    NotFound,
+}
+
+/// Resolves the API record a request version selects. A major-only version
+/// (`v1`) picks the highest routable release in that line, counting a legacy
+/// `v1` record as 1.0.0; any other version must match exactly. Drafts are never
+/// routable, and a line with only retired releases resolves to `Retired`.
+pub fn resolve_api<'a>(items: &'a [Value], name: &str, requested: &str) -> ApiResolution<'a> {
+    let named = || {
+        items
+            .iter()
+            .filter(move |item| string_field(item, "api_name") == Some(name))
+    };
+    let requested_version = ApiVersion::parse(requested).filter(|version| version.major_only);
+    let Some(line) = requested_version else {
+        return match named().find(|item| string_field(item, "api_version") == Some(requested)) {
+            Some(api) => match api_lifecycle_status(api) {
+                "draft" => ApiResolution::NotFound,
+                "retired" => ApiResolution::Retired(api),
+                _ => ApiResolution::Found(api),
+            },
+            None => ApiResolution::NotFound,
+        };
+    };
+    let release_key = |item: &Value| {
+        let version = string_field(item, "api_version")?;
+        let parsed = ApiVersion::parse(version).filter(|parsed| parsed.major == line.major)?;
+        // A legacy exact `v1` record wins a tie with `v1.0.0`.
+        Some((parsed.release(), version == requested))
+    };
+    let best = |status: fn(&str) -> bool| {
+        named()
+            .filter(|item| status(api_lifecycle_status(item)))
+            .filter_map(|item| release_key(item).map(|key| (key, item)))
+            .max_by_key(|(key, _)| *key)
+            .map(|(_, item)| item)
+    };
+    if let Some(api) = best(|status| matches!(status, "active" | "deprecated")) {
+        return ApiResolution::Found(api);
+    }
+    match best(|status| status == "retired") {
+        Some(api) => ApiResolution::Retired(api),
+        None => ApiResolution::NotFound,
+    }
+}
+
 pub fn find_endpoint<'a>(
     items: &'a [Value],
     api: &Value,
@@ -134,6 +195,82 @@ pub fn find_endpoint<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn api(version: &str, status: Option<&str>) -> Value {
+        let mut api = json!({"api_name": "demo", "api_version": version});
+        if let Some(status) = status {
+            api["api_lifecycle_status"] = json!(status);
+        }
+        api
+    }
+
+    fn resolved_version(resolution: ApiResolution<'_>) -> Option<(&'static str, String)> {
+        match resolution {
+            ApiResolution::Found(api) => Some(("found", api["api_version"].as_str()?.to_owned())),
+            ApiResolution::Retired(api) => {
+                Some(("retired", api["api_version"].as_str()?.to_owned()))
+            }
+            ApiResolution::NotFound => None,
+        }
+    }
+
+    #[test]
+    fn major_line_resolves_highest_routable_release() {
+        let apis = vec![
+            api("v1", None),
+            api("v1.1.0", None),
+            api("v1.10.0", Some("deprecated")),
+            api("v1.11.0", Some("draft")),
+            api("v1.12.0", Some("retired")),
+            api("v2.0.0", None),
+        ];
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v1")),
+            Some(("found", "v1.10.0".to_owned()))
+        );
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v2")),
+            Some(("found", "v2.0.0".to_owned()))
+        );
+        assert_eq!(resolve_api(&apis, "demo", "v3"), ApiResolution::NotFound);
+        assert_eq!(resolve_api(&apis, "other", "v1"), ApiResolution::NotFound);
+    }
+
+    #[test]
+    fn legacy_major_record_wins_tie_and_exact_versions_match_exactly() {
+        let apis = vec![api("v1.0.0", None), api("v1", None), api("beta", None)];
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v1")),
+            Some(("found", "v1".to_owned()))
+        );
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v1.0.0")),
+            Some(("found", "v1.0.0".to_owned()))
+        );
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "beta")),
+            Some(("found", "beta".to_owned()))
+        );
+        assert_eq!(resolve_api(&apis, "demo", "v1.0"), ApiResolution::NotFound);
+    }
+
+    #[test]
+    fn retired_and_draft_releases_are_not_routable() {
+        let apis = vec![api("v1.0.0", Some("retired")), api("v1.1.0", Some("draft"))];
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v1")),
+            Some(("retired", "v1.0.0".to_owned()))
+        );
+        assert_eq!(
+            resolved_version(resolve_api(&apis, "demo", "v1.0.0")),
+            Some(("retired", "v1.0.0".to_owned()))
+        );
+        assert_eq!(
+            resolve_api(&apis, "demo", "v1.1.0"),
+            ApiResolution::NotFound
+        );
+        assert_eq!(api_lifecycle_status(&api("v1", Some("bogus"))), "active");
+    }
 
     #[test]
     fn builds_api_name_version_keys() {

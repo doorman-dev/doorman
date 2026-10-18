@@ -81,6 +81,36 @@ class SystemE2EContractTests(unittest.TestCase):
         self.assertEqual(first["topologies"], ["memory", "external", "two-node"])
         self.assertEqual(first["independent_upstreams"], 10)
 
+    def test_smoke_selects_a_bounded_operation_sample(self) -> None:
+        smoke = system_e2e.profile_scenarios(self.ledger, "smoke")
+        self.assertEqual(len(smoke), 178 * len(system_e2e.SMOKE_OPERATION_CASES))
+        self.assertTrue(all(item["executor"] == "openapi-operation" for item in smoke))
+        self.assertEqual(
+            system_e2e.profile_scenarios(self.ledger, "comprehensive"), self.ledger["scenarios"]
+        )
+        self.assertEqual(system_e2e.plan("smoke")["selected_scenarios"], len(smoke))
+
+    def test_smoke_judges_only_selected_scenarios(self) -> None:
+        smoke = system_e2e.profile_scenarios(self.ledger, "smoke")
+        runtime = SimpleNamespace(
+            ledger=self.ledger, scenarios=smoke,
+            results={item["id"]: True for item in smoke},
+            report={"failures": [], "scenario_counts": {"planned": len(smoke)},
+                    "operation_coverage": {}, "pair_coverage": {}, "ui_coverage": {}},
+        )
+        system_e2e.Runtime.record_unimplemented_corpus(runtime)
+        self.assertEqual(runtime.report["failures"], [])
+        self.assertEqual(runtime.report["scenario_counts"]["passed"], len(smoke))
+        self.assertEqual(runtime.report["scenario_counts"]["failed"], 0)
+        self.assertEqual(runtime.report["operation_coverage"]["covered"], 178)
+
+        runtime.results.pop(smoke[0]["id"])
+        runtime.report["failures"] = []
+        system_e2e.Runtime.record_unimplemented_corpus(runtime)
+        self.assertEqual(
+            [item["scenario_id"] for item in runtime.report["failures"]], [smoke[0]["id"]]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

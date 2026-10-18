@@ -2,7 +2,7 @@ use serde_json::{Map, Number, Value, json};
 
 const STRING_FIELDS: &[(&str, Option<usize>, Option<usize>)] = &[
     ("api_name", Some(1), Some(64)),
-    ("api_version", Some(1), Some(8)),
+    ("api_version", Some(1), Some(16)),
     ("api_description", None, Some(127)),
     ("api_type", None, None),
     ("api_grpc_package", None, None),
@@ -73,6 +73,21 @@ const RUST_EXTENSION_FIELDS: &[&str] = &[
 
 pub fn normalize_create_api(payload: &Value) -> Result<Value, Vec<Value>> {
     let mut normalized = normalize_api_fields(payload, false)?;
+    // New versions start as a draft or go straight to active; later states are
+    // reached only through the lifecycle endpoint.
+    match payload.get("api_lifecycle_status") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(status)) if matches!(status.as_str(), "draft" | "active") => {
+            normalized["api_lifecycle_status"] = json!(status);
+        }
+        Some(_) => {
+            return Err(vec![json!({
+                "loc": ["body", "api_lifecycle_status"],
+                "msg": "new APIs must start as draft or active",
+                "type": "value_error.lifecycle"
+            })]);
+        }
+    }
     let object = normalized
         .as_object_mut()
         .expect("normalization returns object");
@@ -437,7 +452,7 @@ mod tests {
     fn validation_uses_fastapi_pydantic_error_shape() {
         let errors = normalize_create_api(&json!({
             "api_name": "",
-            "api_version": "version-too-long"
+            "api_version": "version-is-too-long"
         }))
         .unwrap_err();
         assert_eq!(errors.len(), 2);

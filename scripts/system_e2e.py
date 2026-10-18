@@ -53,6 +53,20 @@ PROFILE_TOPOLOGIES = {
     "comprehensive": ["memory", "external", "two-node"],
     "soak": ["two-node"],
 }
+# Smoke is a bounded differential sample: every frozen operation once on its
+# happy path and once unauthenticated, on the memory topology only.
+SMOKE_OPERATION_CASES = frozenset({"success", "anonymous"})
+
+
+def profile_scenarios(ledger: dict[str, Any], profile: str) -> list[dict[str, Any]]:
+    """The ledger scenarios a profile executes and is judged on."""
+    if profile != "smoke":
+        return list(ledger["scenarios"])
+    return [
+        scenario for scenario in ledger["scenarios"]
+        if scenario["executor"] == "openapi-operation"
+        and scenario["id"].rsplit("::", 1)[1] in SMOKE_OPERATION_CASES
+    ]
 
 
 class ContractError(ValueError):
@@ -403,6 +417,7 @@ def plan(profile: str) -> dict[str, Any]:
         "valid_pairs": ledger["valid_pairs"],
         "higher_order_packs": len(load_json(SYSTEM / "contract.json")["feature_packs"]),
         "total_scenarios": len(ledger["scenarios"]),
+        "selected_scenarios": len(profile_scenarios(ledger, profile)),
     }
 
 
@@ -522,9 +537,13 @@ class Runtime:
         self.resources = OwnedResources(self.run_id, [], [])
         self.results: dict[str, bool] = {}
         self.started = time.monotonic()
+        # Image builds are excluded from the profile budget: a cold build alone
+        # takes longer than the smoke budget and says nothing about the product.
+        self.build_seconds = 0.0
         commit, dirty = git_state()
         ledger = validate_contract()
         self.ledger = ledger
+        self.scenarios = profile_scenarios(ledger, profile)
         self.report: dict[str, Any] = {
             "schema_version": 1,
             "status": "running",
@@ -540,7 +559,7 @@ class Runtime:
                 {"name": name, "status": "planned"} for name in PROFILE_TOPOLOGIES[profile]
             ],
             "timings": {"started_at": utc_now()},
-            "scenario_counts": {"planned": len(ledger["scenarios"]), "passed": 0, "failed": 0, "skipped": 0},
+            "scenario_counts": {"planned": len(self.scenarios), "passed": 0, "failed": 0, "skipped": 0},
             "operation_coverage": {"total": len(ledger["operations"]), "covered": 0},
             "pair_coverage": {"valid": ledger["valid_pairs"], "covered": 0},
             "ui_coverage": {"total": len(ledger["dashboard_routes"]), "covered": 0},
@@ -565,6 +584,13 @@ class Runtime:
         (self.evidence / REPORT_NAME).write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n")
 
     def build_images(self) -> None:
+        started = time.monotonic()
+        try:
+            self._build_images()
+        finally:
+            self.build_seconds += time.monotonic() - started
+
+    def _build_images(self) -> None:
         candidate_iid = self.evidence / "candidate-image-id.txt"
         fixture_iid = self.evidence / "fixture-image-id.txt"
         # Without provenance attestations (which embed build timestamps) the same
@@ -1000,7 +1026,11 @@ class Runtime:
         image = self.report["fixture_image_ids"].get("python_oracle")
         if not image:
             fixtures = ReleaseFixtures(self.evidence, self.report["candidate_image_id"], dict(os.environ))
-            fixtures.build_python_reference()
+            started = time.monotonic()
+            try:
+                fixtures.build_python_reference()
+            finally:
+                self.build_seconds += time.monotonic() - started
             image = fixtures.python_image_id
             self.report["fixture_image_ids"]["python_oracle"] = image
             self.save()
@@ -1236,7 +1266,7 @@ class Runtime:
     def record_unimplemented_corpus(self) -> None:
         # This is deliberately fail-closed. Infrastructure can be developed and
         # inspected without ever turning absent product assertions into a pass.
-        for scenario in self.ledger["scenarios"]:
+        for scenario in self.scenarios:
             if scenario["id"] in self.results:
                 continue
             self.report["failures"].append(
@@ -1249,9 +1279,9 @@ class Runtime:
             )
         passed = sum(self.results.values())
         self.report["scenario_counts"]["passed"] = passed
-        self.report["scenario_counts"]["failed"] = len(self.ledger["scenarios"]) - passed
+        self.report["scenario_counts"]["failed"] = len(self.scenarios) - passed
         by_operation: dict[str, bool] = {}
-        for scenario in self.ledger["scenarios"]:
+        for scenario in self.scenarios:
             if scenario["executor"] == "openapi-operation":
                 key = scenario["id"].rsplit("::", 1)[0]
                 by_operation[key] = by_operation.get(key, True) and self.results.get(scenario["id"], False)
@@ -1270,6 +1300,11 @@ class Runtime:
         base, _web = self.start_memory_candidate()
         self.seed_and_probe(base)
         oracle = self.start_python_oracle()
+        if self.profile == "smoke":
+            self.run_operation_corpus(base, oracle, set(), set(SMOKE_OPERATION_CASES))
+            self.mark_topology("memory")
+            self.record_unimplemented_corpus()
+            return
         # external_storage / cross_node cells need their topologies.
         self.run_operation_corpus(base, oracle, {"external_storage", "cross_node"})
         self.run_pairwise_rows(base, oracle, fixtures, "memory")
@@ -1353,10 +1388,15 @@ UI: {self.report['ui_coverage']['covered']} / {self.report['ui_coverage']['total
         shutil.rmtree(self.evidence / "tls", ignore_errors=True)
         self.report["infrastructure_errors"].extend(cleanup_errors)
         elapsed = time.monotonic() - self.started
-        self.report["timings"].update(finished_at=utc_now(), elapsed_seconds=round(elapsed, 3))
-        if elapsed > PROFILE_BUDGETS[self.profile]:
+        budgeted = elapsed - self.build_seconds
+        self.report["timings"].update(
+            finished_at=utc_now(), elapsed_seconds=round(elapsed, 3),
+            image_build_seconds=round(self.build_seconds, 3), budgeted_seconds=round(budgeted, 3),
+        )
+        if budgeted > PROFILE_BUDGETS[self.profile]:
             self.report["failures"].append(
-                {"scenario_id": "profile-budget", "signature": "budget-overrun", "message": f"elapsed {elapsed:.1f}s exceeds {PROFILE_BUDGETS[self.profile]}s"}
+                {"scenario_id": "profile-budget", "signature": "budget-overrun",
+                 "message": f"elapsed {budgeted:.1f}s excluding image builds exceeds {PROFILE_BUDGETS[self.profile]}s"}
             )
         clean_pass = (
             status == "passed"

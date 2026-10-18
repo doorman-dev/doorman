@@ -67,6 +67,7 @@ const AddApiPage = () => {
     api_anonymous_allowed: false,
     api_anonymous_credit_group: '',
     active: true,
+    api_lifecycle_status: 'active' as 'draft' | 'active',
     api_auth_required: true,
     api_ip_mode: 'allow_all' as 'allow_all' | 'whitelist',
     api_trust_x_forwarded_for: false,
@@ -359,10 +360,15 @@ const AddApiPage = () => {
                 <Field label="API name" htmlFor="api_name" required hint="Unique identifier, e.g. user-service">
                   <input id="api_name" name="api_name" type="text" className="input" placeholder="user-service" value={formData.api_name} onChange={handleChange} disabled={loading} autoFocus />
                 </Field>
-                <Field label="Version" htmlFor="api_version" required hint="e.g. v1, v2">
+                <Field label="Version" htmlFor="api_version" required hint="v1, or a release such as v1.2.0. Clients call /v1/ and reach the newest active v1 release.">
                   <input id="api_version" name="api_version" type="text" className="input" placeholder="v1" value={formData.api_version} onChange={handleChange} disabled={loading} />
                 </Field>
               </div>
+              <Field label="Initial status" htmlFor="api_lifecycle_status" hint="Drafts aren't routable until you publish them from the API's Version Lifecycle panel.">
+                <select id="api_lifecycle_status" name="api_lifecycle_status" className="input md:w-1/2" value={formData.api_lifecycle_status} onChange={handleChange} disabled={loading}>
+                  <option value="active">Active (live on create)</option><option value="draft">Draft</option>
+                </select>
+              </Field>
               <Field label="Protocol" htmlFor="api_type" hint="The protocol this API speaks to its upstream servers.">
                 <select id="api_type" name="api_type" className="input md:w-1/2" value={formData.api_type} onChange={handleChange} disabled={loading}>
                   <option value="REST">REST</option><option value="GraphQL">GraphQL</option><option value="gRPC">gRPC</option><option value="SOAP">SOAP</option>
