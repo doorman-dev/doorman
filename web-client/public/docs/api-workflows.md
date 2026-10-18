@@ -136,13 +136,15 @@ The URI picks the version. Clients call a major line such as `/api/rest/orders/v
 
 | Header | Sent when | Example |
 | :--- | :--- | :--- |
-| `X-API-Lifecycle-Status` | Always | `deprecated` |
-| `X-API-Resolved-Version` | Always | `v1.1.0` |
+| `X-API-Lifecycle-Status` | Every response once the version resolves | `deprecated` |
+| `X-API-Resolved-Version` | Every response once the version resolves | `v1.1.0` |
 | `Deprecation` (RFC 9745) | Deprecated or retired | `@1792108800` |
 | `Sunset` (RFC 8594) | Deprecated or retired | `Sat, 01 May 2027 00:00:00 GMT` |
 | `Link` | A successor is set | `</api/rest/orders/v2>; rel="successor-version"` |
 
-When CORS applies, these headers are added to `Access-Control-Expose-Headers` so browser clients can read them.
+The headers are also sent on error responses after resolution, such as `401`, `403` (`GTW012`), `404` and `429`, so clients can see the lifecycle even when a call fails.
+
+When CORS applies, these headers are added to `Access-Control-Expose-Headers` so browser clients can read them. A retired version's `410` keeps the API's CORS headers too.
 
 ### Step 1: Publish a release as a draft
 
@@ -166,7 +168,7 @@ curl -s -b "$COOKIE" -H 'Content-Type: application/json' -X POST \
 
 ### Step 2: Deprecate a major line
 
-Send the major version to change every release in the line whose current status allows the transition. Deprecation requires a future `retirement_date`.
+Send the major version to change every release in the line whose current status allows the transition. Deprecation requires a future `retirement_date`. The whole request is checked before anything is written, so if any release would be rejected (for example, with no valid retirement date), no release changes.
 
 ```bash
 curl -s -b "$COOKIE" -H 'Content-Type: application/json' -X POST \
@@ -177,6 +179,8 @@ curl -s -b "$COOKIE" -H 'Content-Type: application/json' -X POST \
     "note": "v2 adds pagination"
   }'
 ```
+
+`successor_version` must name a routable version of the same API. Leave it out to keep the saved successor, or send `""` (or `null`) to clear it.
 
 ### Step 3: Check the line
 
@@ -207,6 +211,6 @@ Requests to the retired line return `410 Gone`. With the retirement date and suc
 
 `retirement_date` is an RFC 3339 UTC timestamp. Either metadata field is `null` when unset. SOAP keeps its XML error body; the lifecycle headers carry the retirement and successor information.
 
-**Allowed transitions:** draft → active, active → deprecated, deprecated → active or retired, retired → deprecated (undo). Lifecycle changes need the `manage_apis` permission. Each change is written to the audit log and to the version's `api_lifecycle_history`. Updating an API with `PUT /platform/api/{name}/{version}` leaves its lifecycle fields unchanged.
+**Allowed transitions:** draft → active, active → deprecated, deprecated → active or retired, retired → deprecated (undo). Lifecycle changes need the `manage_apis` permission. Each change is written to the audit log and to the version's `api_lifecycle_history`. Updating an API with `PUT /platform/api/{name}/{version}` leaves its lifecycle fields unchanged. A config import (`POST /platform/config/import`) restores `api_lifecycle_status` as given, without transition rules, but rejects the whole import with `400` (`API014`) if any status isn't one of `draft`, `active`, `deprecated` or `retired`.
 
 Subscriptions can name a major line (`orders/v1`), which covers every release in it, or an exact release. Drafts can't be subscribed to, and retired versions can only be unsubscribed from. The dashboard's **Version Lifecycle** panel on each API page offers the same actions.
