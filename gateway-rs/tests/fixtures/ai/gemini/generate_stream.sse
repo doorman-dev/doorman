@@ -1,0 +1,6 @@
+data: {"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Gateway "}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":40,"candidatesTokenCount":8,"thoughtsTokenCount":2,"totalTokenCount":110},"modelVersion":"gemini-example-flash"}
+
+data: {"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"ready"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":40,"candidatesTokenCount":16,"thoughtsTokenCount":4,"totalTokenCount":120},"modelVersion":"gemini-example-flash"}
+
+data: {"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":40,"candidatesTokenCount":24,"thoughtsTokenCount":8,"totalTokenCount":132},"modelVersion":"gemini-example-flash"}
+

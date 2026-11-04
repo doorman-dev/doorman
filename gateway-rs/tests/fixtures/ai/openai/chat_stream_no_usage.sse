@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-no-usage","object":"chat.completion.chunk","created":1792281600,"model":"gpt-example-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"Gateway ready."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-no-usage","object":"chat.completion.chunk","created":1792281600,"model":"gpt-example-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

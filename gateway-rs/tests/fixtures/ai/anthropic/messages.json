@@ -1,0 +1,6 @@
+{
+  "id": "msg_fixture", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+  "content": [{"type": "text", "text": "Gateway ready."}],
+  "stop_reason": "end_turn", "stop_sequence": null,
+  "usage": {"input_tokens": 80, "cache_creation_input_tokens": 20, "cache_read_input_tokens": 40, "output_tokens": 24}
+}
