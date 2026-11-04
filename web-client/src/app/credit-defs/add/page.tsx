@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import Link from 'next/link'
 import Layout from '@/components/Layout'
 import InfoTooltip from '@/components/InfoTooltip'
@@ -8,8 +8,11 @@ import FormHelp from '@/components/FormHelp'
 import { SERVER_URL } from '@/utils/config'
 import { postJson } from '@/utils/api'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
+import { useAiProviders } from '@/hooks/useAiProviders'
 
 export default function AddCreditDefPage() {
+  const { providers } = useAiProviders()
+  const [preset, setPreset] = useState('')
   const [api_credit_group, setGroup] = useState('')
   const [api_key_header, setHeader] = useState('x-api-key')
   const [api_key, setKey] = useState('')
@@ -20,6 +23,16 @@ export default function AddCreditDefPage() {
   const [working, setWorking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+
+  useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get('preset')
+    const selected = providers.find(provider => provider.id === requested)
+    if (selected) {
+      setPreset(selected.id); setHeader(selected.credential_header)
+      setGroup(previous => previous || `${selected.id.replaceAll('_', '-')}-prod`)
+      setTiers([])
+    }
+  }, [providers])
 
   const create = async () => {
     setWorking(true); setError(null); setSuccess(null)
@@ -51,6 +64,14 @@ export default function AddCreditDefPage() {
               <FormHelp docHref="/docs/using-fields.html#credits">Define a credit group, key header, optional key, and tiers.</FormHelp>
               {error && <div className="text-sm text-error-600">{error}</div>}
               {success && <div className="text-sm text-success-600">{success}</div>}
+              <label className="block text-sm font-medium">Provider preset
+                <select className="input mt-1" value={preset} onChange={e => {
+                  setPreset(e.target.value)
+                  const selected = providers.find(provider => provider.id === e.target.value)
+                  if (selected) { setHeader(selected.credential_header); setGroup(previous => previous || `${selected.id.replaceAll('_', '-')}-prod`); setTiers([]) }
+                }}><option value="">None</option>{providers.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select>
+              </label>
+              {preset && <p className="rounded border p-3 text-sm">Use your organization&apos;s own API key from the provider console. Consumer subscriptions (ChatGPT Plus, Claude Pro) are not supported. Credit tiers are optional for provider credentials.</p>}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium">API Credit Group <InfoTooltip text="Reference name used by APIs to deduct credits and inject the key header." /></label>
@@ -62,7 +83,7 @@ export default function AddCreditDefPage() {
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium">API Key <InfoTooltip text="Default key injected for this group; per-user keys may override when Auth Required is enabled." /></label>
-                  <input className="input" value={api_key} onChange={e => setKey(e.target.value)} placeholder="sk_live_..." />
+                  <input type="password" autoComplete="off" className="input" value={api_key} onChange={e => setKey(e.target.value)} placeholder="Provider API key" />
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium">Credit Tiers</label>

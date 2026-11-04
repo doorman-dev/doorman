@@ -76,6 +76,13 @@ interface TimeSeriesData {
 type TimeRange = '1h' | '24h' | '7d' | '30d' | 'custom'
 type ActiveTab = 'overview' | 'apis' | 'users' | 'performance'
 
+const analyticsTabs = [
+                      { id: 'overview', label: 'Overview', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
+                      { id: 'apis', label: 'APIs', icon: 'M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10' },
+                      { id: 'users', label: 'Users', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
+                      { id: 'performance', label: 'Performance', icon: 'M13 7h8m0 0v8m0-8l-8 8-4-4-6 6' },
+]
+
 interface AnalyticsPageContentProps {
   searchParams: ReadonlyURLSearchParams
 }
@@ -95,6 +102,7 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
   const [autoRefresh, setAutoRefresh] = useState(false)
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null)
   
+
   // Modal state
   const [selectedAPI, setSelectedAPI] = useState<string | null>(null)
   const [selectedUser, setSelectedUser] = useState<string | null>(null)
@@ -112,6 +120,9 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
 
   // Load filters from URL on mount
   useEffect(() => {
+    const requestedTab = searchParams.get('tab')
+    if (requestedTab === 'ai' || requestedTab === 'reports') { router.replace(requestedTab === 'reports' ? '/ai/usage#chargeback' : '/ai/usage'); return }
+    if (analyticsTabs.some(tab => tab.id === requestedTab)) setActiveTab(requestedTab as ActiveTab)
     const apis = searchParams.get('apis')
     const users = searchParams.get('users')
     const statusCodes = searchParams.get('status')
@@ -127,7 +138,7 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
     if (search) setSearchQuery(search)
     if (startDate) setFilterStartDate(startDate)
     if (endDate) setFilterEndDate(endDate)
-  }, [searchParams])
+  }, [searchParams, router])
   
   // Fetch analytics data
   const fetchAnalytics = async () => {
@@ -273,8 +284,14 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
             </div>
           </div>
 
+          <div className="card overflow-x-auto"><nav className="flex border-b border-gray-200" aria-label="Analytics sections">{analyticsTabs.map(tab => <button key={tab.id} type="button" aria-pressed={activeTab === tab.id} onClick={() => {
+            setActiveTab(tab.id as ActiveTab)
+            const params = new URLSearchParams(searchParams.toString()); params.set('tab', tab.id)
+            router.replace(`/analytics?${params}`, { scroll: false })
+          }} className={`inline-flex items-center px-5 py-3 border-b-2 text-sm font-medium whitespace-nowrap ${activeTab === tab.id ? 'border-primary-500 text-primary-700' : 'border-transparent text-gray-500'}`}><svg className="h-5 w-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={tab.icon} /></svg>{tab.label}</button>)}</nav></div>
+
           {/* Time Range Selector */}
-          <div className="card">
+          {<div className="card">
             <div className="p-4">
               <div className="flex flex-wrap items-center gap-3">
                 <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -351,7 +368,7 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
                   
                   {/* Refresh Button */}
                   <button
-                    onClick={fetchAnalytics}
+                    onClick={() => fetchAnalytics()}
                     disabled={loading}
                     className="btn btn-outline btn-sm"
                   >
@@ -363,10 +380,10 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
                 </div>
               </div>
             </div>
-          </div>
+          </div>}
 
           {/* Filter Panel */}
-          <FilterPanel
+          {<FilterPanel
             availableAPIs={overview?.top_apis.map(a => a.api) || []}
             availableUsers={overview?.top_users.map(u => u.user) || []}
             selectedAPIs={selectedAPIs}
@@ -386,7 +403,8 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
             onApplyFilters={handleApplyFilters}
             onClearFilters={handleClearFilters}
             onSaveView={handleSaveView}
-          />
+          />}
+
 
           {/* Error State */}
           {error && (
@@ -429,7 +447,7 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
                     No API requests have been recorded yet in the selected time range. Analytics data will appear here once requests are made through the gateway.
                   </p>
                   <button
-                    onClick={fetchAnalytics}
+                    onClick={() => fetchAnalytics()}
                     className="btn btn-primary"
                   >
                     <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -548,34 +566,7 @@ export default function AnalyticsPageContent({ searchParams }: AnalyticsPageCont
                 </div>
               </div>
 
-              {/* Tab Navigation */}
               <div className="card">
-                <div className="border-b border-gray-200 dark:border-gray-700">
-                  <nav className="flex -mb-px">
-                    {[
-                      { id: 'overview', label: 'Overview', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
-                      { id: 'apis', label: 'APIs', icon: 'M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10' },
-                      { id: 'users', label: 'Users', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
-                      { id: 'performance', label: 'Performance', icon: 'M13 7h8m0 0v8m0-8l-8 8-4-4-6 6' }
-                    ].map((tab) => (
-                      <button
-                        key={tab.id}
-                        onClick={() => setActiveTab(tab.id as ActiveTab)}
-                        className={`group inline-flex items-center px-6 py-4 border-b-2 font-medium text-sm ${
-                          activeTab === tab.id
-                            ? 'border-primary-500 text-primary-600 dark:text-primary-400'
-                            : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300'
-                        }`}
-                      >
-                        <svg className="h-5 w-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={tab.icon} />
-                        </svg>
-                        {tab.label}
-                      </button>
-                    ))}
-                  </nav>
-                </div>
-
                 {/* Tab Content */}
                 <div className="p-6">
                   {/* Overview Tab */}

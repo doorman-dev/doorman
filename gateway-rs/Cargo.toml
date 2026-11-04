@@ -50,6 +50,7 @@ x509-parser = "0.18"
 bcrypt = "0.19.3"
 aes-gcm = "0.11.0"
 hkdf = "0.12.4"
+hmac = "0.12"
 fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
 flate2 = "1.1"
 pbkdf2 = "0.12.2"

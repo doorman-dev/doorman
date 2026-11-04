@@ -125,6 +125,52 @@ pub async fn enforce(
     Ok(smallest)
 }
 
+/// The user's effective `limits.ai_monthly_token_allowance` (override limits,
+/// then the assigned tier, then the default tier) as `(tier_id, tokens)`.
+pub fn ai_monthly_token_allowance(
+    documents: &PolicyDocuments,
+    username: &str,
+    now_seconds: u64,
+) -> Option<(String, u64)> {
+    let limits = effective_limits(documents, username, now_seconds)?;
+    let allowance = limits
+        .get("ai_monthly_token_allowance")
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)?;
+    let tier = documents
+        .tier_assignments
+        .iter()
+        .find(|value| string_field(value, "user_id") == Some(username))
+        .and_then(|value| string_field(value, "tier_id"))
+        .or_else(|| {
+            documents
+                .tiers
+                .iter()
+                .find(|value| bool_field_default(value, "is_default", false))
+                .and_then(|value| string_field(value, "tier_id"))
+        })
+        .unwrap_or("override")
+        .to_owned();
+    Some((tier, allowance))
+}
+
+/// The user's assigned tier, or the default tier when they have none.
+pub fn user_tier_id(documents: &PolicyDocuments, username: &str) -> Option<String> {
+    documents
+        .tier_assignments
+        .iter()
+        .find(|value| string_field(value, "user_id") == Some(username))
+        .and_then(|value| string_field(value, "tier_id"))
+        .or_else(|| {
+            documents
+                .tiers
+                .iter()
+                .find(|value| bool_field_default(value, "is_default", false))
+                .and_then(|value| string_field(value, "tier_id"))
+        })
+        .map(str::to_owned)
+}
+
 fn effective_limits(
     documents: &PolicyDocuments,
     username: &str,

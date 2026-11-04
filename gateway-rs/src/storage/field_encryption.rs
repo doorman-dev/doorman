@@ -4,15 +4,21 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use fernet::Fernet;
 use sha2::{Digest, Sha256};
 
-fn cipher() -> Option<Fernet> {
-    let key = env::var("TOKEN_ENCRYPTION_KEY")
+/// The deployment's field-encryption key material, also used as HKDF input for
+/// derived secrets (AI key pepper, user-ID salt).
+pub fn key_material() -> Option<String> {
+    env::var("TOKEN_ENCRYPTION_KEY")
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| {
             env::var("MEM_ENCRYPTION_KEY")
                 .ok()
                 .filter(|value| !value.is_empty())
-        })?;
+        })
+}
+
+fn cipher() -> Option<Fernet> {
+    let key = key_material()?;
     Fernet::new(&key).or_else(|| {
         let encoded = URL_SAFE.encode(Sha256::digest(key.as_bytes()));
         Fernet::new(&encoded)

@@ -22,7 +22,7 @@ export async function fetchJson<T = any>(url: string, init: RequestInit = {}): P
   const unwrapped = (data && typeof data === 'object' && 'response' in data) ? (data as any).response : data
   if (!resp.ok) {
     const msg = (unwrapped && (unwrapped.error_message || unwrapped.message)) || resp.statusText
-    throw new Error(msg)
+    throw Object.assign(new Error(msg), { status: resp.status, error_code: unwrapped?.error_code })
   }
   return unwrapped as T
 }

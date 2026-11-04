@@ -1,10 +1,13 @@
 'use client'
 
 import React, { useEffect, useState } from 'react'
+import Link from 'next/link'
 import Layout from '@/components/Layout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { SERVER_URL } from '@/utils/config'
 import { useAuth } from '@/contexts/AuthContext'
+import { fetchAllPaginated, getJson } from '@/utils/api'
+import { formatUsd, type AiOverview } from '@/utils/ai'
 
 interface DashboardData {
   totalRequests: number
@@ -19,10 +22,31 @@ const emptyDashboard: DashboardData = { totalRequests: 0, activeUsers: 0, newApi
 const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 function Dashboard() {
-  const { isAuthenticated, hasUIAccess } = useAuth()
+  const { isAuthenticated, hasUIAccess, permissions } = useAuth()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [dashboardData, setDashboardData] = useState<DashboardData>(emptyDashboard)
+  const [aiMonth, setAiMonth] = useState<AiOverview | null>(null)
+  const canViewAnalytics = !!permissions?.view_analytics
+
+  useEffect(() => {
+    if (!isAuthenticated || !hasUIAccess || !canViewAnalytics) return
+    let active = true
+    const load = async () => {
+      try {
+        const apis = await fetchAllPaginated<{ api_type: string }>(
+          (page, size) => `${SERVER_URL}/platform/api/all?page=${page}&page_size=${size}`,
+          data => Array.isArray(data) ? data : data.apis || data.response?.apis || []
+        )
+        if (!apis.some(api => api.api_type === 'AI')) return
+        const end = new Date().toISOString().slice(0, 10)
+        const month = await getJson<AiOverview>(`${SERVER_URL}/platform/analytics/ai/overview?start=${end.slice(0, 7)}-01&end=${end}`)
+        if (active) setAiMonth(month)
+      } catch { /* the AI link is optional on the API dashboard */ }
+    }
+    load()
+    return () => { active = false }
+  }, [isAuthenticated, hasUIAccess, canViewAnalytics])
 
   const fetchData = async () => {
     try {
@@ -48,6 +72,7 @@ function Dashboard() {
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
       {[['Total requests', dashboardData.totalRequests], ['Active users', dashboardData.activeUsers], ['New APIs', dashboardData.newApis]].map(([label, value]) => <div key={String(label)} className={`${card} p-4`}><div className="text-xs text-gray-500">{label}</div><div className="text-[26px] font-semibold leading-tight text-gray-900">{loading ? '—' : Number(value).toLocaleString()}</div></div>)}
     </div>
+    {canViewAnalytics && aiMonth && <Link href="/ai" className={`${card} flex items-center justify-between p-4 hover:border-primary-300`}><span><span className="block text-xs text-gray-500">AI spend (month to date)</span><span className="text-lg font-semibold text-gray-900">{formatUsd(aiMonth.cost_nanos)}</span></span><span className="text-sm font-medium text-primary-700">Open AI Gateway →</span></Link>}
     <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
       <div className={`${card} p-4`}>
         <div className="mb-3 flex items-center justify-between"><strong className="text-gray-900">Popular APIs</strong><span className="text-xs text-gray-500">Route activity</span></div>

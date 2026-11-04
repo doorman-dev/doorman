@@ -31,6 +31,7 @@ export default function EditTierPage() {
     requests_per_day: '',
     monthly_request_quota: '',
     daily_request_quota: '',
+    ai_monthly_token_allowance: '',
     // Throttling
     enable_throttling: false,
     max_queue_time_ms: '5000'
@@ -68,6 +69,7 @@ export default function EditTierPage() {
         requests_per_day: (hasRateLimits && tier.limits?.requests_per_day && tier.limits.requests_per_day < 999999) ? tier.limits.requests_per_day.toString() : '',
         monthly_request_quota: (hasRateLimits && tier.limits?.monthly_request_quota && tier.limits.monthly_request_quota < 999999) ? tier.limits.monthly_request_quota.toString() : '',
         daily_request_quota: (hasRateLimits && tier.limits?.daily_request_quota && tier.limits.daily_request_quota < 999999) ? tier.limits.daily_request_quota.toString() : '',
+        ai_monthly_token_allowance: tier.limits?.ai_monthly_token_allowance?.toString() || '',
         enable_throttling: tier.limits?.enable_throttling || false,
         max_queue_time_ms: tier.limits?.max_queue_time_ms?.toString() || '5000'
       })
@@ -104,6 +106,7 @@ export default function EditTierPage() {
           requests_per_day: rateLimitingDisabled ? unlimitedValue : (formData.requests_per_day ? parseInt(formData.requests_per_day) : undefined),
           monthly_request_quota: rateLimitingDisabled ? unlimitedValue : (formData.monthly_request_quota ? parseInt(formData.monthly_request_quota) : undefined),
           daily_request_quota: rateLimitingDisabled ? unlimitedValue : (formData.daily_request_quota ? parseInt(formData.daily_request_quota) : undefined),
+          ai_monthly_token_allowance: formData.ai_monthly_token_allowance ? Number(formData.ai_monthly_token_allowance) : null,
           burst_per_second: 0,
           burst_per_minute: 0,
           burst_per_hour: 0,
@@ -210,6 +213,13 @@ export default function EditTierPage() {
                   />
                 </div>
               </div>
+            </div>
+
+            <div className="card p-6">
+              <label className="block text-sm font-medium" title="Applies as a per-user monthly token cap for users in this tier.">AI monthly token allowance
+                <input type="number" min={1} step={1} name="ai_monthly_token_allowance" value={formData.ai_monthly_token_allowance} onChange={handleChange} className="input w-full mt-2" placeholder="No AI token cap" />
+              </label>
+              <p className="text-xs text-gray-500 mt-2">Applies as a per-user monthly token cap for users in this tier. Leave blank for no tier allowance.</p>
             </div>
 
             {/* Pricing */}

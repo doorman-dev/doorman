@@ -224,6 +224,16 @@ impl SharedStorage {
             ("vault_entries", doc! {"username": 1}, false),
             ("config_snapshots", doc! {"snapshot_id": 1}, true),
             ("tls_profiles", doc! {"id": 1}, true),
+            ("ai_access_keys", doc! {"key_hash": 1}, true),
+            ("ai_access_keys", doc! {"key_id": 1}, true),
+            ("ai_access_keys", doc! {"username": 1}, false),
+            ("ai_budgets", doc! {"budget_id": 1}, true),
+            ("ai_guardrails", doc! {"guardrail_id": 1}, true),
+            ("ai_prompt_logs", doc! {"log_id": 1}, true),
+            ("ai_prompt_logs", doc! {"expires_at": 1}, false),
+            ("ai_usage_daily", doc! {"day": 1}, false),
+            ("ai_usage_daily", doc! {"username": 1, "day": 1}, false),
+            ("ai_usage_daily", doc! {"groups": 1, "day": 1}, false),
             (
                 "revocations",
                 doc! {"type": 1, "username": 1, "jti": 1},
@@ -287,14 +297,26 @@ impl SharedStorage {
             "manage_gateway": true, "manage_subscriptions": true, "manage_credits": true,
             "manage_auth": true, "manage_security": true, "manage_tiers": true,
             "manage_rate_limits": true, "view_analytics": true, "view_logs": true,
-            "export_logs": true, "ui_access": true
+            "export_logs": true, "ui_access": true, "manage_ai": true
         });
-        if self
+        match self
             .find_one("roles", &serde_json::json!({"role_name": "admin"}))
             .await?
-            .is_none()
         {
-            self.insert_one("roles", admin_role).await?;
+            None => {
+                self.insert_one("roles", admin_role).await?;
+            }
+            // `manage_ai` is a Rust extension permission: grant it once to an
+            // admin role created before it existed, but respect an explicit value.
+            Some(role) if role.get("manage_ai").is_none() => {
+                self.update_one(
+                    "roles",
+                    &serde_json::json!({"role_name": "admin"}),
+                    &serde_json::json!({"manage_ai": true}),
+                )
+                .await?;
+            }
+            Some(_) => {}
         }
         for (name, description) in [
             ("admin", "Administrator group with full access"),
@@ -511,6 +533,9 @@ impl SharedStorage {
             revocations,
             tiers,
             tier_assignments,
+            ai_access_keys,
+            ai_budgets,
+            ai_guardrails,
         ) = tokio::try_join!(
             self.load_collection("apis"),
             self.load_collection("endpoints"),
@@ -525,6 +550,9 @@ impl SharedStorage {
             self.load_collection("revocations"),
             self.load_collection("tiers"),
             self.load_collection("user_tier_assignments"),
+            self.load_collection("ai_access_keys"),
+            self.load_collection("ai_budgets"),
+            self.load_collection("ai_guardrails"),
         )?;
         let documents = PolicyDocuments {
             apis,
@@ -540,6 +568,9 @@ impl SharedStorage {
             revocations,
             tiers,
             tier_assignments,
+            ai_access_keys,
+            ai_budgets,
+            ai_guardrails,
         };
         *self.policy_cache.write().await = Some(CachedPolicyDocuments {
             loaded_at: Instant::now(),
@@ -638,6 +669,16 @@ impl SharedStorage {
         .arg(ttl_seconds.max(1))
         .invoke_async(&mut redis)
         .await?)
+    }
+
+    /// INCRBY with a TTL set on first write (budget counters).
+    pub async fn incr_by(
+        &self,
+        key: &str,
+        amount: u64,
+        ttl_seconds: u64,
+    ) -> Result<u64, StorageError> {
+        self.add_bandwidth(key, amount, ttl_seconds).await
     }
 
     pub async fn add_bandwidth(
@@ -789,6 +830,86 @@ impl SharedStorage {
         }
         let mut redis = self.redis()?;
         Ok(redis.get::<_, Option<u64>>(key).await?.unwrap_or(0))
+    }
+
+    /// Daily AI usage rollup: `$inc` the counters of document `id`, creating it
+    /// with `set_on_insert` (plus `_id`) on first write.
+    pub async fn ai_usage_increment(
+        &self,
+        id: &str,
+        set_on_insert: &Value,
+        inc: &[(&str, i64)],
+    ) -> Result<(), StorageError> {
+        self.chaos_mongo_guard()?;
+        if let Some(memory) = &self.memory {
+            let mut collections = memory.collections.write().await;
+            let documents = collections.entry("ai_usage_daily".to_owned()).or_default();
+            let index = match documents
+                .iter()
+                .position(|doc| doc.get("_id").and_then(Value::as_str) == Some(id))
+            {
+                Some(index) => index,
+                None => {
+                    let mut document = set_on_insert.clone();
+                    if let Some(object) = document.as_object_mut() {
+                        object.insert("_id".to_owned(), Value::String(id.to_owned()));
+                    }
+                    documents.push(document);
+                    documents.len() - 1
+                }
+            };
+            if let Some(object) = documents[index].as_object_mut() {
+                for (field, amount) in inc {
+                    let current = object.get(*field).and_then(Value::as_i64).unwrap_or(0);
+                    object.insert(
+                        (*field).to_owned(),
+                        serde_json::json!(current.saturating_add(*amount)),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let mut increment = Document::new();
+        for (field, amount) in inc {
+            increment.insert(*field, *amount);
+        }
+        let set_on_insert = mongodb::bson::to_document(set_on_insert)?;
+        self.mongo()?
+            .collection::<Document>("ai_usage_daily")
+            .update_one(
+                doc! { "_id": id },
+                doc! { "$inc": increment, "$setOnInsert": set_on_insert },
+            )
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    /// Live AI counters for the overview: hash `ai_live:{minute}` (memory mode:
+    /// one counter per field, `ai_live:{minute}:{field}`). Kept for two days.
+    pub async fn ai_live_increment(
+        &self,
+        minute_start: u64,
+        fields: &[(&str, u64)],
+    ) -> Result<(), StorageError> {
+        const TTL_SECONDS: u64 = 2 * 24 * 3600;
+        let key = format!("ai_live:{minute_start}");
+        if let Some(memory) = &self.memory {
+            for (field, amount) in fields {
+                memory
+                    .increment(&format!("{key}:{field}"), *amount, TTL_SECONDS)
+                    .await;
+            }
+            return Ok(());
+        }
+        let mut redis = self.redis()?;
+        let mut pipe = redis::pipe();
+        for (field, amount) in fields {
+            pipe.hincr(&key, *field, *amount).ignore();
+        }
+        pipe.expire(&key, TTL_SECONDS as i64).ignore();
+        let _: () = pipe.query_async(&mut redis).await?;
+        Ok(())
     }
 
     pub async fn deduct_credit(&self, username: &str, group: &str) -> Result<bool, StorageError> {
@@ -1036,6 +1157,29 @@ impl SharedStorage {
     /// Remove expired per-token revocations while retaining non-expiring
     /// revoke-all records.  This deliberately lives in the storage layer so
     /// the memory and MongoDB backends have identical cleanup semantics.
+    /// Deletes prompt logs whose `expires_at` (unix seconds) has passed. Runs
+    /// in both modes alongside the revocation purge (retention, C8).
+    pub async fn purge_expired_prompt_logs(&self, now_seconds: u64) -> Result<u64, StorageError> {
+        if let Some(memory) = &self.memory {
+            let mut collections = memory.collections.write().await;
+            let records = collections.entry("ai_prompt_logs".to_owned()).or_default();
+            let before = records.len();
+            records.retain(|record| {
+                record
+                    .get("expires_at")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|expires_at| expires_at > now_seconds)
+            });
+            return Ok((before - records.len()) as u64);
+        }
+        let result = self
+            .mongo()?
+            .collection::<Document>("ai_prompt_logs")
+            .delete_many(doc! { "expires_at": { "$lte": now_seconds as i64 } })
+            .await?;
+        Ok(result.deleted_count)
+    }
+
     pub async fn purge_expired_revocations(&self, now_seconds: u64) -> Result<u64, StorageError> {
         if let Some(memory) = &self.memory {
             let mut collections = memory.collections.write().await;
@@ -1548,6 +1692,29 @@ fn value_matches(item: &Value, filter: &Value) -> bool {
             return item
                 .get(key)
                 .is_some_and(|actual| candidates.contains(actual));
+        }
+        if let Some(range) = expected
+            .as_object()
+            .filter(|range| range.keys().any(|op| op == "$gte" || op == "$lte"))
+        {
+            let Some(actual) = item.get(key) else {
+                return false;
+            };
+            return range.iter().all(|(op, bound)| {
+                let ordering = match (actual, bound) {
+                    (Value::String(actual), Value::String(bound)) => Some(actual.cmp(bound)),
+                    (Value::Number(actual), Value::Number(bound)) => actual
+                        .as_f64()
+                        .zip(bound.as_f64())
+                        .and_then(|(actual, bound)| actual.partial_cmp(&bound)),
+                    _ => None,
+                };
+                match (op.as_str(), ordering) {
+                    ("$gte", Some(ordering)) => ordering.is_ge(),
+                    ("$lte", Some(ordering)) => ordering.is_le(),
+                    _ => false,
+                }
+            });
         }
         item.get(key) == Some(expected)
     })

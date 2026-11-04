@@ -28,6 +28,8 @@ interface FilterPanelProps {
   onApplyFilters: () => void
   onClearFilters: () => void
   onSaveView?: () => void
+  aiMode?: boolean
+  aiControls?: React.ReactNode
 }
 
 const STATUS_CODE_OPTIONS = [
@@ -57,11 +59,15 @@ export default function FilterPanel({
   onEndDateChange,
   onApplyFilters,
   onClearFilters,
-  onSaveView
+  onSaveView,
+  aiMode = false,
+  aiControls,
 }: FilterPanelProps) {
   const [isExpanded, setIsExpanded] = useState(false)
   const [apiDropdownOpen, setApiDropdownOpen] = useState(false)
   const [userDropdownOpen, setUserDropdownOpen] = useState(false)
+
+  if (aiMode) return <div className="card p-4 space-y-3"><h3 className="text-lg font-semibold">AI usage filters</h3><div className="grid md:grid-cols-3 gap-4 items-end">{aiControls}<div><p className="text-sm mb-2">Date range (UTC days)</p><DateRangePicker startDate={startDate} endDate={endDate} onStartDateChange={onStartDateChange} onEndDateChange={onEndDateChange} onApply={onApplyFilters} onClear={onClearFilters} /></div></div><button type="button" className="btn btn-secondary btn-sm" onClick={onClearFilters}>Clear filters</button></div>
 
   // Multi-select handlers
   const toggleAPI = (api: string) => {

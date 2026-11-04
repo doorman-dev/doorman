@@ -1,3 +1,4 @@
+pub mod ai_settings;
 pub mod cache;
 pub mod configuration;
 pub mod field_encryption;

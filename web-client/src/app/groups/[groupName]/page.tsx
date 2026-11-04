@@ -5,6 +5,7 @@ import ConfirmModal from '@/components/ConfirmModal'
 import Link from 'next/link'
 import { useRouter, useParams } from 'next/navigation'
 import Layout from '@/components/Layout'
+import AiBudgetUsageCard from '@/components/AiBudgetUsageCard'
 import { SERVER_URL } from '@/utils/config'
 import InfoTooltip from '@/components/InfoTooltip'
 import FormHelp from '@/components/FormHelp'
@@ -273,6 +274,8 @@ const GroupDetailPage = () => {
             </button>
           </div>
         </div>
+
+        <AiBudgetUsageCard scope="group" target={groupName} />
 
         {success && (
           <div className="rounded-lg bg-success-50 border border-success-200 p-4 dark:bg-success-900/20 dark:border-success-800">

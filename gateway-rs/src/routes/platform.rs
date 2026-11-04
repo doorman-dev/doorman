@@ -41,7 +41,10 @@ use crate::{
         },
         audit::{self, global_ip_deny},
     },
-    platform_contract::{normalize_create_api, normalize_update_api},
+    platform_contract::{
+        ai_validation_message, normalize_create_api, normalize_update_api, prepare_ai_api,
+        validate_ai_api,
+    },
     policy::{
         auth::{AuthClaims, verify_request_token},
         groups::enforce_group_access,
@@ -503,6 +506,21 @@ pub async fn platform_dispatch(
             method.clone(),
             payload,
             &claims,
+            &request_id,
+        )
+        .await;
+        audit_management_request(&username, &method, path, &response);
+        return with_platform_activity_context(response, &username, path);
+    }
+
+    if path.starts_with("/ai/") || path.starts_with("/analytics/ai/") {
+        let response = crate::routes::ai_platform::dispatch(
+            &state,
+            &method,
+            path,
+            &query,
+            payload,
+            &username,
             &request_id,
         )
         .await;
@@ -1347,6 +1365,9 @@ async fn tier_crud_routes(
                 request_id,
             );
         };
+        if let Some(response) = ai_allowance_error(limits, request_id) {
+            return response;
+        }
         let fallback = || {
             success(
                 StatusCode::CREATED,
@@ -1435,6 +1456,9 @@ async fn tier_crud_routes(
             }
         }
         if let Some(limits) = payload.get("limits").filter(|value| value.is_object()) {
+            if let Some(response) = ai_allowance_error(limits, request_id) {
+                return response;
+            }
             updates["limits"] = tier_limits_response(limits);
         }
         updates["updated_at"] = json!(timestamp_now_naive());
@@ -1714,6 +1738,10 @@ fn normalize_tier_limits(value: &Value) -> Result<Value, ()> {
             None => false,
         }),
     );
+    // Rust extension for AI budgets; validated by `ai_allowance_error`.
+    if let Some(value) = input.get("ai_monthly_token_allowance") {
+        output.insert("ai_monthly_token_allowance".to_owned(), value.clone());
+    }
     Ok(Value::Object(output))
 }
 
@@ -1888,6 +1916,22 @@ fn normalize_tier_request(path: &str, method: &Method, payload: &mut Value) -> R
     }
     *payload = Value::Object(output);
     Ok(())
+}
+
+/// `limits.ai_monthly_token_allowance` (Rust extension): null or a positive integer.
+fn ai_allowance_error(limits: &Value, request_id: &str) -> Option<Response> {
+    let value = limits.get("ai_monthly_token_allowance")?;
+    if value.is_null() || value.as_u64().is_some_and(|tokens| tokens > 0) {
+        return None;
+    }
+    Some(validation_errors(
+        vec![json!({
+            "loc": ["body", "limits", "ai_monthly_token_allowance"],
+            "msg": "must be a positive integer",
+            "type": "value_error.ai"
+        })],
+        request_id,
+    ))
 }
 
 fn tier_limits_response(limits: &Value) -> Value {
@@ -3989,6 +4033,9 @@ async fn api_routes(
             Ok(payload) => payload,
             Err(errors) => return validation_errors(errors, request_id),
         };
+        if let Err(errors) = prepare_ai_api(&mut payload) {
+            return ai_config_error(&errors, request_id);
+        }
         let _tls_guard = match lock_tls_binding_mutation(state, &payload, "api").await {
             Ok(guard) => guard,
             Err(()) => {
@@ -4225,6 +4272,17 @@ async fn api_routes(
                 "No data to update",
                 request_id,
             );
+        }
+        let mut merged = existing.clone();
+        if let Some(merged) = merged.as_object_mut() {
+            merged.extend(
+                updates
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        if let Err(errors) = validate_ai_api(&merged) {
+            return ai_config_error(&errors, request_id);
         }
         let desired_public = payload
             .get("api_public")
@@ -5593,15 +5651,32 @@ const ROLE_BOOLEAN_FIELDS: [&str; 15] = [
     "view_logs",
 ];
 
+/// Native permissions outside the pinned Python role model: kept and coerced
+/// when sent, but never materialized as a default on create.
+const ROLE_EXTENSION_BOOLEAN_FIELDS: [&str; 1] = ["manage_ai"];
+
 fn normalize_role_model(payload: &mut Value, create: bool) -> Result<(), ()> {
     let object = payload.as_object_mut().ok_or(())?;
     object.retain(|field, value| {
         (matches!(
             field.as_str(),
             "role_name" | "role_description" | "export_logs"
-        ) || ROLE_BOOLEAN_FIELDS.contains(&field.as_str()))
+        ) || ROLE_BOOLEAN_FIELDS.contains(&field.as_str())
+            || ROLE_EXTENSION_BOOLEAN_FIELDS.contains(&field.as_str()))
             && (create || !value.is_null())
     });
+    for field in ROLE_EXTENSION_BOOLEAN_FIELDS {
+        match object.get(field) {
+            Some(Value::Null) => {
+                object.remove(field);
+            }
+            Some(value) => {
+                let value = security_setting_bool(value).ok_or(())?;
+                object.insert(field.to_owned(), json!(value));
+            }
+            None => {}
+        }
+    }
     // The create model materializes each permission field, including
     // `export_logs`, while the update model drops null values before `$set`.
     for field in ROLE_BOOLEAN_FIELDS.into_iter().chain(["export_logs"]) {
@@ -6005,6 +6080,18 @@ fn normalize_subscription_model(payload: &mut Value) -> Result<(), ()> {
     Ok(())
 }
 
+/// A credit definition whose header is an AI provider credential header.
+fn is_provider_credential(payload: &Value) -> bool {
+    payload
+        .get("api_key_header")
+        .and_then(Value::as_str)
+        .is_some_and(|header| {
+            ["authorization", "x-api-key", "x-goog-api-key", "api-key"]
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(header.trim()))
+        })
+}
+
 fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
     let object = payload.as_object_mut().ok_or(())?;
     object.retain(|field, _| {
@@ -6046,10 +6133,13 @@ fn normalize_credit_model(payload: &mut Value, create: bool) -> Result<(), ()> {
             object.insert(field.to_owned(), Value::Null);
         }
     }
+    // Provider credentials for AI APIs only hold a key, so they may have no
+    // tiers; every other definition keeps the pinned non-empty requirement.
+    let provider_credential = is_provider_credential(&Value::Object(object.clone()));
     let tiers = object
         .get_mut("credit_tiers")
         .and_then(Value::as_array_mut)
-        .filter(|tiers| !tiers.is_empty())
+        .filter(|tiers| provider_credential || !tiers.is_empty())
         .ok_or(())?;
     for tier in tiers {
         let tier = tier.as_object_mut().ok_or(())?;
@@ -6950,6 +7040,34 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("POST", "/platform/tools/rate-limit-simulator"),
     ("POST", "/platform/api/{api_name}/{api_version}/lifecycle"),
     ("GET", "/platform/api/{api_name}/{api_version}/versions"),
+    // AI gateway (routes/ai_platform.rs).
+    ("GET", "/platform/ai/providers"),
+    ("GET", "/platform/ai/keys"),
+    ("POST", "/platform/ai/keys"),
+    ("DELETE", "/platform/ai/keys/{key_id}"),
+    ("GET", "/platform/ai/keys/user/{username}"),
+    ("GET", "/platform/ai/pricing"),
+    ("PUT", "/platform/ai/pricing"),
+    ("GET", "/platform/ai/usage/me"),
+    ("GET", "/platform/analytics/ai/overview"),
+    ("GET", "/platform/analytics/ai/timeseries"),
+    ("GET", "/platform/analytics/ai/breakdown"),
+    ("GET", "/platform/analytics/ai/export.csv"),
+    ("GET", "/platform/ai/budgets"),
+    ("POST", "/platform/ai/budgets"),
+    ("GET", "/platform/ai/budgets/status"),
+    ("PUT", "/platform/ai/budgets/{budget_id}"),
+    ("DELETE", "/platform/ai/budgets/{budget_id}"),
+    ("GET", "/platform/ai/settings"),
+    ("PUT", "/platform/ai/settings"),
+    ("GET", "/platform/ai/guardrails"),
+    ("POST", "/platform/ai/guardrails"),
+    ("POST", "/platform/ai/guardrails/test"),
+    ("PUT", "/platform/ai/guardrails/{guardrail_id}"),
+    ("DELETE", "/platform/ai/guardrails/{guardrail_id}"),
+    ("GET", "/platform/ai/prompt-logs"),
+    ("GET", "/platform/ai/prompt-logs/{log_id}"),
+    ("DELETE", "/platform/ai/prompt-logs/{log_id}"),
 ];
 
 /// `Allow` answered by the pinned server for multi-route platform paths.
@@ -7183,6 +7301,24 @@ fn operation_body_schemas() -> &'static [(Regex, String, Option<Value>)] {
 /// the resolved route declares; `true` when the request must fail with 422.
 fn body_fails_declared_model(path: &str, method: &Method, payload: &Value) -> bool {
     let full = format!("/platform{path}");
+    // AI provider credentials may have no tiers (see normalize_credit_model);
+    // check the rest of the pinned CreditModel with a placeholder tier.
+    let relaxed;
+    let payload = if path.starts_with("/credit")
+        && is_provider_credential(payload)
+        && payload
+            .get("credit_tiers")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        let mut copy = payload.clone();
+        copy["credit_tiers"] = json!([{"tier_name": "default", "credits": 0,
+            "input_limit": 0, "output_limit": 0, "reset_frequency": "monthly"}]);
+        relaxed = copy;
+        &relaxed
+    } else {
+        payload
+    };
     let Some((_, _, Some(schema))) = operation_body_schemas()
         .iter()
         .find(|(matcher, allowed, _)| allowed == method.as_str() && matcher.is_match(&full))
@@ -7388,6 +7524,8 @@ const GATEWAY_ROUTES: &[(&str, &[&str])] = &[
     ("/api/graphql/{path:path}", &["POST"]),
     ("/api/graphql/{path:path}", &["OPTIONS"]),
     ("/api/grpc/{path:path}", &["OPTIONS"]),
+    ("/api/ai/{path:path}", &["GET", "POST"]),
+    ("/api/ai/{path:path}", &["OPTIONS"]),
     ("/api/features", &["GET"]),
     // CORS preflights bypass this table, so only POST is a registered route.
     ("/grpc-web/{api_name}/{service}/{method}", &["POST"]),
@@ -7564,7 +7702,7 @@ async fn authorize(
     }
 }
 
-async fn has_permission(state: &AppState, username: &str, permission: &str) -> bool {
+pub(crate) async fn has_permission(state: &AppState, username: &str, permission: &str) -> bool {
     let Some(storage) = &state.storage else {
         return false;
     };
@@ -13534,17 +13672,32 @@ fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
     let timestamp_time = timestamp
         .get(11..16)
         .filter(|value| value.as_bytes().get(2) == Some(&b':'));
-    if let Some(start_time) = query
-        .get("start_time")
-        .filter(|value| !value.trim().is_empty())
-        && timestamp_time.is_none_or(|value| value < start_time.as_str())
+    // With a date, the time bounds the start/end instant (so a range spanning
+    // midnight UTC works); without one, it filters the time of day.
+    let timestamp_minute = timestamp_time.and(timestamp.get(..16));
+    let time_bound = |time_key: &str, date_key: &str| {
+        let time = query
+            .get(time_key)
+            .filter(|value| !value.trim().is_empty())?;
+        Some(match query.get(date_key) {
+            Some(date) => (format!("{}T{}", date.trim(), time.trim()), true),
+            None => (time.trim().to_owned(), false),
+        })
+    };
+    let actual = |with_date: bool| {
+        if with_date {
+            timestamp_minute
+        } else {
+            timestamp_time
+        }
+    };
+    if let Some((start, with_date)) = time_bound("start_time", "start_date")
+        && actual(with_date).is_none_or(|value| value < start.as_str())
     {
         return false;
     }
-    if let Some(end_time) = query
-        .get("end_time")
-        .filter(|value| !value.trim().is_empty())
-        && timestamp_time.is_none_or(|value| value > end_time.as_str())
+    if let Some((end, with_date)) = time_bound("end_time", "end_date")
+        && actual(with_date).is_none_or(|value| value > end.as_str())
     {
         return false;
     }
@@ -14483,17 +14636,17 @@ fn set_default(target: &mut Value, key: &str, value: Value) {
     }
 }
 
-fn success(status: StatusCode, payload: Value, request_id: &str) -> Response {
+pub(crate) fn success(status: StatusCode, payload: Value, request_id: &str) -> Response {
     json_response(status, payload, request_id)
 }
 
-fn message(status: StatusCode, text: &str, request_id: &str) -> Response {
+pub(crate) fn message(status: StatusCode, text: &str, request_id: &str) -> Response {
     let mut response = json_response(status, json!({"message": text}), request_id);
     response.extensions_mut().insert(MessageEnvelope);
     response
 }
 
-fn error(status: StatusCode, code: &str, text: &str, request_id: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str, text: &str, request_id: &str) -> Response {
     json_response(
         status,
         json!({"error_code": code, "error_message": text}),
@@ -14507,6 +14660,17 @@ fn http_detail(status: StatusCode, detail: &str, request_id: &str) -> Response {
 /// FastAPI's request validation failures all pass through the pinned global
 /// RequestValidationError handler, which renders the VAL001 envelope; the
 /// Pydantic error list is only logged, never returned.
+/// AI API validation failures use the standard error body with `AI009`; the
+/// message lists each `field: reason` so the UI can show it inline.
+fn ai_config_error(errors: &[Value], request_id: &str) -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        crate::error_codes::ErrorCode::AI_INVALID_CONFIG,
+        &ai_validation_message(errors),
+        request_id,
+    )
+}
+
 fn validation_errors(errors: Vec<Value>, request_id: &str) -> Response {
     let errors = Value::Array(errors);
     tracing::debug!(%errors, "request validation failed");
@@ -14535,7 +14699,7 @@ fn response_model_envelope(message_text: &str, request_id: &str) -> Response {
     )
 }
 
-fn unexpected(request_id: &str) -> Response {
+pub(crate) fn unexpected(request_id: &str) -> Response {
     error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "GTW999",
@@ -14629,6 +14793,28 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_def_allows_empty_tiers() {
+        for header in ["Authorization", "x-api-key", "x-goog-api-key", "api-key"] {
+            let mut payload = json!({
+                "api_credit_group": "openai-prod", "api_key": "sk-test",
+                "api_key_header": header, "credit_tiers": []
+            });
+            normalize_credit_model(&mut payload, true).unwrap();
+            assert_eq!(payload["credit_tiers"], json!([]));
+        }
+        // Non-provider definitions keep the pinned non-empty tier requirement.
+        let mut payload = json!({
+            "api_credit_group": "basic", "api_key": "key",
+            "api_key_header": "header", "credit_tiers": []
+        });
+        assert!(normalize_credit_model(&mut payload, true).is_err());
+        let mut payload = json!({
+            "api_credit_group": "openai-prod", "api_key": "sk-test", "api_key_header": "api-key"
+        });
+        assert!(normalize_credit_model(&mut payload, true).is_err());
+    }
 
     #[test]
     fn subscribable_api_lines_collapse_releases_and_hide_unroutable_ones() {
@@ -14971,6 +15157,27 @@ mod tests {
             ("status_code".to_owned(), "200".to_owned()),
         ]);
         assert!(log_record_matches(&record, &filters));
+        // A local day converted to UTC spans midnight: the bounds are instants.
+        let utc_day = |start_date: &str, start_time: &str, end_date: &str, end_time: &str| {
+            HashMap::from([
+                ("start_date".to_owned(), start_date.to_owned()),
+                ("start_time".to_owned(), start_time.to_owned()),
+                ("end_date".to_owned(), end_date.to_owned()),
+                ("end_time".to_owned(), end_time.to_owned()),
+            ])
+        };
+        assert!(log_record_matches(
+            &record,
+            &utc_day("2026-09-26", "05:00", "2026-09-27", "04:59")
+        ));
+        assert!(!log_record_matches(
+            &record,
+            &utc_day("2026-09-26", "10:12", "2026-09-27", "04:59")
+        ));
+        assert!(!log_record_matches(
+            &record,
+            &utc_day("2026-09-25", "05:00", "2026-09-26", "04:59")
+        ));
         assert!(!log_record_matches(
             &record,
             &HashMap::from([("exclude_type".to_owned(), "gateway".to_owned())])

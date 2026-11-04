@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package billing_pmhpce_v3;
+
+service BillingPmhpceService {
+  rpc GetStatus (StatusRequest) returns (StatusReply) {}
+}
+
+message StatusRequest {
+  string id = 1;
+}
+
+message StatusReply {
+  string status = 1;
+  string message = 2;
+}

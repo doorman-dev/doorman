@@ -63,6 +63,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/graphql/{*path}", any(graphql_policy_then_execute))
         .route("/soap/{*path}", any(soap_policy_then_execute))
         .route("/grpc/{*path}", any(grpc_policy_then_execute))
+        .route("/ai/{*path}", any(crate::routes::ai::ai_policy_then_proxy))
         .route("/health", any(health))
         .route("/features", get(features))
         .route("/status", any(status))

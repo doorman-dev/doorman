@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation'
 export default function ReportsRedirect() {
   const router = useRouter()
   useEffect(() => {
-    router.replace('/analytics?tab=reports')
+    router.replace('/ai/usage#chargeback')
   }, [router])
   return null
 }

@@ -9,6 +9,7 @@ import SearchableSelect from '@/components/SearchableSelect'
 import { SERVER_URL } from '@/utils/config'
 import { getJson, postJson, putJson, delJson, fetchAllPaginated } from '@/utils/api'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
+import { useAuth } from '@/contexts/AuthContext'
 
 interface CreditTier {
   tier_name: string
@@ -42,6 +43,8 @@ interface UserCreditsRow {
 
 export default function CreditsPage() {
   const router = useRouter()
+  const { permissions } = useAuth()
+  const canManageCredits = !!permissions?.manage_credits
   const [form, setForm] = useState<CreditDefForm>({
     api_credit_group: '',
     api_key: '',
@@ -210,18 +213,20 @@ export default function CreditsPage() {
   }
 
   useEffect(() => {
+    if (!canManageCredits) return
     loadAllUserTokens()
     loadDefs()
-  }, [usersPage, usersPageSize])
+  }, [usersPage, usersPageSize, canManageCredits])
 
   // Debounced search to request server-side filtering
   useEffect(() => {
+    if (!canManageCredits) return
     const h = setTimeout(() => {
       setUsersPage(1)
       loadAllUserTokens()
     }, 300)
     return () => clearTimeout(h)
-  }, [userSearch])
+  }, [userSearch, canManageCredits])
 
   return (
     <ProtectedRoute requiredPermission="manage_credits">
@@ -230,10 +235,11 @@ export default function CreditsPage() {
         <div className="page-header">
           <div>
             <h1 className="page-title">Credits</h1>
-            <p className="text-gray-600 dark:text-gray-400 mt-1">Manage credit definitions and user credit balances</p>
+            <p className="text-gray-600 dark:text-gray-400 mt-1">Credit definitions and user credit balances</p>
           </div>
         </div>
 
+        {canManageCredits && <>
         <div className="card">
           <div className="p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div>
@@ -357,10 +363,12 @@ export default function CreditsPage() {
             </div>
           </div>
         </div>
+        </>}
+
       </div>
 
       {/* Assign Credits Modal */}
-      {showAssignModal && (
+      {showAssignModal && canManageCredits && (
         <div className="fixed inset-0 z-50 overflow-y-auto">
           <div className="flex items-center justify-center min-h-screen px-4">
             <div className="fixed inset-0 bg-black/50" onClick={() => setShowAssignModal(false)} />

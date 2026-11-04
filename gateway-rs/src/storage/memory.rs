@@ -47,6 +47,10 @@ impl MemoryStorage {
             "rate_limit_rules",
             "config_snapshots",
             "tls_profiles",
+            "ai_access_keys",
+            "ai_budgets",
+            "ai_guardrails",
+            "ai_prompt_logs",
         ] {
             collections.insert(name.to_owned(), Vec::new());
         }
@@ -74,6 +78,9 @@ impl MemoryStorage {
             revocations: get("revocations"),
             tiers: get("tiers"),
             tier_assignments: get("user_tier_assignments"),
+            ai_access_keys: get("ai_access_keys"),
+            ai_budgets: get("ai_budgets"),
+            ai_guardrails: get("ai_guardrails"),
         }
     }
 

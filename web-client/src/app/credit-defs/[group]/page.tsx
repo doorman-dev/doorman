@@ -7,11 +7,15 @@ import Layout from '@/components/Layout'
 import InfoTooltip from '@/components/InfoTooltip'
 import FormHelp from '@/components/FormHelp'
 import { SERVER_URL } from '@/utils/config'
-import { getJson, putJson, delJson } from '@/utils/api'
+import { getJson, putJson, delJson, fetchAllPaginated } from '@/utils/api'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import ConfirmModal from '@/components/ConfirmModal'
+import { useAiProviders } from '@/hooks/useAiProviders'
 
 export default function EditCreditDefPage() {
+  const { providers } = useAiProviders()
+  const [preset, setPreset] = useState('')
+  const [usedBy, setUsedBy] = useState<{ api_id: string; api_name: string; api_version: string }[] | null>(null)
   const params = useParams<{ group: string }>()
   const router = useRouter()
   const group = decodeURIComponent(params.group)
@@ -25,6 +29,17 @@ export default function EditCreditDefPage() {
   const [success, setSuccess] = useState<string | null>(null)
   const [showDelete, setShowDelete] = useState(false)
   const [confirmText, setConfirmText] = useState('')
+
+  useEffect(() => {
+    let active = true
+    fetchAllPaginated<{ api_id: string; api_name: string; api_version: string; api_type: string; api_ai_config?: { credential_group: string; credential_overrides?: { credential_group: string }[] } }>(
+      (page, size) => `${SERVER_URL}/platform/api/all?page=${page}&page_size=${size}`,
+      data => Array.isArray(data) ? data : data.apis || data.response?.apis || []
+    ).then(apis => {
+      if (active) setUsedBy(apis.filter(api => api.api_type === 'AI' && (api.api_ai_config?.credential_group === group || api.api_ai_config?.credential_overrides?.some(override => override.credential_group === group))))
+    }).catch(() => {})
+    return () => { active = false }
+  }, [group])
 
   useEffect(() => { load() }, [])
   const load = async () => {
@@ -84,6 +99,15 @@ export default function EditCreditDefPage() {
               <FormHelp docHref="/docs/using-fields.html#credits">Edit key header, optional key, and tiers. Changes apply immediately.</FormHelp>
               {error && <div className="text-sm text-error-600">{error}</div>}
               {success && <div className="text-sm text-success-600">{success}</div>}
+              <label className="block text-sm font-medium">Provider preset
+                <select className="input mt-1" value={preset} onChange={e => {
+                  setPreset(e.target.value)
+                  const selected = providers.find(provider => provider.id === e.target.value)
+                  if (selected) setHeader(selected.credential_header)
+                }}><option value="">None / custom</option>{providers.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select>
+              </label>
+              <p className="rounded border p-3 text-sm">Use your organization&apos;s own API key from the provider console. Consumer subscriptions (ChatGPT Plus, Claude Pro) are not supported. Provider credentials may have no credit tiers.</p>
+              <p className="text-sm">Used by AI APIs: {usedBy === null ? 'Unavailable' : usedBy.length ? usedBy.map(api => <Link className="underline mr-3" key={api.api_id} href={`/apis/${encodeURIComponent(api.api_id)}`}>{api.api_name}/{api.api_version}</Link>) : 'None'}</p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium">API Credit Group <InfoTooltip text="Immutable group name referenced by APIs for credits and key injection" /></label>
@@ -95,7 +119,7 @@ export default function EditCreditDefPage() {
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium">API Key (leave blank to keep existing) <InfoTooltip text="Optional default key for this group; leave empty to keep current. Per-user keys apply when Auth Required is enabled." /></label>
-                  <input className="input" value={api_key} onChange={e => setKey(e.target.value)} placeholder="sk_live_..." />
+                  <input type="password" autoComplete="off" className="input" value={api_key} onChange={e => setKey(e.target.value)} placeholder="Provider API key" />
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium">Credit Tiers</label>

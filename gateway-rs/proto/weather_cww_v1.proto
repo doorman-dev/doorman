@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package weather_cww_v1;
+
+service WeatherCwwService {
+  rpc GetStatus (StatusRequest) returns (StatusReply) {}
+}
+
+message StatusRequest {
+  string id = 1;
+}
+
+message StatusReply {
+  string status = 1;
+  string message = 2;
+}

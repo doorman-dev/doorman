@@ -28,6 +28,9 @@ pub struct ActivityContext {
     pub api: Option<String>,
     pub endpoint: Option<String>,
     pub upstream: Option<String>,
+    /// Usage block of a non-stream AI request (streams log a separate
+    /// `type: "ai_usage"` line when the stream ends).
+    pub ai: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +56,8 @@ struct ActivityRecord<'a> {
     upstream: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai: Option<&'a serde_json::Value>,
 }
 
 pub async fn track_active_requests(
@@ -226,6 +231,7 @@ pub async fn track_active_requests(
             api: context.api.as_deref(),
             upstream: upstream.as_deref(),
             ip_address: direct_ip,
+            ai: context.ai.as_ref(),
         };
         if let Err(error) = append_record(logs_dir, "doorman.log.rust", &record).await {
             let was_healthy = state
@@ -267,10 +273,18 @@ pub async fn track_active_requests(
     response
 }
 
+/// Appends one JSON line to the gateway activity log (`doorman.log.rust`).
+pub async fn append_json_record(
+    logs_dir: &Path,
+    record: &serde_json::Value,
+) -> std::io::Result<()> {
+    append_record(logs_dir, "doorman.log.rust", record).await
+}
+
 async fn append_record(
     logs_dir: &Path,
     filename: &str,
-    record: &ActivityRecord<'_>,
+    record: &impl Serialize,
 ) -> std::io::Result<()> {
     tokio::fs::create_dir_all(logs_dir).await?;
     let path = logs_dir.join(filename);

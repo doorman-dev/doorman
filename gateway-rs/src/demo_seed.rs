@@ -61,6 +61,7 @@ pub async fn run_seed(
     let credit_groups = seed_credits(storage, &mut rng).await?;
     seed_user_credits(storage, &users, &credit_groups, &mut rng).await?;
     seed_subscriptions(storage, &users, &api_keys, &mut rng).await?;
+    seed_ai(storage, &users, &mut rng).await?;
     seed_logs(options.logs, &users, &apis, &mut rng)?;
     seed_protos(options.protos, &apis, &mut rng)?;
     seed_metrics(&users, &apis, &mut rng);
@@ -281,6 +282,220 @@ async fn seed_endpoints(
             let uri = choose(&uris, rng);
             if !created.insert((method, uri)) || storage.find_one("endpoints", &json!({"api_name": name, "api_version": version, "endpoint_method": method, "endpoint_uri": uri})).await?.is_some() { continue; }
             storage.insert_one("endpoints", json!({"api_name": name, "api_version": version, "endpoint_method": method, "endpoint_uri": uri, "endpoint_description": format!("{method} {uri} for {name}"), "api_id": api_id, "endpoint_id": Uuid::new_v4().to_string()})).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Example Anthropic rates from plan Appendix B (as of 2026-10-06; verify).
+fn ai_example_pricing() -> Vec<Value> {
+    vec![
+        json!({"pricing_id": "demo-claude-opus-5-5", "provider": "anthropic", "model_pattern": "claude-opus-5-5", "input_usd_per_mtok": 4.0, "output_usd_per_mtok": 20.0, "cache_read_usd_per_mtok": 0.2, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
+        json!({"pricing_id": "demo-claude-sonnet-5-5", "provider": "anthropic", "model_pattern": "claude-sonnet-5-5", "input_usd_per_mtok": 2.0, "output_usd_per_mtok": 10.0, "cache_read_usd_per_mtok": 0.2, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
+        json!({"pricing_id": "demo-claude-haiku-5-5", "provider": "anthropic", "model_pattern": "claude-haiku-5-5", "input_usd_per_mtok": 0.1, "output_usd_per_mtok": 0.5, "cache_read_usd_per_mtok": null, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify; >100K-token prompts priced higher"}),
+        json!({"pricing_id": "demo-claude-fable-5-1", "provider": "anthropic", "model_pattern": "claude-fable-5-1", "input_usd_per_mtok": 10.0, "output_usd_per_mtok": 50.0, "cache_read_usd_per_mtok": null, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
+    ]
+}
+
+/// One AI API per provider. Their credential groups hold **no key** (never
+/// seed real keys), so calls answer `AI006` until an admin adds one. Also an
+/// example pricing set, one budget, one guardrail and 30 days of usage.
+async fn seed_ai(
+    storage: &SharedStorage,
+    users: &[String],
+    rng: &mut StdRng,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let apis = [
+        (
+            "demo-openai",
+            "openai",
+            "https://api.openai.com",
+            "openai-demo",
+            "authorization",
+            vec!["gpt-demo", "gpt-demo-mini*"],
+        ),
+        (
+            "demo-claude",
+            "anthropic",
+            "https://api.anthropic.com",
+            "anthropic-demo",
+            "x-api-key",
+            vec!["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+        ),
+        (
+            "demo-gemini",
+            "gemini",
+            "https://generativelanguage.googleapis.com",
+            "gemini-demo",
+            "x-goog-api-key",
+            vec!["gemini-demo"],
+        ),
+        (
+            "demo-azure",
+            "azure_openai",
+            "https://demo-resource.openai.azure.com",
+            "azure-demo",
+            "api-key",
+            vec!["gpt-demo-deployment"],
+        ),
+        (
+            "demo-local-llm",
+            "openai_compatible",
+            "http://ollama:11434",
+            "local-llm-demo",
+            "authorization",
+            vec!["llama-demo"],
+        ),
+    ];
+    for (name, provider, server, credential_group, header, models) in &apis {
+        if storage
+            .find_one(
+                "credit_defs",
+                &json!({"api_credit_group": credential_group}),
+            )
+            .await?
+            .is_none()
+        {
+            storage
+                .insert_one(
+                    "credit_defs",
+                    json!({"api_credit_group": credential_group, "api_key": "", "api_key_header": header,
+                        "api_key_new": null, "api_key_rotation_expires": null, "credit_tiers": []}),
+                )
+                .await?;
+        }
+        if storage
+            .find_one("apis", &json!({"api_name": name, "api_version": "v1"}))
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        storage
+            .insert_one(
+                "apis",
+                json!({
+                    "api_id": Uuid::new_v4().to_string(), "api_name": name, "api_version": "v1",
+                    "api_path": format!("/{name}/v1"), "api_type": "AI", "api_ai_provider": provider,
+                    "api_description": format!("Demo {provider} AI API (add a provider key to {credential_group} to use it)"),
+                    "api_servers": [server], "api_allowed_groups": ["ALL"], "api_allowed_roles": [],
+                    "api_public": false, "api_auth_required": true, "api_allowed_retry_count": 0,
+                    "api_credits_enabled": false, "active": true,
+                    "api_ai_config": {"credential_group": credential_group, "allowed_models": models,
+                        "model_aliases": {}, "stream_allowed": true, "forward_user_id": true},
+                }),
+            )
+            .await?;
+    }
+    let pricing = ai_example_pricing();
+    if storage
+        .find_many("ai_pricing", &json!({}))
+        .await?
+        .is_empty()
+    {
+        for row in &pricing {
+            let mut row = row.clone();
+            row["updated_at"] = json!(timestamp());
+            storage.insert_one("ai_pricing", row).await?;
+        }
+    }
+    if storage
+        .find_one("ai_budgets", &json!({"budget_id": "demo-monthly-ai-spend"}))
+        .await?
+        .is_none()
+    {
+        storage
+            .insert_one(
+                "ai_budgets",
+                json!({"budget_id": "demo-monthly-ai-spend", "name": "Demo monthly AI spend", "scope": "global",
+                    "target": "", "period": "month", "limit_type": "cost", "limit_value": 100_000_000_000u64,
+                    "action": "warn", "downgrade_model": null, "warn_at_percent": 80, "enabled": true}),
+            )
+            .await?;
+    }
+    if storage
+        .find_one(
+            "ai_guardrails",
+            &json!({"guardrail_id": "demo-redact-secrets"}),
+        )
+        .await?
+        .is_none()
+    {
+        storage
+            .insert_one(
+                "ai_guardrails",
+                json!({"guardrail_id": "demo-redact-secrets", "name": "Redact secrets and email", "enabled": true,
+                    "applies_to": {"apis": ["*"], "groups": ["*"]}, "direction": "input",
+                    "detectors": [{"type": "builtin", "id": "email"}, {"type": "builtin", "id": "aws_access_key"},
+                        {"type": "builtin", "id": "private_key_pem"}, {"type": "builtin", "id": "generic_api_key"}],
+                    "action": "redact", "mode": "enforce"}),
+            )
+            .await?;
+    }
+    storage.bump_policy_revision().await?;
+
+    // 30 days of daily rollups for a sample of users, priced with the example table.
+    let prices = crate::ai::pricing::PriceTable::from_docs(&pricing)
+        .unwrap_or_else(|_| crate::ai::pricing::PriceTable::empty());
+    let models = [
+        ("demo-claude/v1", "anthropic", "claude-sonnet-5-5"),
+        ("demo-claude/v1", "anthropic", "claude-haiku-5-5"),
+        ("demo-claude/v1", "anthropic", "claude-opus-5-5"),
+        ("demo-openai/v1", "openai", "gpt-demo-mini"),
+    ];
+    let today = OffsetDateTime::now_utc().date();
+    for username in users.iter().take(8) {
+        let groups = storage
+            .find_one("users", &json!({"username": username}))
+            .await?
+            .and_then(|user| user.get("groups").cloned())
+            .unwrap_or_else(|| json!([]));
+        for days_ago in 0..30 {
+            let day = (today - Duration::days(days_ago)).to_string();
+            for (api, provider, model) in models {
+                if rng.random_bool(0.4) {
+                    continue;
+                }
+                let requests: u64 = rng.random_range(1..=25);
+                let usage = crate::ai::usage::AiUsage {
+                    input_tokens: requests * rng.random_range(200..4_000),
+                    output_tokens: requests * rng.random_range(50..1_200),
+                    cache_read_tokens: requests * rng.random_range(0..500),
+                    ..Default::default()
+                };
+                let cost = prices.cost(provider, model, &usage, OffsetDateTime::now_utc());
+                let errors = u64::from(rng.random_bool(0.05));
+                let as_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                storage
+                    .ai_usage_increment(
+                        &format!("{day}|{api}|{model}|{username}"),
+                        &json!({"day": day, "api": api, "provider": provider, "model": model,
+                            "username": username, "groups": groups}),
+                        &[
+                            ("requests", as_i64(requests)),
+                            ("errors", as_i64(errors)),
+                            ("input_tokens", as_i64(usage.input_tokens)),
+                            ("output_tokens", as_i64(usage.output_tokens)),
+                            ("cache_read_tokens", as_i64(usage.cache_read_tokens)),
+                            ("cache_write_tokens", 0),
+                            ("cost_nanos", as_i64(cost.cost_nanos)),
+                            ("estimated_requests", 0),
+                            (
+                                "unpriced_requests",
+                                if cost.unpriced { as_i64(requests) } else { 0 },
+                            ),
+                            (
+                                "latency_ms_total",
+                                as_i64(requests * rng.random_range(300..4_000)),
+                            ),
+                            (
+                                "ttft_ms_total",
+                                as_i64(requests * rng.random_range(80..900)),
+                            ),
+                        ],
+                    )
+                    .await?;
+            }
         }
     }
     Ok(())

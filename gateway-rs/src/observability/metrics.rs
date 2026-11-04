@@ -77,6 +77,15 @@ pub fn render(runtime: &GatewayRuntime) -> String {
         runtime.retries_total.load(Ordering::Relaxed)
     );
     output.push_str(
+        "# HELP doorman_ai_usage_record_failures_total Failed AI usage writes\n\
+         # TYPE doorman_ai_usage_record_failures_total counter\n",
+    );
+    let _ = writeln!(
+        output,
+        "doorman_ai_usage_record_failures_total {}",
+        crate::ai::usage::USAGE_RECORD_FAILURES.load(Ordering::Relaxed)
+    );
+    output.push_str(
         "# HELP doorman_upstream_timeouts_total Upstream timeout count\n\
          # TYPE doorman_upstream_timeouts_total counter\n",
     );

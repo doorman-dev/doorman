@@ -10,6 +10,7 @@ pub struct BodyLimits {
     pub soap: usize,
     pub graphql: usize,
     pub grpc: usize,
+    pub ai: usize,
 }
 
 impl BodyLimits {
@@ -21,6 +22,7 @@ impl BodyLimits {
                 soap: usize::MAX,
                 graphql: usize::MAX,
                 grpc: usize::MAX,
+                ai: usize::MAX,
             };
         }
         let default = env_usize("MAX_BODY_SIZE_BYTES", 1024 * 1024);
@@ -30,6 +32,8 @@ impl BodyLimits {
             soap: env_usize("MAX_BODY_SIZE_BYTES_SOAP", default),
             graphql: env_usize("MAX_BODY_SIZE_BYTES_GRAPHQL", default),
             grpc: env_usize("MAX_BODY_SIZE_BYTES_GRPC", default),
+            // 32 MiB matches Anthropic's request ceiling and leaves room for base64 images.
+            ai: env_usize("MAX_BODY_SIZE_AI", 32 * 1024 * 1024),
         }
     }
 

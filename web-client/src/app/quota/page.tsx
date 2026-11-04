@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react'
 import Layout from '@/components/Layout'
+import AiBudgetUsageCard from '@/components/AiBudgetUsageCard'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { getJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
@@ -318,6 +319,7 @@ export default function QuotaDashboardPage() {
               </div>
             </>
           ) : null}
+          <AiBudgetUsageCard />
         </div>
       </Layout>
     </ProtectedRoute>
