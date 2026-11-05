@@ -12,8 +12,8 @@ use crate::{
         adapter::PRESETS,
         budgets::{self, BudgetSpec},
         keys,
-        pricing::{format_usd, validate_pricing_doc},
-        usage::invalidate_price_table,
+        pricing::{builtin_prices, builtin_prices_enabled, format_usd, validate_pricing_doc},
+        usage::{AiUsage, invalidate_price_table, price_table},
     },
     error_codes::ErrorCode,
     observability::audit,
@@ -56,6 +56,32 @@ pub(crate) async fn dispatch(
                 return forbidden("You do not have permission to view AI pricing", request_id);
             }
             get_pricing(state, request_id).await
+        }
+        (Method::GET, ["ai", "pricing", "builtin"]) => {
+            if !has_permission(state, username, "view_analytics").await {
+                return forbidden("You do not have permission to view AI pricing", request_id);
+            }
+            let document = builtin_prices();
+            success(
+                StatusCode::OK,
+                json!({
+                    "enabled": builtin_prices_enabled(),
+                    "source": document.get("source"),
+                    "license": document.get("license"),
+                    "generated_at": document.get("generated_at"),
+                    "prices": document.get("prices").cloned().unwrap_or_else(|| json!([])),
+                }),
+                request_id,
+            )
+        }
+        (Method::POST, ["ai", "pricing", "recalculate"]) => {
+            if !has_permission(state, username, "manage_ai").await {
+                return forbidden(
+                    "You do not have permission to manage AI pricing",
+                    request_id,
+                );
+            }
+            recalculate_pricing(state, &payload, request_id).await
         }
         (Method::PUT, ["ai", "pricing"]) => {
             if !has_permission(state, username, "manage_ai").await {
@@ -202,6 +228,99 @@ fn pricing_row(doc: &Value) -> Value {
                 )
             })
             .collect(),
+    )
+}
+
+/// Re-prices past daily rollups that were recorded with no price, using the
+/// current prices (admin and built-in). Rows that were partly priced are left
+/// alone, because their tokens can't be split. Budget counters are not changed.
+async fn recalculate_pricing(state: &AppState, payload: &Value, request_id: &str) -> Response {
+    let Some(storage) = &state.storage else {
+        return unexpected(request_id);
+    };
+    let days = payload
+        .get("days")
+        .and_then(Value::as_u64)
+        .unwrap_or(90)
+        .clamp(1, 3650);
+    let since = (OffsetDateTime::now_utc() - Duration::days(days as i64))
+        .date()
+        .to_string();
+    let rows = match storage.find_many("ai_usage_daily", &json!({})).await {
+        Ok(rows) => rows,
+        Err(_) => return unexpected(request_id),
+    };
+    invalidate_price_table();
+    let table = price_table(Some(storage)).await;
+    let number = |row: &Value, field: &str| row.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let (mut repriced, mut requests, mut skipped, mut still_unpriced) =
+        (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut added_nanos = 0_u64;
+    for row in rows {
+        let unpriced = number(&row, "unpriced_requests");
+        let day = row.get("day").and_then(Value::as_str).unwrap_or_default();
+        if unpriced == 0 || day < since.as_str() {
+            continue;
+        }
+        if unpriced < number(&row, "requests").saturating_sub(number(&row, "errors")) {
+            skipped += 1;
+            continue;
+        }
+        let at = time::Date::parse(
+            day,
+            time::macros::format_description!("[year]-[month]-[day]"),
+        )
+        .map(|date| date.midnight().assume_utc())
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let usage = AiUsage {
+            input_tokens: number(&row, "input_tokens"),
+            output_tokens: number(&row, "output_tokens"),
+            cache_read_tokens: number(&row, "cache_read_tokens"),
+            cache_write_tokens: number(&row, "cache_write_tokens"),
+            ..AiUsage::default()
+        };
+        let provider = row
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let model = row.get("model").and_then(Value::as_str).unwrap_or_default();
+        let cost = table.cost(provider, model, &usage, at);
+        if cost.unpriced {
+            still_unpriced += 1;
+            continue;
+        }
+        let Some(id) = row.get("_id").cloned() else {
+            continue;
+        };
+        let total = number(&row, "cost_nanos").saturating_add(cost.cost_nanos);
+        let update = json!({
+            "cost_nanos": i64::try_from(total).unwrap_or(i64::MAX),
+            "unpriced_requests": 0,
+        });
+        match storage
+            .update_one("ai_usage_daily", &json!({"_id": id}), &update)
+            .await
+        {
+            Ok(Some(_)) => {
+                repriced += 1;
+                requests += unpriced;
+                added_nanos = added_nanos.saturating_add(cost.cost_nanos);
+            }
+            Ok(None) => {}
+            Err(_) => return unexpected(request_id),
+        }
+    }
+    success(
+        StatusCode::OK,
+        json!({
+            "days": days,
+            "repriced_rows": repriced,
+            "repriced_requests": requests,
+            "added_cost_usd": format_usd(added_nanos),
+            "skipped_partly_priced_rows": skipped,
+            "still_unpriced_rows": still_unpriced,
+        }),
+        request_id,
     )
 }
 
@@ -1015,12 +1134,12 @@ async fn validate_budget(state: &AppState, input: &Value) -> Result<Value, Strin
         _ => errors.push("scope: must be user, group, tier, api or global".to_owned()),
     }
     let period = text("period");
-    if !matches!(period, "day" | "week" | "month") {
-        errors.push("period: must be day, week or month".to_owned());
+    if !matches!(period, "minute" | "hour" | "day" | "week" | "month") {
+        errors.push("period: must be minute, hour, day, week or month".to_owned());
     }
     let limit_type = text("limit_type");
-    if !matches!(limit_type, "cost" | "tokens") {
-        errors.push("limit_type: must be cost or tokens".to_owned());
+    if !matches!(limit_type, "cost" | "tokens" | "requests") {
+        errors.push("limit_type: must be cost, tokens or requests".to_owned());
     }
     let limit_value = input
         .get("limit_value")
@@ -1032,6 +1151,8 @@ async fn validate_budget(state: &AppState, input: &Value) -> Result<Value, Strin
     let action = text("action");
     if !matches!(action, "warn" | "downgrade" | "block") {
         errors.push("action: must be warn, downgrade or block".to_owned());
+    } else if matches!(period, "minute" | "hour") && action != "block" {
+        errors.push("action: per-minute and per-hour limits always block".to_owned());
     }
     let downgrade_model = text("downgrade_model");
     if action == "downgrade" {

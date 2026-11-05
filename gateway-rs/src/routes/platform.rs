@@ -7048,6 +7048,8 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/platform/ai/keys/user/{username}"),
     ("GET", "/platform/ai/pricing"),
     ("PUT", "/platform/ai/pricing"),
+    ("GET", "/platform/ai/pricing/builtin"),
+    ("POST", "/platform/ai/pricing/recalculate"),
     ("GET", "/platform/ai/usage/me"),
     ("GET", "/platform/analytics/ai/overview"),
     ("GET", "/platform/analytics/ai/timeseries"),

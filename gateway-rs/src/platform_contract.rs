@@ -445,6 +445,45 @@ pub fn validate_ai_api(api: &Value) -> Result<(), Vec<Value>> {
         if config.first_byte_timeout_ms == 0 || config.stream_idle_timeout_ms == 0 {
             fail("api_ai_config", "timeouts must be greater than 0");
         }
+        if config.fallback_targets.len() > crate::ai::config::MAX_FALLBACK_TARGETS {
+            fail(
+                "api_ai_config.fallback_targets",
+                "at most 10 backup targets are allowed",
+            );
+        }
+        if config.load_balance
+            && !config
+                .fallback_targets
+                .iter()
+                .any(|target| target.server.is_some())
+        {
+            fail(
+                "api_ai_config.load_balance",
+                "load balancing needs a backup on a different server; backup keys on the same server are used for failover only",
+            );
+        }
+        for target in &config.fallback_targets {
+            if target.credential_group.trim().is_empty() && target.server.is_none() {
+                fail(
+                    "api_ai_config.fallback_targets",
+                    "each backup needs a credential group, a server, or both",
+                );
+            }
+            if target.server.as_deref().is_some_and(|server| {
+                !(server.starts_with("https://") || server.starts_with("http://"))
+            }) {
+                fail(
+                    "api_ai_config.fallback_targets",
+                    "backup server must be an http(s) URL",
+                );
+            }
+            if !(1..=1000).contains(&target.weight) {
+                fail(
+                    "api_ai_config.fallback_targets",
+                    "weight must be between 1 and 1000",
+                );
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())

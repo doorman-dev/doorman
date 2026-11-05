@@ -2,8 +2,8 @@
 
 import Link from 'next/link'
 import { useEffect, useMemo, useState } from 'react'
-import Layout from '@/components/Layout'
-import { SignalCopyButton, SignalPageHeader } from '@/components/signal/Signal'
+import AiPage from '@/components/AiPage'
+import { SignalCopyButton } from '@/components/signal/Signal'
 import { useAuth } from '@/contexts/AuthContext'
 import { useAiProviders } from '@/hooks/useAiProviders'
 import { fetchAllPaginated, getJson, postJson, putJson } from '@/utils/api'
@@ -36,6 +36,8 @@ export default function AiSetupPage() {
   const { permissions } = useAuth()
   const { providers: presets } = useAiProviders()
   const [step, setStep] = useState(0)
+  // Errors show only after the user tries to continue, not before they've typed anything.
+  const [attempted, setAttempted] = useState(false)
   const [drafts, setDrafts] = useState<Record<AiProvider, ProviderDraft>>(() => Object.fromEntries(ORDER.map(id => [id, { enabled: id === 'openai' || id === 'anthropic', key: '', name: DEFAULTS[id].name, models: DEFAULTS[id].models, server: '' }])) as Record<AiProvider, ProviderDraft>)
   const [everyone, setEveryone] = useState(true)
   const [groups, setGroups] = useState<string[]>([])
@@ -151,29 +153,29 @@ export default function AiSetupPage() {
   const error = stepError()
   const amountLabel = unit === 'cost' ? 'USD per month' : 'tokens per month'
 
-  return <Layout>
+  const go = (target: number) => { if (target > step && error) { setAttempted(true); return } setAttempted(false); setStep(target) }
+  return <AiPage title="Add AI providers" description="Connect providers, choose who can use them and set allowances." permission="manage_ai">
     <div className="space-y-6 max-w-4xl">
-      <SignalPageHeader kicker="AI gateway" title="AI setup" description="Give employees access to AI providers with allowances, in four steps." />
       {missing.length > 0 && <p role="alert" className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">Your role is missing {missing.join(', ')}. Setup will stop at the first step that needs it.</p>}
-      <ol className="flex flex-wrap gap-2 text-sm">{STEPS.map((label, index) => <li key={label} className={`px-3 py-1 rounded-full border ${index === step ? 'border-primary-600 text-primary-700 font-medium' : index < step ? 'border-green-600 text-green-700' : 'border-gray-300 text-gray-500'}`}>{index + 1}. {label}</li>)}</ol>
+      <ol className="ai-steps" aria-label="Setup steps">{STEPS.map((label, index) => <li key={label} aria-current={index === step ? 'step' : undefined} className={index < step ? 'is-done' : ''}><span>{index + 1}</span>{label}</li>)}</ol>
 
       {done ? <section className="card p-6 space-y-4">
         <h3 className="card-title">You&apos;re set up</h3>
         <ul className="text-sm space-y-1">{log.map((line, index) => <li key={index}>✓ {line.text}</li>)}</ul>
         <div className="space-y-2"><p className="font-medium text-sm">Tell your employees</p><p className="text-sm bg-gray-50 p-3 rounded">{shareText}</p><SignalCopyButton text={shareText} label="Copy message" /></div>
         <div className="flex flex-wrap gap-2"><Link className="btn btn-primary" href="/my-ai">Open My AI</Link><Link className="btn btn-secondary" href="/ai/allowances">Adjust allowances</Link><Link className="btn btn-secondary" href="/ai/usage">Watch usage</Link></div>
-        <p className="text-xs text-gray-500">Individual exceptions: add a “One user” budget in Credits → AI Budgets. Guardrails (PII redaction) are in Security → AI Guardrails.</p>
+        <p className="text-xs text-gray-500">For one person's exception, add an allowance for that user in Allowances. To redact personal data, add a guardrail in Policies.</p>
       </section> : <>
         {step === 0 && <section className="card p-6 space-y-4">
           <div><h3 className="card-title">Which AI providers will you offer?</h3><p className="text-sm text-gray-500">Paste each company API key once. It is encrypted and never shown to employees.</p></div>
-          {ORDER.map(id => { const draft = drafts[id]; return <div key={id} className={`rounded border p-4 space-y-3 ${draft.enabled ? 'border-primary-300' : 'border-gray-200'}`}>
+          {ORDER.map(id => { const draft = drafts[id]; return <div key={id} className="border-t border-gray-100 pt-4 space-y-3 first-of-type:border-t-0 first-of-type:pt-0">
             <label className="flex items-center gap-2 font-medium"><input type="checkbox" checked={draft.enabled} onChange={event => update(id, { enabled: event.target.checked })} />{providerLabel(id)}</label>
             {draft.enabled && <div className="grid gap-3 md:grid-cols-2 text-sm">
               <label className="block md:col-span-2">API key<input className="input w-full mt-1" type="password" autoComplete="off" value={draft.key} onChange={event => update(id, { key: event.target.value })} placeholder={id === 'anthropic' ? 'sk-ant-…' : id === 'openai' ? 'sk-…' : 'Provider key'} /></label>
               {needsServer(id) && <label className="block md:col-span-2">Endpoint URL<input className="input w-full mt-1" value={draft.server} onChange={event => update(id, { server: event.target.value })} placeholder={id === 'azure_openai' ? 'https://YOUR-RESOURCE.openai.azure.com' : 'http://llm.internal:8000'} /></label>}
               <label className="block">Allowed models<input className="input w-full mt-1 font-mono" value={draft.models} onChange={event => update(id, { models: event.target.value })} placeholder={id === 'azure_openai' ? 'your-deployment-name' : 'model-*'} /><span className="text-xs text-gray-500">Comma-separated; a trailing * allows a family.</span></label>
               <label className="block">Name in URLs<input className="input w-full mt-1 font-mono" value={draft.name} onChange={event => update(id, { name: event.target.value.toLowerCase() })} /></label>
-              {providerErrors[id] && <p className="text-xs text-red-600 md:col-span-2">{providerErrors[id]}</p>}
+              {attempted && providerErrors[id] && <p className="text-xs text-red-600 md:col-span-2">{providerErrors[id]}</p>}
             </div>}
           </div> })}
         </section>}
@@ -214,12 +216,12 @@ export default function AiSetupPage() {
         </section>}
 
         {step < 3 && <div className="flex items-center gap-3">
-          {step > 0 && <button type="button" className="btn btn-secondary" onClick={() => setStep(step - 1)}>Back</button>}
-          <button type="button" className="btn btn-primary" disabled={!!error} onClick={() => setStep(step + 1)}>Continue</button>
-          {error && <p className="text-sm text-red-600">{error}</p>}
+          {step > 0 && <button type="button" className="btn btn-secondary" onClick={() => go(step - 1)}>Back</button>}
+          <button type="button" className="btn btn-primary" onClick={() => go(step + 1)}>Continue</button>
+          {attempted && error && <p role="alert" className="text-sm text-red-600">{error}</p>}
         </div>}
         {step === 3 && !running && log.length === 0 && <button type="button" className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>}
       </>}
     </div>
-  </Layout>
+  </AiPage>
 }

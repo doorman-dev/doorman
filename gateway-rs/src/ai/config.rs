@@ -12,6 +12,22 @@ pub struct CredentialOverride {
     pub credential_group: String,
 }
 
+/// A backup upstream for failover and load balancing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiTarget {
+    /// `credit_defs.api_credit_group` with this target's key. Empty = the API's own key.
+    #[serde(default)]
+    pub credential_group: String,
+    /// Base URL. None = the API's upstream server (another key, same endpoint).
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Share of traffic when `load_balance` is on. The primary counts as 1.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+pub const MAX_FALLBACK_TARGETS: usize = 10;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiApiConfig {
     /// `credit_defs.api_credit_group` holding the provider key (C1). Required.
@@ -50,6 +66,14 @@ pub struct AiApiConfig {
     pub first_byte_timeout_ms: u64,
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
+    /// Backups tried in order when the primary returns 502-504, times out
+    /// before the first byte, or cannot be reached. Never on 429 (C3).
+    #[serde(default)]
+    pub fallback_targets: Vec<AiTarget>,
+    /// Spread requests by weight across the primary and the backups that use a
+    /// different server. Never across keys on the same server (C3).
+    #[serde(default)]
+    pub load_balance: bool,
 }
 
 impl Default for AiApiConfig {
@@ -70,6 +94,8 @@ impl Default for AiApiConfig {
             guardrail_ids: Vec::new(),
             first_byte_timeout_ms: default_first_byte_timeout_ms(),
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
+            fallback_targets: Vec::new(),
+            load_balance: false,
         }
     }
 }
@@ -88,6 +114,10 @@ pub fn model_allowed(model: &str, allowed_models: &[String]) -> bool {
             Some(prefix) => model.starts_with(prefix),
             None => pattern == model,
         })
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 fn default_true() -> bool {

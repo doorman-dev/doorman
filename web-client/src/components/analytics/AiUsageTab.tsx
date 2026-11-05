@@ -3,9 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import TimeSeriesChart from '@/components/analytics/TimeSeriesChart'
-import APIDistributionChart from '@/components/analytics/APIDistributionChart'
 import DetailModal from '@/components/analytics/DetailModal'
-import FilterPanel from '@/components/analytics/FilterPanel'
 import AiBudgetBar from '@/components/AiBudgetBar'
 import { getJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
@@ -40,8 +38,6 @@ export default function AiUsageTab({ start, end, refreshToken, onRangeChange, on
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [retry, setRetry] = useState(0)
-  const [inputStart, setInputStart] = useState(`${start}T00:00`)
-  const [inputEnd, setInputEnd] = useState(`${end}T23:59`)
   const [filters, setFilters] = useState<Filters>(EMPTY)
   const [choices, setChoices] = useState<Record<FilterKey, string[]>>({ model: [], group: [], role: [], tier: [], provider: [] })
   const [view, setView] = useState<AiBreakdownDimension>('user')
@@ -50,7 +46,6 @@ export default function AiUsageTab({ start, end, refreshToken, onRangeChange, on
   const [selectedUser, setSelectedUser] = useState<AiUsageRow | null>(null)
   const [userDetail, setUserDetail] = useState<{ models: AiUsageRow[]; providers: AiUsageRow[] } | null>(null)
   const [userError, setUserError] = useState<string | null>(null)
-  useEffect(() => { setInputStart(`${start}T00:00`); setInputEnd(`${end}T23:59`) }, [start, end])
   const query = useMemo(() => {
     const params = new URLSearchParams({ start, end })
     for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value)
@@ -122,21 +117,24 @@ export default function AiUsageTab({ start, end, refreshToken, onRangeChange, on
   const detailTable = (rows: AiUsageRow[], column: string, dimension: string) => <table className="table w-full text-sm"><thead><tr><th>{column}</th><th>Requests</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>{rows.map(row => <tr key={row.key}><td>{keyLabel(dimension, row.key)}</td><td>{formatTokens(row.requests)}</td><td>{formatTokens(tokens(row))}</td><td>{formatUsd(row.cost_nanos)}</td></tr>)}</tbody></table>
 
   return <div className="space-y-5">
-    <div className="flex flex-wrap justify-between gap-3"><div><h3 className="text-lg font-semibold">AI Usage</h3><p className="text-sm text-gray-500">Daily UTC totals from {start} through {end}.</p></div><a href="#chargeback" className="btn btn-secondary">AI chargeback report</a></div>
-    <FilterPanel aiMode availableAPIs={[]} availableUsers={[]} selectedAPIs={[]} selectedUsers={[]} selectedStatusCodes={[]} selectedMethods={[]} searchQuery="" startDate={inputStart} endDate={inputEnd} onAPIsChange={() => {}} onUsersChange={() => {}} onStatusCodesChange={() => {}} onMethodsChange={() => {}} onSearchChange={() => {}} onStartDateChange={setInputStart} onEndDateChange={setInputEnd} onApplyFilters={() => onRangeChange(inputStart, inputEnd)} onClearFilters={() => { setFilters(EMPTY); onClearRange() }}
-      aiControls={<div className="flex flex-wrap gap-3">{FILTERS.map(item => <label key={item.key} className="text-sm min-w-[10rem] flex-1">{item.label}<select className="input w-full mt-1" value={filters[item.key]} onChange={event => setFilters(current => ({ ...current, [item.key]: event.target.value }))}><option value="">{item.all}</option>{[...new Set([...choices[item.key], ...(filters[item.key] ? [filters[item.key]] : [])])].map(value => <option key={value} value={value}>{keyLabel(item.key, value)}</option>)}</select></label>)}</div>} />
-    {applied.length > 0 && <div className="flex flex-wrap gap-2 items-center text-sm"><span className="text-gray-500">Showing:</span>{applied.map(item => <button key={item.key} type="button" className="border rounded-full px-3 py-0.5 hover:bg-gray-50" onClick={() => setFilters(current => ({ ...current, [item.key]: '' }))} aria-label={`Remove ${item.label} filter`}>{item.label}: {keyLabel(item.key, filters[item.key])} ✕</button>)}</div>}
+    <div className="flex flex-wrap items-end gap-3" aria-label="Filter AI usage">
+      {FILTERS.map(item => <label key={item.key} className="text-xs text-gray-500 flex flex-col gap-1">{item.label}<select id={`ai-filter-${item.key}`} className="input w-auto min-w-[9rem] text-sm" value={filters[item.key]} onChange={event => setFilters(current => ({ ...current, [item.key]: event.target.value }))}><option value="">{item.all}</option>{[...new Set([...choices[item.key], ...(filters[item.key] ? [filters[item.key]] : [])])].map(value => <option key={value} value={value}>{keyLabel(item.key, value)}</option>)}</select></label>)}
+      <label className="text-xs text-gray-500 flex flex-col gap-1">From<input id="ai-filter-start" type="date" className="input w-auto text-sm" value={start} max={end} onChange={event => event.target.value && onRangeChange(event.target.value, end)} /></label>
+      <label className="text-xs text-gray-500 flex flex-col gap-1">To<input id="ai-filter-end" type="date" className="input w-auto text-sm" value={end} min={start} onChange={event => event.target.value && onRangeChange(start, event.target.value)} /></label>
+      {(applied.length > 0) && <button type="button" className="btn btn-ghost" onClick={() => { setFilters(EMPTY); onClearRange() }}>Clear filters</button>}
+    </div>
     {loading && <p className="text-sm text-gray-500">Loading AI usage…</p>}
     {error && <div role="alert" className="space-y-2"><p className="text-sm text-red-600">{error}</p><button type="button" className="btn btn-secondary" onClick={() => setRetry(value => value + 1)}>Retry</button></div>}
-    {!loading && !error && data && (data.overview.requests === 0 && !applied.length ? <div className="text-center p-8 border rounded"><p>No AI traffic yet.</p><Link href="/ai/setup" className="btn btn-primary mt-3">Set up AI for employees</Link></div> : <>
-      <div className="grid sm:grid-cols-2 xl:grid-cols-6 gap-3">{[
-        ['Spend', formatUsd(data.overview.cost_nanos)], ['Input tokens (uncached)', formatTokens(data.overview.input_tokens)], ['Output tokens', formatTokens(data.overview.output_tokens)], ['Requests', formatTokens(data.overview.requests)], ['Active users', formatTokens(data.overview.active_users)],
-      ].map(([label, value]) => <div key={label} className="border rounded p-4"><p className="text-xs text-gray-500">{label}</p><p className="text-xl font-semibold mt-1">{value}</p></div>)}<Link href="/ai/pricing" className={`border rounded p-4 ${data.overview.unpriced_requests ? 'border-amber-300 bg-amber-50' : ''}`}><p className="text-xs text-gray-500">Unpriced requests</p><p className="text-xl font-semibold mt-1">{formatTokens(data.overview.unpriced_requests)}</p><p className="text-xs underline mt-1">Review pricing</p></Link></div>
+    {!loading && !error && data && (data.overview.requests === 0 && !applied.length ? <div className="card text-center p-10"><p>No AI traffic in this period.</p><Link href="/ai/setup" className="btn btn-primary mt-3">Set up AI for employees</Link></div> : <>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">{[
+        ['Spend', formatUsd(data.overview.cost_nanos)], ['Requests', formatTokens(data.overview.requests)], ['Tokens', formatTokens(data.overview.input_tokens + data.overview.output_tokens)], ['Active employees', formatTokens(data.overview.active_users)],
+      ].map(([label, value]) => <div key={label} className="card p-4"><p className="text-xs text-gray-500">{label}</p><p className="text-2xl font-semibold mt-1 tabular-nums">{value}</p></div>)}</div>
+      {data.overview.unpriced_requests > 0 && <p className="text-sm rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">{formatTokens(data.overview.unpriced_requests)} requests have no price and count as $0. <Link href="/ai/providers#prices" className="underline">Add model prices</Link></p>}
       {data.overview.estimated_requests > 0 && <p className="text-sm text-amber-800">{formatTokens(data.overview.estimated_requests)} requests use estimated token counts.</p>}
-      <div className="grid lg:grid-cols-2 gap-6"><div className="border rounded p-4"><TimeSeriesChart data={chart.points} title="Spend over time by model" series={chart.series} stacked valueFormatter={formatUsd} timestampFormatter={timestamp => new Date(timestamp * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })} /></div><div className="border rounded p-4"><APIDistributionChart data={data.models.rows.map(row => ({ api: row.key, count: row.requests }))} title="Model mix (requests)" /></div></div>
+      <div className="card p-4"><TimeSeriesChart data={chart.points} title="Spend by model" series={chart.series} stacked valueFormatter={formatUsd} timestampFormatter={timestamp => new Date(timestamp * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })} /></div>
 
-      <section className="space-y-3">
-        <div className="flex flex-wrap justify-between items-end gap-3"><h4 className="font-semibold">Breakdown</h4><div role="tablist" aria-label="Break down AI usage by" className="flex flex-wrap gap-1 border-b border-gray-200">{VIEWS.map(item => <button key={item.id} type="button" role="tab" aria-selected={view === item.id} onClick={() => setView(item.id)} className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${view === item.id ? 'border-primary-600 text-primary-700 font-medium' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{item.label}</button>)}</div></div>
+      <section className="card p-4 space-y-3">
+        <div className="flex flex-wrap justify-between items-end gap-3"><h3 className="font-semibold text-gray-900">Breakdown</h3><div role="tablist" aria-label="Break down AI usage by" className="flex flex-wrap gap-1 border-b border-gray-200">{VIEWS.map(item => <button key={item.id} type="button" role="tab" aria-selected={view === item.id} onClick={() => setView(item.id)} className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${view === item.id ? 'border-primary-600 text-primary-700 font-medium' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{item.label}</button>)}</div></div>
         {breakdownError ? <p role="alert" className="text-sm text-red-600">{breakdownError}</p> : !breakdown ? <p className="text-sm text-gray-500">Loading…</p> : !breakdown.rows.length ? <p className="text-sm text-gray-500">No usage for these filters.</p> : <div className="overflow-x-auto"><table className="table w-full text-sm"><thead><tr><th>{active.column}</th>{view === 'user' && <><th>Groups</th><th>Role</th><th>Tier</th></>}<th>Requests</th><th>Tokens</th><th>Cost</th><th>Share of spend</th>{view === 'group' && <th>Current budget</th>}</tr></thead><tbody>{breakdown.rows.map(row => {
           const budget = view === 'group' ? groupBudget(row.key) : undefined
           const label = keyLabel(view, row.key)

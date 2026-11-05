@@ -25,7 +25,7 @@ export default function AiPromptLogModal({ logId, onClose }: { logId: string; on
     if (text == null) return '(not stored)'
     try { return JSON.stringify(JSON.parse(text), null, 2) } catch { return text }
   }
-  return <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={onClose}>
+  return <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label="AI prompt log" className="bg-white dark:bg-gray-900 rounded-lg w-full max-w-3xl max-h-[90vh] overflow-y-auto p-6 space-y-4" onClick={event => event.stopPropagation()}>
       <div className="flex justify-between gap-3"><h3 className="text-lg font-semibold">AI prompt</h3><button type="button" className="btn btn-ghost" onClick={onClose}>Close</button></div>
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}

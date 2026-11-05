@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod budgets;
 pub mod config;
+pub mod failover;
 pub mod guardrails;
 pub mod keys;
 pub mod pricing;

@@ -25,6 +25,7 @@ use crate::{
         adapter::{AiProvider, INBOUND_CREDENTIAL_HEADERS, INBOUND_CREDENTIAL_QUERY},
         budgets,
         config::{AiApiConfig, model_allowed},
+        failover,
         guardrails::{self, CompiledGuardrails, Direction},
         keys::{InboundAuth, record_last_used, resolve_inbound},
         providers::adapter_for,
@@ -65,6 +66,15 @@ pub(crate) struct AiOperation(pub &'static str);
 pub(crate) struct AiActivity(pub Value);
 
 /// Upstream rate-limit and request-id headers always reach the client (§5.5).
+/// One place an AI request can be sent: the primary or a backup.
+struct UpstreamTarget {
+    /// Position in config: 0 = primary, 1.. = `fallback_targets`.
+    index: usize,
+    credential: Option<(String, String)>,
+    server: String,
+    weight: u32,
+}
+
 fn is_passthrough_response_header(name: &str) -> bool {
     matches!(name, "retry-after" | "request-id" | "x-request-id")
         || name.starts_with("x-ratelimit-")
@@ -514,35 +524,65 @@ pub(crate) async fn execute_ai(
         .find(|entry| user_groups.iter().any(|group| group == &entry.group))
         .map(|entry| entry.credential_group.clone())
         .unwrap_or_else(|| config.credential_group.clone());
-    let credential = if credential_group == "none" && provider == AiProvider::OpenaiCompatible {
-        None
-    } else {
-        let resolved = documents
+    // Some(None) = no key needed; None = configured key missing or undecryptable.
+    let resolve_credential = |group: &str| -> Option<Option<(String, String)>> {
+        if group == "none" && provider == AiProvider::OpenaiCompatible {
+            return Some(None);
+        }
+        documents
             .credit_defs
             .iter()
-            .find(|def| {
-                def.get("api_credit_group").and_then(Value::as_str)
-                    == Some(credential_group.as_str())
-            })
+            .find(|def| def.get("api_credit_group").and_then(Value::as_str) == Some(group))
             .and_then(|def| credit_header_values(def, now_rfc3339()))
             .and_then(|(header, mut values)| values.pop().map(|key| (header, key)))
-            .filter(|(_, key)| !key.trim().is_empty() && !key.starts_with("enc:"));
-        match resolved {
-            Some(credential) => Some(credential),
-            None => {
-                tracing::error!(
-                    api = %api_label,
-                    credential_group = %credential_group,
-                    "AI credential not configured or undecryptable"
-                );
-                return Ok(ai_error(
-                    StatusCode::BAD_GATEWAY,
-                    ErrorCode::AI_CREDENTIAL_UNAVAILABLE,
-                    "AI credential not configured",
-                ));
-            }
-        }
+            .filter(|(_, key)| !key.trim().is_empty() && !key.starts_with("enc:"))
+            .map(Some)
     };
+    let Some(primary_server) = decision.upstream.clone() else {
+        return Ok(ai_error(
+            StatusCode::NOT_FOUND,
+            "GTW001",
+            "No upstream servers configured",
+        ));
+    };
+    // Index 0 is the primary; backups follow in configured order (failover).
+    let mut targets: Vec<UpstreamTarget> = Vec::with_capacity(1 + config.fallback_targets.len());
+    for (index, (group, server, weight)) in std::iter::once((credential_group.as_str(), None, 1))
+        .chain(config.fallback_targets.iter().map(|target| {
+            (
+                if target.credential_group.trim().is_empty() {
+                    credential_group.as_str()
+                } else {
+                    target.credential_group.as_str()
+                },
+                target.server.as_deref(),
+                target.weight,
+            )
+        }))
+        .enumerate()
+    {
+        match resolve_credential(group) {
+            Some(credential) => targets.push(UpstreamTarget {
+                index,
+                credential,
+                server: server.unwrap_or(&primary_server).to_owned(),
+                weight,
+            }),
+            None => tracing::error!(
+                api = %api_label,
+                credential_group = %group,
+                target = index,
+                "AI credential not configured or undecryptable"
+            ),
+        }
+    }
+    if targets.is_empty() {
+        return Ok(ai_error(
+            StatusCode::BAD_GATEWAY,
+            ErrorCode::AI_CREDENTIAL_UNAVAILABLE,
+            "AI credential not configured",
+        ));
+    }
 
     let mut headers = HeaderMap::new();
     for (name, value) in &parts.headers {
@@ -566,11 +606,6 @@ pub(crate) async fn execute_ai(
         headers.append(name.clone(), value.clone());
     }
     adapter.default_headers(&mut headers);
-    if let Some((header_name, key)) = &credential {
-        let header_override =
-            (provider == AiProvider::OpenaiCompatible).then_some(header_name.as_str());
-        adapter.apply_credential(&mut headers, key, header_override);
-    }
     if method == Method::POST {
         headers.insert(
             header::CONTENT_TYPE,
@@ -596,19 +631,6 @@ pub(crate) async fn execute_ai(
                 .finish()
         )
     };
-    let Some(base_url) = decision.upstream.clone() else {
-        return Ok(ai_error(
-            StatusCode::NOT_FOUND,
-            "GTW001",
-            "No upstream servers configured",
-        ));
-    };
-    let target = format!(
-        "{}/{}{}",
-        base_url.trim_end_matches('/'),
-        rest_path.trim_start_matches('/'),
-        query
-    );
     let outbound_body = if method == Method::POST {
         serde_json::to_vec(&body).unwrap_or_default()
     } else {
@@ -633,47 +655,110 @@ pub(crate) async fn execute_ai(
     };
     let first_byte_timeout = std::time::Duration::from_millis(config.first_byte_timeout_ms.max(1));
     let attempts = decision.retry_count.saturating_add(1);
-    let mut attempt = 0_u32;
-    // Retries happen only before anything reaches the client, and only for
-    // connection errors and 502/503/504. Never 429 (C3) or 500 (costs tokens).
-    let upstream = loop {
-        attempt += 1;
-        let send = client
-            .request(method.clone(), target.clone())
-            .headers(headers.clone())
-            .body(outbound_body.clone())
-            .send();
-        match tokio::time::timeout(first_byte_timeout, send).await {
-            Err(_) => {
-                record_failure(&state.runtime.circuits, &circuit_key);
-                state
-                    .runtime
-                    .upstream_timeouts_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(ai_error(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    ErrorCode::AI_FIRST_BYTE_TIMEOUT,
-                    "Upstream first-byte timeout",
-                ));
-            }
-            Ok(Ok(response))
-                if matches!(response.status().as_u16(), 502..=504) && attempt < attempts =>
-            {
-                record_failure(&state.runtime.circuits, &circuit_key);
-                state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
-                retry_backoff(attempt).await;
-            }
-            Ok(Ok(response)) => break response,
-            Ok(Err(error)) if error.is_connect() && attempt < attempts => {
-                record_failure(&state.runtime.circuits, &circuit_key);
-                state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
-                retry_backoff(attempt).await;
-            }
-            Ok(Err(error)) => {
-                record_failure(&state.runtime.circuits, &circuit_key);
-                return Err(error.into());
+    let weights: Vec<u32> = targets.iter().map(|target| target.weight).collect();
+    let bench_keys: Vec<String> = targets
+        .iter()
+        .map(|target| failover::target_key(&api_label, target.index))
+        .collect();
+    let order = failover::attempt_order(
+        &weights,
+        config.load_balance,
+        rand::random::<u64>(),
+        |i| targets[i].server != primary_server,
+        |i| failover::is_benched(&bench_keys[i]),
+    );
+    let mut fallbacks = 0_u32;
+    let mut chosen = None;
+    // Per target, retries happen only before anything reaches the client, and
+    // only for connection errors and 502/503/504; never 429 (C3) or 500 (costs
+    // tokens). With backups configured, a timeout, a connection error or a
+    // 502-504 after retries moves on to the next target; a 429 never does (C3).
+    'targets: for (position, &slot) in order.iter().enumerate() {
+        let target = &targets[slot];
+        let has_next = position + 1 < order.len();
+        let mut target_headers = headers.clone();
+        if let Some((header_name, key)) = &target.credential {
+            let header_override =
+                (provider == AiProvider::OpenaiCompatible).then_some(header_name.as_str());
+            adapter.apply_credential(&mut target_headers, key, header_override);
+        }
+        let url = format!(
+            "{}/{}{}",
+            target.server.trim_end_matches('/'),
+            rest_path.trim_start_matches('/'),
+            query
+        );
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            let send = client
+                .request(method.clone(), url.clone())
+                .headers(target_headers.clone())
+                .body(outbound_body.clone())
+                .send();
+            let move_on = |reason: &str, cool_down: std::time::Duration| {
+                failover::bench_target(&bench_keys[slot], cool_down);
+                tracing::warn!(api = %api_label, target = target.index, reason, "AI upstream failed; trying the next target");
+            };
+            match tokio::time::timeout(first_byte_timeout, send).await {
+                Err(_) => {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    state
+                        .runtime
+                        .upstream_timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if has_next {
+                        move_on("first-byte timeout", failover::ERROR_COOL_DOWN);
+                        fallbacks += 1;
+                        continue 'targets;
+                    }
+                    return Ok(ai_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        ErrorCode::AI_FIRST_BYTE_TIMEOUT,
+                        "Upstream first-byte timeout",
+                    ));
+                }
+                Ok(Ok(response))
+                    if matches!(response.status().as_u16(), 502..=504) && attempt < attempts =>
+                {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
+                    retry_backoff(attempt).await;
+                }
+                Ok(Ok(response)) if has_next && matches!(response.status().as_u16(), 502..=504) => {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    move_on("server error", failover::ERROR_COOL_DOWN);
+                    fallbacks += 1;
+                    continue 'targets;
+                }
+                Ok(Ok(response)) => {
+                    chosen = Some(response);
+                    break 'targets;
+                }
+                Ok(Err(error)) if error.is_connect() && attempt < attempts => {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    state.runtime.retries_total.fetch_add(1, Ordering::Relaxed);
+                    retry_backoff(attempt).await;
+                }
+                Ok(Err(_)) if has_next => {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    move_on("connection error", failover::ERROR_COOL_DOWN);
+                    fallbacks += 1;
+                    continue 'targets;
+                }
+                Ok(Err(error)) => {
+                    record_failure(&state.runtime.circuits, &circuit_key);
+                    return Err(error.into());
+                }
             }
         }
+    }
+    let Some(upstream) = chosen else {
+        return Ok(ai_error(
+            StatusCode::BAD_GATEWAY,
+            "GTW999",
+            "No AI upstream target responded",
+        ));
     };
     let status = upstream.status();
     if status.is_server_error() {
@@ -707,10 +792,12 @@ pub(crate) async fn execute_ai(
     }
     let redaction_count: u32 = redactions.iter().map(|(_, count)| *count).sum();
     let redaction_header = (redaction_count > 0).then(|| redaction_count.to_string());
+    let fallback_header = (fallbacks > 0).then(|| fallbacks.to_string());
     for (name, value) in [
         ("x-doorman-ai-model-downgraded", downgraded.as_deref()),
         ("x-doorman-ai-budget-warning", budget_warning.as_deref()),
         ("x-doorman-ai-redactions", redaction_header.as_deref()),
+        ("x-doorman-ai-fallbacks", fallback_header.as_deref()),
     ] {
         if let Some(value) = value.and_then(|value| HeaderValue::from_str(value).ok()) {
             response_headers.insert(HeaderName::from_static(name), value);
@@ -749,6 +836,7 @@ pub(crate) async fn execute_ai(
         response_bytes: 0,
         bandwidth,
         redactions: redaction_count,
+        fallbacks,
         prompt_log,
         groups: user_groups.clone(),
         role: user_role,

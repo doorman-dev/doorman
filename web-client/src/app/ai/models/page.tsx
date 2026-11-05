@@ -1,7 +1,7 @@
 'use client'
 
-import ApisList from '@/components/ApisList'
+import AiRedirect from '@/components/AiRedirect'
 
-export default function AiModelsPage() {
-  return <ApisList mode="ai" />
+export default function Page() {
+  return <AiRedirect to="/ai/providers" />
 }

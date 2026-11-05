@@ -6,6 +6,13 @@ import { delJson, fetchAllPaginated, getJson, postJson, putJson } from '@/utils/
 import { SERVER_URL } from '@/utils/config'
 import type { AiBuiltinDetector, AiDetector, AiGuardrail } from '@/utils/ai'
 
+const DIRECTION_LABELS: Record<string, string> = { input: 'Prompts', output: 'Responses', both: 'Prompts and responses' }
+const appliesTo = (apis: string[], groups: string[]) => {
+  const all = (list: string[]) => !list.length || list.includes('*')
+  const apiText = all(apis) ? 'All providers' : apis.join(', ')
+  return all(groups) ? apiText : `${apiText} · ${groups.join(', ')}`
+}
+
 const BUILTINS: [AiBuiltinDetector, string][] = [['email', 'Email address'], ['us_ssn', 'US SSN'], ['credit_card', 'Credit card (Luhn)'], ['aws_access_key', 'AWS access key'], ['private_key_pem', 'PEM private key'], ['generic_api_key', 'Generic API key / token']]
 type Draft = Omit<AiGuardrail, 'detectors'> & { builtins: AiBuiltinDetector[]; regexes: string[]; keywords: string; apis: string; groups: string }
 type TestResult = { matches: { detector: string; start: number; end: number }[]; redacted: string }
@@ -101,23 +108,22 @@ export default function AiGuardrailsPanel() {
     finally { setWorking(false) }
   }
 
-  const detectorSummary = (rail: AiGuardrail) => rail.detectors.map(d => d.type === 'builtin' ? d.id : d.type === 'regex' ? 'regex' : `${d.values.length} keyword${d.values.length === 1 ? '' : 's'}`).join(', ') || '—'
+  const detectorSummary = (rail: AiGuardrail) => rail.detectors.map(d => d.type === 'builtin' ? (BUILTINS.find(([id]) => id === d.id)?.[1] || d.id) : d.type === 'regex' ? 'Custom pattern' : `${d.values.length} keyword${d.values.length === 1 ? '' : 's'}`).join(', ') || '—'
   return <div className="space-y-4">
-    <div className="flex justify-between gap-3"><div><h3 className="card-title">AI Guardrails</h3><p className="text-sm text-gray-500 mt-1">Redact or block PII and secrets in AI prompts and responses. Matched text is never logged.</p></div><button type="button" className="btn btn-primary" onClick={() => open(fresh())}>Create guardrail</button></div>
-    <p className="text-sm rounded-lg bg-warning-50 border border-warning-200 p-3 text-warning-800">Output guardrails apply to non-streaming responses only. On streaming requests they are log-only and the stream is never altered.</p>
+    <div className="flex flex-wrap items-start justify-between gap-3"><p className="text-sm text-gray-500 max-w-2xl">Redact or block personal data and secrets in prompts and responses. Matched text is never logged. Response checks don&apos;t change streamed replies; they only log matches.</p><button type="button" className="btn btn-primary shrink-0" onClick={() => open(fresh())}>Add guardrail</button></div>
     {error && !draft && <p role="alert" className="text-sm text-red-600">{error}</p>}
-    {loading ? <p>Loading guardrails…</p> : rows.length ? <div className="overflow-x-auto"><table className="table w-full text-sm"><thead><tr><th>Enabled</th><th>Name</th><th>Applies to</th><th>Direction</th><th>Detectors</th><th>Action</th><th /></tr></thead><tbody>{rows.map(rail => <tr key={rail.guardrail_id}>
-      <td><input type="checkbox" aria-label={`Enable ${rail.name}`} checked={rail.enabled} disabled={working} onChange={() => toggle(rail)} /></td>
-      <td>{rail.name}</td>
-      <td className="text-xs">APIs: {rail.applies_to.apis.join(', ')}<br />Groups: {rail.applies_to.groups.join(', ')}</td>
-      <td>{rail.direction}</td>
-      <td className="text-xs">{detectorSummary(rail)}</td>
-      <td>{rail.action}{rail.mode === 'dry_run' && <span className="block text-xs text-gray-500">Dry run</span>}</td>
+    {loading ? <p className="text-sm text-gray-500">Loading guardrails…</p> : rows.length ? <div className="overflow-x-auto"><table className="table w-full text-sm"><thead><tr><th>Name</th><th>Applies to</th><th>Checks</th><th>Looks for</th><th>Action</th><th>On</th><th /></tr></thead><tbody>{rows.map(rail => <tr key={rail.guardrail_id}>
+      <td className="font-medium">{rail.name}</td>
+      <td>{appliesTo(rail.applies_to.apis, rail.applies_to.groups)}</td>
+      <td>{DIRECTION_LABELS[rail.direction] || rail.direction}</td>
+      <td className="max-w-xs">{detectorSummary(rail)}</td>
+      <td>{rail.action === 'redact' ? 'Redact' : rail.action === 'block' ? 'Block' : rail.action}{rail.mode === 'dry_run' && <span className="block text-xs text-gray-500">Dry run</span>}</td>
+      <td><input type="checkbox" aria-label={`Turn ${rail.name} ${rail.enabled ? 'off' : 'on'}`} checked={rail.enabled} disabled={working} onChange={() => toggle(rail)} /></td>
       <td><div className="flex gap-2"><button type="button" className="btn btn-ghost" onClick={() => open(toDraft(rail))}>Edit</button><button type="button" className="btn btn-ghost" onClick={() => setRemoving(rail)}>Delete</button></div></td>
-    </tr>)}</tbody></table></div> : <p className="text-sm text-gray-500">No AI guardrails yet.</p>}
+    </tr>)}</tbody></table></div> : <p className="text-sm text-gray-500">No guardrails yet.</p>}
 
-    {draft && <div className="fixed inset-0 bg-black/50 z-50 flex justify-end"><form role="dialog" aria-modal="true" aria-label={draft.guardrail_id ? 'Edit AI guardrail' : 'Create AI guardrail'} onSubmit={save} className="bg-white dark:bg-gray-900 w-full max-w-xl h-full overflow-y-auto p-6 space-y-4">
-      <h3 className="text-lg font-semibold">{draft.guardrail_id ? 'Edit' : 'Create'} AI guardrail</h3>
+    {draft && <div className="fixed inset-0 bg-black/50 z-[60] flex justify-end"><form role="dialog" aria-modal="true" aria-label={draft.guardrail_id ? 'Edit AI guardrail' : 'Create AI guardrail'} onSubmit={save} className="bg-white dark:bg-gray-900 w-full max-w-xl h-full overflow-y-auto p-6 space-y-4">
+      <h3 className="text-lg font-semibold">{draft.guardrail_id ? 'Edit guardrail' : 'Add guardrail'}</h3>
       <label className="block text-sm">Name<input className="input w-full mt-1" required value={draft.name} onChange={e => update({ name: e.target.value })} /></label>
       <label className="block text-sm">Applies to APIs<input className="input w-full mt-1" list="ai-guardrail-apis" value={draft.apis} onChange={e => update({ apis: e.target.value })} /><span className="text-xs text-gray-500">Comma-separated <code>name/version</code>, or <code>*</code> for all AI APIs.</span></label>
       <datalist id="ai-guardrail-apis">{apiOptions.map(api => <option key={api} value={api} />)}</datalist>

@@ -3579,3 +3579,264 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(body_json(response).await["error_code"], "AI006");
 }
+
+#[tokio::test]
+async fn failover_moves_to_backup_on_503_and_benches_primary() {
+    let primary = FakeProvider::start(vec![Reply::status(
+        503,
+        json!({"error": {"message": "overloaded"}}),
+    )])
+    .await;
+    let backup = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness(
+        "failover-openai",
+        "openai",
+        &primary.url,
+        json!({"api_ai_config": {
+            "credential_group": "prov-cred",
+            "allowed_models": ["gpt-x"],
+            "fallback_targets": [{"credential_group": "backup-cred", "server": backup.url}],
+        }}),
+    )
+    .await;
+    h.storage
+        .insert_one(
+            "credit_defs",
+            json!({"api_credit_group": "backup-cred", "api_key": "BACKUP_KEY",
+                "api_key_header": "authorization", "credit_tiers": []}),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let uri = "/api/ai/failover-openai/v1/v1/chat/completions";
+    let first = send(
+        &h.app,
+        Method::POST,
+        uri,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()["x-doorman-ai-fallbacks"], "1");
+    assert_eq!(body_json(first).await, chat_reply());
+    assert_eq!(primary.calls().len(), 1);
+    assert_eq!(backup.last().headers["authorization"], "Bearer BACKUP_KEY");
+
+    // The failed primary is benched, so the next request goes straight to the backup.
+    let second = send(
+        &h.app,
+        Method::POST,
+        uri,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert!(second.headers().get("x-doorman-ai-fallbacks").is_none());
+    assert_eq!(primary.calls().len(), 1);
+    assert_eq!(backup.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn failover_never_moves_a_429_to_a_backup() {
+    // C3: a provider rate limit is passed through even when backups exist.
+    let primary = FakeProvider::start(vec![Reply::status(
+        429,
+        json!({"error": {"message": "rate limited"}}),
+    )])
+    .await;
+    let backup = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness(
+        "no-429-failover",
+        "openai",
+        &primary.url,
+        json!({"api_ai_config": {
+            "credential_group": "prov-cred",
+            "allowed_models": ["gpt-x"],
+            "fallback_targets": [{"server": backup.url}],
+        }}),
+    )
+    .await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        "/api/ai/no-429-failover/v1/v1/chat/completions",
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(primary.calls().len(), 1);
+    assert!(backup.calls().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_prices_are_listed_and_recalculate_reprices_unpriced_days() {
+    let (app, storage) = platform_app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    let builtin = json_body(
+        request(
+            &app,
+            Method::GET,
+            "/platform/ai/pricing/builtin",
+            Some(&admin),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(builtin["enabled"], true);
+    assert!(builtin["prices"].as_array().unwrap().len() > 100);
+    assert!(builtin["license"].as_str().unwrap().contains("MIT"));
+
+    let today = time::OffsetDateTime::now_utc().date().to_string();
+    for (id, model, unpriced) in [
+        ("a", "gpt-x", 2),
+        ("b", "gpt-partly", 1),
+        ("c", "mystery", 3),
+    ] {
+        storage
+            .insert_one(
+                "ai_usage_daily",
+                json!({"_id": id, "day": today, "api": "corp/v1", "provider": "openai", "model": model,
+                    "username": "alice", "requests": 3, "errors": if id == "c" { 0 } else { 1 },
+                    "input_tokens": 1_000_000, "output_tokens": 0, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0, "cost_nanos": 0, "unpriced_requests": unpriced}),
+            )
+            .await
+            .unwrap();
+    }
+    let put = request(
+        &app,
+        Method::PUT,
+        "/platform/ai/pricing",
+        Some(&admin),
+        Some(json!({"pricing": [
+            {"provider": "openai", "model_pattern": "gpt-x", "input_usd_per_mtok": 2, "output_usd_per_mtok": 8, "effective_from": "2020-01-01"},
+            {"provider": "openai", "model_pattern": "gpt-partly", "input_usd_per_mtok": 2, "output_usd_per_mtok": 8, "effective_from": "2020-01-01"},
+        ]})),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::OK);
+    let result = json_body(
+        request(
+            &app,
+            Method::POST,
+            "/platform/ai/pricing/recalculate",
+            Some(&admin),
+            Some(json!({"days": 30})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(result["repriced_rows"], 1);
+    assert_eq!(result["repriced_requests"], 2);
+    assert_eq!(result["added_cost_usd"], "2.000000");
+    assert_eq!(result["skipped_partly_priced_rows"], 1);
+    assert_eq!(result["still_unpriced_rows"], 1);
+    let row = storage
+        .find_one("ai_usage_daily", &json!({"_id": "a"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row["cost_nanos"], 2_000_000_000_i64);
+    assert_eq!(row["unpriced_requests"], 0);
+}
+
+#[tokio::test]
+async fn requests_per_minute_limit_blocks_and_names_the_allowance() {
+    // Start well inside a minute so both requests share one window.
+    let second = time::OffsetDateTime::now_utc().second();
+    if second > 50 {
+        tokio::time::sleep(Duration::from_secs(u64::from(61 - second))).await;
+    }
+    let fake = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness("rpm-openai", "openai", &fake.url, json!({})).await;
+    let mut rpm = budget("rpm", "global", "", "requests", 1, "block");
+    rpm["period"] = json!("minute");
+    h.storage.insert_one("ai_budgets", rpm).await.unwrap();
+    let auth = bearer(&h.key);
+    let uri = "/api/ai/rpm-openai/v1/v1/chat/completions";
+    let first = send(
+        &h.app,
+        Method::POST,
+        uri,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    body_bytes(first).await;
+    for _ in 0..50 {
+        if minute_used(&h.storage, "rpm").await > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        minute_used(&h.storage, "rpm").await,
+        1,
+        "one request counted"
+    );
+    let blocked = send(
+        &h.app,
+        Method::POST,
+        uri,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = blocked.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry_after), "retry-after {retry_after}");
+    assert_eq!(body_json(blocked).await["budget"], "budget-rpm");
+    assert_eq!(fake.calls().len(), 1);
+}
+
+async fn minute_used(storage: &SharedStorage, id: &str) -> u64 {
+    let key = format!(
+        "ai_budget:{id}:{}",
+        doorman_gateway::ai::budgets::period_key(time::OffsetDateTime::now_utc(), "minute")
+    );
+    storage.current_counter(&key).await.unwrap()
+}
+
+#[tokio::test]
+async fn short_window_allowances_must_block() {
+    let (app, _storage) = platform_app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    let body = |action: &str| {
+        json!({"name": "rpm", "scope": "global", "period": "minute", "limit_type": "requests",
+            "limit_value": 60, "action": action})
+    };
+    let warn = request(
+        &app,
+        Method::POST,
+        "/platform/ai/budgets",
+        Some(&admin),
+        Some(body("warn")),
+    )
+    .await;
+    assert_eq!(warn.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_body(warn).await["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("always block")
+    );
+    let block = request(
+        &app,
+        Method::POST,
+        "/platform/ai/budgets",
+        Some(&admin),
+        Some(body("block")),
+    )
+    .await;
+    assert_eq!(block.status(), StatusCode::CREATED);
+}

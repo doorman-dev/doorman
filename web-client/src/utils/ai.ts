@@ -29,6 +29,18 @@ export interface AiApiConfig {
   guardrail_ids: string[]
   first_byte_timeout_ms: number
   stream_idle_timeout_ms: number
+  /** Backups used when the primary returns 502-504, times out or is unreachable. Never on 429. */
+  fallback_targets?: AiTarget[]
+  /** Spread traffic across the primary and backups on a different server. */
+  load_balance?: boolean
+}
+
+export interface AiTarget {
+  /** Empty = the provider's own key. */
+  credential_group: string
+  /** Null = the provider's own server. */
+  server: string | null
+  weight: number
 }
 
 export interface AiAccessKey {
@@ -51,7 +63,8 @@ export interface AiCreatedAccessKey {
 }
 
 export type AiBudgetScope = 'user' | 'group' | 'tier' | 'api' | 'global'
-export type AiBudgetPeriod = 'day' | 'week' | 'month'
+export type AiBudgetLimitType = 'cost' | 'tokens' | 'requests'
+export type AiBudgetPeriod = 'minute' | 'hour' | 'day' | 'week' | 'month'
 export type AiBudgetAction = 'warn' | 'downgrade' | 'block'
 
 export interface AiBudget {
@@ -60,7 +73,7 @@ export interface AiBudget {
   scope: AiBudgetScope
   target: string
   period: AiBudgetPeriod
-  limit_type: 'cost' | 'tokens'
+  limit_type: AiBudgetLimitType
   limit_value: number
   action: AiBudgetAction
   downgrade_model?: string | null
@@ -78,7 +91,7 @@ export interface BudgetStatus {
   scope: AiBudgetScope
   target: string
   period: AiBudgetPeriod
-  limit_type: 'cost' | 'tokens'
+  limit_type: AiBudgetLimitType
   limit_value: number
   used: number
   percent: number
@@ -243,11 +256,19 @@ export function providerLabel(id: string): string {
 }
 
 export function formatUsd(nanos: number | string): string {
-  // Preserve integer precision when the caller supplies nanos as a string.
+  // Display to the cent. Exact amounts stay in the CSV export.
   const value = BigInt(typeof nanos === 'number' ? Math.round(nanos) : nanos)
   const absolute = value < 0n ? -value : value
-  const micros = (absolute + 500n) / 1000n
-  return `${value < 0n ? '-' : ''}$${micros / 1_000_000n}.${(micros % 1_000_000n).toString().padStart(6, '0')}`
+  const cents = (absolute + 5_000_000n) / 10_000_000n
+  if (cents === 0n && absolute > 0n) return value < 0n ? '-<$0.01' : '<$0.01'
+  const dollars = new Intl.NumberFormat('en-US').format(cents / 100n)
+  return `${value < 0n ? '-' : ''}$${dollars}.${(cents % 100n).toString().padStart(2, '0')}`
+}
+
+/** An allowance amount in its own unit: dollars, tokens or requests. */
+export function formatBudgetAmount(limitType: string, value: number): string {
+  if (limitType === 'cost') return formatUsd(value)
+  return `${formatTokens(value)} ${limitType === 'requests' ? (value === 1 ? 'request' : 'requests') : 'tokens'}`
 }
 
 export function formatTokens(n: number): string {

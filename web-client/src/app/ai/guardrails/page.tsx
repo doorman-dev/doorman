@@ -1,8 +1,7 @@
 'use client'
 
-import AiPage from '@/components/AiPage'
-import AiGuardrailsPanel from '@/components/AiGuardrailsPanel'
+import AiRedirect from '@/components/AiRedirect'
 
-export default function AiGuardrailsPage() {
-  return <AiPage title="Guardrails" description="Block or redact sensitive content in prompts and responses." permission="manage_security"><div className="card p-6"><AiGuardrailsPanel /></div></AiPage>
+export default function Page() {
+  return <AiRedirect to="/ai/policies#guardrails" />
 }

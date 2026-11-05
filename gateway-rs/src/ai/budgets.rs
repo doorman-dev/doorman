@@ -89,10 +89,13 @@ impl BudgetSpec {
     }
 }
 
-/// `d2026-10-18`, `w2026-42` (ISO week) or `m2026-10`, all UTC.
+/// `n2026-10-18T09:41` (minute), `h2026-10-18T09` (hour), `d2026-10-18`,
+/// `w2026-42` (ISO week) or `m2026-10`, all UTC.
 pub fn period_key(now: OffsetDateTime, period: &str) -> String {
     let now = now.to_offset(time::UtcOffset::UTC);
     match period {
+        "minute" => format!("n{}T{:02}:{:02}", now.date(), now.hour(), now.minute()),
+        "hour" => format!("h{}T{:02}", now.date(), now.hour()),
         "day" => format!("d{}", now.date()),
         "week" => {
             let (year, week, _) = now.date().to_iso_week_date();
@@ -104,7 +107,20 @@ pub fn period_key(now: OffsetDateTime, period: &str) -> String {
 
 /// Start of the next period (UTC).
 pub fn resets_at(now: OffsetDateTime, period: &str) -> OffsetDateTime {
-    let today = now.to_offset(time::UtcOffset::UTC).date();
+    let utc = now.to_offset(time::UtcOffset::UTC);
+    let start_of_minute = utc
+        .replace_second(0)
+        .and_then(|value| value.replace_nanosecond(0))
+        .unwrap_or(utc);
+    match period {
+        "minute" => return start_of_minute + Duration::minutes(1),
+        "hour" => {
+            return start_of_minute.replace_minute(0).unwrap_or(start_of_minute)
+                + Duration::hours(1);
+        }
+        _ => {}
+    }
+    let today = utc.date();
     let next: Date = match period {
         "day" => today + Duration::days(1),
         "week" => today + Duration::days(7 - i64::from(today.weekday().number_days_from_monday())),
@@ -119,9 +135,12 @@ pub fn resets_at(now: OffsetDateTime, period: &str) -> OffsetDateTime {
     next.with_time(Time::MIDNIGHT).assume_utc()
 }
 
-/// Counter TTL per §5.4: day 2 days, week 15 days, month 40 days.
+/// Counter TTL per §5.4: day 2 days, week 15 days, month 40 days; short
+/// windows keep two periods.
 pub fn ttl_seconds(period: &str) -> u64 {
     match period {
+        "minute" => 120,
+        "hour" => 2 * 3_600,
         "day" => 2 * 86_400,
         "week" => 15 * 86_400,
         _ => 40 * 86_400,
@@ -230,12 +249,31 @@ pub fn status_json(spec: &BudgetSpec, used: u64, now: OffsetDateTime) -> Value {
     })
 }
 
+/// What a budget counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetUnit {
+    /// Nano-USD.
+    Cost,
+    Tokens,
+    Requests,
+}
+
+impl BudgetUnit {
+    pub fn of(limit_type: &str) -> Self {
+        match limit_type {
+            "tokens" => Self::Tokens,
+            "requests" => Self::Requests,
+            _ => Self::Cost,
+        }
+    }
+}
+
 /// A counter to charge once the request's usage is known.
 #[derive(Clone, Debug)]
 pub struct BudgetCharge {
     pub key: String,
     pub ttl_seconds: u64,
-    pub tokens: bool,
+    pub unit: BudgetUnit,
 }
 
 #[derive(Debug, Default)]
@@ -295,13 +333,13 @@ pub async fn precheck(
         outcome.charges.push(BudgetCharge {
             key: spec.counter_key(now),
             ttl_seconds: ttl_seconds(&spec.period),
-            tokens: spec.limit_type == "tokens",
+            unit: BudgetUnit::of(&spec.limit_type),
         });
         if spec.member.is_some() {
             outcome.charges.push(BudgetCharge {
                 key: spec.total_key(now),
                 ttl_seconds: ttl_seconds(&spec.period),
-                tokens: spec.limit_type == "tokens",
+                unit: BudgetUnit::of(&spec.limit_type),
             });
         }
     }
@@ -309,8 +347,8 @@ pub async fn precheck(
     Ok(outcome)
 }
 
-/// Adds the request's cost (nanos) or tokens (input + output + cache writes;
-/// cache reads are excluded) to each applicable budget counter.
+/// Adds the request's cost (nanos), tokens (input + output + cache writes;
+/// cache reads are excluded) or one request to each applicable budget counter.
 pub async fn charge(
     storage: &SharedStorage,
     charges: &[BudgetCharge],
@@ -322,7 +360,11 @@ pub async fn charge(
         .saturating_add(usage.output_tokens)
         .saturating_add(usage.cache_write_tokens);
     for charge in charges {
-        let amount = if charge.tokens { tokens } else { cost_nanos };
+        let amount = match charge.unit {
+            BudgetUnit::Tokens => tokens,
+            BudgetUnit::Cost => cost_nanos,
+            BudgetUnit::Requests => 1,
+        };
         if amount == 0 {
             continue;
         }
@@ -478,5 +520,20 @@ mod tests {
             .await,
             12
         );
+    }
+
+    #[test]
+    fn minute_and_hour_windows() {
+        let now = datetime!(2026-10-18 09:41:27.5 UTC);
+        assert_eq!(period_key(now, "minute"), "n2026-10-18T09:41");
+        assert_eq!(period_key(now, "hour"), "h2026-10-18T09");
+        assert_eq!(resets_at(now, "minute"), datetime!(2026-10-18 09:42 UTC));
+        assert_eq!(resets_at(now, "hour"), datetime!(2026-10-18 10:00 UTC));
+        assert_eq!(
+            resets_at(datetime!(2026-12-31 23:59:59 UTC), "minute"),
+            datetime!(2027-01-01 00:00 UTC)
+        );
+        assert_eq!(ttl_seconds("minute"), 120);
+        assert_eq!(BudgetUnit::of("requests"), BudgetUnit::Requests);
     }
 }

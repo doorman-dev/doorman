@@ -395,7 +395,11 @@ async fn seed_ai(
     {
         for row in &pricing {
             let mut row = row.clone();
-            row["updated_at"] = json!(timestamp());
+            row["updated_at"] = json!(
+                OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            );
             storage.insert_one("ai_pricing", row).await?;
         }
     }

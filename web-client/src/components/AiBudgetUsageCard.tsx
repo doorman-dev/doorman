@@ -6,7 +6,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { getJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
 import AiBudgetBar from '@/components/AiBudgetBar'
-import { formatTokens, formatUsd, providerLabel, type AiBreakdown, type AiMyUsage, type BudgetStatus } from '@/utils/ai'
+import { formatBudgetAmount, formatTokens, formatUsd, providerLabel, type AiBreakdown, type AiMyUsage, type BudgetStatus } from '@/utils/ai'
 
 export default function AiBudgetUsageCard({ scope, target }: { scope?: 'user' | 'group'; target?: string }) {
   const { permissions } = useAuth()
@@ -41,11 +41,11 @@ export default function AiBudgetUsageCard({ scope, target }: { scope?: 'user' | 
   useEffect(() => { load() }, [load])
   if (!canView && !canManage) return null
   return <section className="card p-6 space-y-4">
-    <div className="flex justify-between flex-wrap gap-3"><h3 className="card-title">{scope === 'group' ? 'AI budget and usage' : 'AI usage'}</h3>{scope && canManage && <Link className="btn btn-secondary" href={`/credits?${new URLSearchParams({ budget_scope: scope, budget_target: target || '' })}#ai-budgets`}>{scope === 'group' ? 'Add group budget' : 'Create user budget'}</Link>}</div>
+    <div className="flex justify-between flex-wrap gap-3"><h3 className="card-title">{scope === 'group' ? 'AI budget and usage' : 'AI usage'}</h3>{scope && canManage && <Link className="btn btn-secondary" href={`/ai/allowances?${new URLSearchParams({ budget_scope: scope, budget_target: target || '' })}`}>{scope === 'group' ? 'Add group allowance' : 'Add allowance for this user'}</Link>}</div>
     {canView && <>
       {loading ? <p className="text-sm">Loading AI usage…</p> : error ? <div role="alert"><p className="text-sm text-red-600">{error}</p><button type="button" className="btn btn-ghost" onClick={load}>Retry</button></div> : <>
         {usage && <p className="text-sm">This UTC month: {formatTokens(usage.requests)} requests · {formatTokens(usage.input_tokens + usage.output_tokens)} input/output tokens · {formatUsd(usage.cost_nanos)}</p>}
-        {budgets.length ? <div className="space-y-4">{budgets.map(budget => <div key={budget.budget_id} className="space-y-1"><div className="flex justify-between gap-3 text-sm"><span>{budget.name}{budget.provider ? ` · ${providerLabel(budget.provider)}` : ''} · {budget.period} · {budget.action}</span><span>{budget.percent}%</span></div><AiBudgetBar percent={budget.percent} label={`${budget.name} usage`} /><p className="text-xs text-gray-500">{budget.limit_type === 'cost' ? formatUsd(budget.used) : formatTokens(budget.used)} / {budget.limit_type === 'cost' ? formatUsd(budget.limit_value) : `${formatTokens(budget.limit_value)} tokens`} · Resets {new Date(budget.resets_at).toLocaleString()}</p></div>)}</div> : <p className="text-sm text-gray-500">No applicable budgets.</p>}
+        {budgets.length ? <div className="space-y-4">{budgets.map(budget => <div key={budget.budget_id} className="space-y-1"><div className="flex justify-between gap-3 text-sm"><span>{budget.name}{budget.provider ? ` · ${providerLabel(budget.provider)}` : ''} · {budget.period} · {budget.action}</span><span>{budget.percent}%</span></div><AiBudgetBar percent={budget.percent} label={`${budget.name} usage`} /><p className="text-xs text-gray-500">{formatBudgetAmount(budget.limit_type, budget.used)} / {formatBudgetAmount(budget.limit_type, budget.limit_value)} · Resets {new Date(budget.resets_at).toLocaleString()}</p></div>)}</div> : <p className="text-sm text-gray-500">No applicable budgets.</p>}
         <button type="button" className="btn btn-ghost" onClick={load}>Refresh AI usage</button>
       </>}
       <p className="text-xs text-gray-500">Budget bars show their current UTC period. Concurrent requests can exceed soft limits.{scope === 'group' ? ' A member’s usage contributes to every group in their request snapshot.' : ''}</p>

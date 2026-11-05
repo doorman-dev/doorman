@@ -97,7 +97,11 @@ pub async fn price_table(storage: Option<&SharedStorage>) -> Arc<PriceTable> {
             }
         })
         .collect();
-    let table = Arc::new(PriceTable::from_docs(&valid).unwrap_or_else(|_| PriceTable::empty()));
+    let table = Arc::new(
+        PriceTable::from_docs(&valid)
+            .unwrap_or_else(|_| PriceTable::empty())
+            .with_builtin(),
+    );
     if let Ok(mut cache) = price_cache().write() {
         cache.insert(cache_key, (Instant::now(), table.clone()));
     }
@@ -129,6 +133,8 @@ pub struct FinalizeCtx {
     /// Bandwidth counter key and TTL, when the API meters bandwidth.
     pub bandwidth: Option<(String, u64)>,
     pub redactions: u32,
+    /// Upstream targets that failed before one answered (failover).
+    pub fallbacks: u32,
     /// The user's groups at request time (snapshot for the group breakdown).
     pub groups: Vec<String>,
     /// The user's role and tier at request time (snapshots for the breakdown).
@@ -231,6 +237,7 @@ pub fn activity_block(ctx: &FinalizeCtx, usage: &AiUsage, cost: CostResult) -> V
         "estimated": usage.estimated,
         "stream": ctx.stream,
         "redactions": ctx.redactions,
+        "fallbacks": ctx.fallbacks,
     })
 }
 

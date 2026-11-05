@@ -31,17 +31,17 @@ export default function AiSettingsPanel() {
     finally { setSaving(false) }
   }
 
-  return <form className="card max-w-2xl" onSubmit={save}>
-    <div className="card-header"><h3 className="card-title">AI gateway</h3><p className="text-sm text-gray-500 mt-1">Prompt logging and retention for all AI APIs. A per-API log level can only lower this setting.</p></div>
-    {!settings ? <div className="p-6 text-sm">{error ? <p role="alert" className="text-red-600">{error}</p> : 'Loading AI settings…'}</div> : <div className="p-6 space-y-4">
-      <label className="block text-sm">Prompt log level<select className="input w-full mt-1" value={logLevel} onChange={e => setLogLevel(e.target.value as AiLogLevel)}><option value="none">None: no AI request metadata or prompts</option><option value="metadata">Metadata: model, tokens and cost only</option><option value="full">Full: encrypted prompts and completions</option></select></label>
+  return <form className="card" onSubmit={save}>
+    {!settings ? <div className="p-6 text-sm">{error ? <p role="alert" className="text-red-600">{error}</p> : 'Loading…'}</div> : <div className="p-6 space-y-4">
+      <p className="text-sm text-gray-500">Applies to every AI provider. A provider can only log less than this, never more.</p>
+      <label className="block text-sm max-w-xl">What to keep<select className="input w-full mt-1" value={logLevel} onChange={e => setLogLevel(e.target.value as AiLogLevel)}><option value="none">None: no AI request metadata or prompts</option><option value="metadata">Metadata: model, tokens and cost only</option><option value="full">Full: encrypted prompts and completions</option></select></label>
       {logLevel === 'full' && <p className="text-sm rounded-lg bg-warning-50 border border-warning-200 p-3 text-warning-800">Storing employee prompts may be regulated by employee-monitoring and privacy laws in your jurisdiction. All users see the notice below as a banner. Guardrail redactions are applied before storage, and prompts are encrypted at rest (requires <code>TOKEN_ENCRYPTION_KEY</code> or <code>MEM_ENCRYPTION_KEY</code>).</p>}
-      <label className="block text-sm">Notice text{logLevel === 'full' && ' (required)'}<textarea className="input w-full mt-1" rows={3} maxLength={2000} required={logLevel === 'full'} value={notice} onChange={e => setNotice(e.target.value)} placeholder="AI prompts sent through Doorman are logged for security review." /></label>
-      <label className="block text-sm">Retention (days)<input className="input w-full mt-1" type="number" min={1} max={3650} required value={retention} onChange={e => setRetention(e.target.value)} /></label>
-      <div className="text-sm"><p>Egress IPs (read-only)</p>{settings.egress_ips.length ? <ul className="font-mono text-xs mt-1">{settings.egress_ips.map(ip => <li key={ip}>{ip}</li>)}</ul> : <p className="text-xs text-gray-500 mt-1">Not configured. Set <code>DOORMAN_EGRESS_IPS</code> to show the addresses providers should allowlist.</p>}</div>
+      <label className="block text-sm max-w-xl">Notice shown to employees{logLevel === 'full' && ' (required)'}<textarea className="input w-full mt-1" rows={3} maxLength={2000} required={logLevel === 'full'} value={notice} onChange={e => setNotice(e.target.value)} placeholder="AI prompts sent through Doorman are logged for security review." /></label>
+      <label className="block text-sm">Keep logs for (days)<input className="input w-32 mt-1 block" type="number" min={1} max={3650} required value={retention} onChange={e => setRetention(e.target.value)} /></label>
+      <div className="text-sm"><p>Outbound IP addresses</p>{settings.egress_ips.length ? <ul className="font-mono text-xs mt-1">{settings.egress_ips.map(ip => <li key={ip}>{ip}</li>)}</ul> : <p className="text-xs text-gray-500 mt-1">Not configured. Set <code>DOORMAN_EGRESS_IPS</code> to show the addresses providers should allowlist.</p>}</div>
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
-      {saved && <p role="status" className="text-sm text-green-700">AI settings saved.</p>}
-      <button type="submit" className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save AI settings'}</button>
+      {saved && <p role="status" className="text-sm text-green-700">Saved.</p>}
+      <button type="submit" className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
     </div>}
   </form>
 }

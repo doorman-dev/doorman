@@ -223,7 +223,7 @@ const AddApiPage = () => {
         try { sessionStorage.setItem('selectedApi', JSON.stringify(createdApi)) } catch {}
         router.push(isAi ? `/apis/${encodeURIComponent(String(newId))}` : `/apis/${encodeURIComponent(String(newId))}/endpoints?add=1`)
       } else {
-        router.push(isAi ? '/ai/models' : '/apis')
+        router.push(isAi ? '/ai/providers' : '/apis')
       }
     } catch (err) {
       const errors = aiValidationErrors(err)
@@ -399,7 +399,7 @@ const AddApiPage = () => {
             <h1 className="page-title">Add API</h1>
             <p className="text-gray-600 mt-1">Step {step + 1} of {steps.length}: {steps[step]?.hint}</p>
           </div>
-          <Link href={isAi ? '/ai/models' : '/apis'} className="btn btn-secondary">Cancel</Link>
+          <Link href={isAi ? '/ai/providers' : '/apis'} className="btn btn-secondary">Cancel</Link>
         </div>
 
         <ol className="flex items-center gap-2" aria-label="Progress">

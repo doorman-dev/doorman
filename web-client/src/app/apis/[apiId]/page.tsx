@@ -320,7 +320,7 @@ const ApiDetailPage = () => {
     }
   }, [api])
 
-  const listPath = api?.api_type === 'AI' ? '/ai/models' : '/apis'
+  const listPath = api?.api_type === 'AI' ? '/ai/providers' : '/apis'
   const handleBack = () => {
     router.push(listPath)
   }

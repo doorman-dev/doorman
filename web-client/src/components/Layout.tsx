@@ -19,7 +19,7 @@ const apiItems: MenuItem[] = [
   { label: 'Dashboard', href: '/dashboard' }, { label: 'Analytics', href: '/analytics', permission: 'view_analytics' }, { label: 'Logs', href: '/logging', permission: 'view_logs' }, { label: 'APIs', href: '/apis', permission: 'manage_apis' }, { label: 'Subscriptions', href: '/authorizations', permission: 'manage_subscriptions' }, { label: 'Credits', href: '/credits', permission: 'manage_credits' }, { label: 'Routings', href: '/routings', permission: 'manage_routings' }, { label: 'Security', href: '/security', permission: 'manage_security' }, { label: 'TLS', href: '/tls', permission: 'manage_security' }, { label: 'Tools', href: '/tools', permission: 'manage_security' },
 ]
 const aiItems: MenuItem[] = [
-  { label: 'Overview', href: '/ai', permission: 'view_analytics' }, { label: 'My AI', href: '/my-ai' }, { label: 'Setup', href: '/ai/setup', permission: 'manage_ai' }, { label: 'Providers & Models', href: '/ai/models', permission: 'manage_apis' }, { label: 'Allowances', href: '/ai/allowances', permission: 'manage_ai' }, { label: 'Pricing', href: '/ai/pricing', permission: 'view_analytics' }, { label: 'Usage', href: '/ai/usage', permission: 'view_analytics' }, { label: 'Guardrails', href: '/ai/guardrails', permission: 'manage_security' }, { label: 'Logs', href: '/ai/logs', permission: 'view_logs' }, { label: 'AI Settings', href: '/ai/settings', permission: 'manage_ai' },
+  { label: 'Overview', href: '/ai', permission: 'view_analytics' }, { label: 'Providers', href: '/ai/providers', permission: 'manage_apis' }, { label: 'Allowances', href: '/ai/allowances', permission: 'manage_ai' }, { label: 'Usage', href: '/ai/usage', permission: 'view_analytics' }, { label: 'Policies', href: '/ai/policies', permission: 'ai_policies' }, { label: 'My AI', href: '/my-ai' },
 ]
 const sharedItems: MenuItem[] = [
   { label: 'Users', href: '/users', permission: 'manage_users' }, { label: 'Groups', href: '/groups', permission: 'manage_groups' }, { label: 'Roles', href: '/roles', permission: 'manage_roles' }, { label: 'Tiers', href: '/tiers', permission: 'manage_tiers' }, { label: 'Documentation', href: '/documentation' }, { label: 'Settings', href: '/settings' },
@@ -64,7 +64,8 @@ export default function Layout({ children }: LayoutProps) {
   const dismissAiNotice = () => { try { if (aiNotice) window.localStorage.setItem(NOTICE_KEY, aiNotice) } catch {}; setAiNotice(null) }
   
   const allowed = (item: MenuItem) => {
-    if ((item.href === '/logging' || item.href === '/ai/logs') && !logsEnabled) return false
+    if (item.href === '/logging' && !logsEnabled) return false
+    if (item.href === '/ai/policies') return !!(permissions?.manage_security || permissions?.manage_ai)
     if (item.href === '/tools') return !!(permissions?.manage_security || permissions?.manage_gateway)
     return !item.permission || !!permissions?.[item.permission]
   }

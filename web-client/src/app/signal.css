@@ -536,3 +536,25 @@ input[type='file']:hover::file-selector-button, .signal-file-picker:hover::file-
   .main-content { margin-left: 0 !important; }
   .main-content > div { padding: 22px 16px 42px !important; }
 }
+
+/* ---- AI gateway pages ---- */
+.ai-tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--ent-line); margin-top: -6px; }
+.ai-tabs button { margin-bottom: -1px; padding: 8px 14px; border-bottom: 2px solid transparent; color: var(--ent-sub); font-size: 13px; font-weight: 500; }
+.ai-tabs button:hover { color: var(--ent-text); }
+.ai-tabs button[aria-selected='true'] { color: var(--ent-navy); font-weight: 600; border-bottom-color: var(--ent-accent); }
+.main-content select, .main-content select option { font-weight: 400 !important; }
+.ai-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+.ai-chip--ok { background: #e3f3ea; color: #1f7a4d; }
+.ai-chip--warn { background: #fbf0d9; color: #8a5a00; }
+.ai-chip--off { background: #eef1f5; color: #55616d; }
+.ai-steps { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 0; padding: 0; list-style: none; font-size: 13px; color: var(--ent-sub); }
+.ai-steps li { display: flex; align-items: center; gap: 8px; }
+.ai-steps span { display: inline-flex; width: 22px; height: 22px; align-items: center; justify-content: center; border-radius: 50%; border: 1px solid var(--ent-line); background: #fff; font-size: 12px; font-weight: 600; }
+.ai-steps li[aria-current='step'] { color: var(--ent-navy); font-weight: 600; }
+.ai-steps li[aria-current='step'] span { background: var(--ent-accent); border-color: var(--ent-accent); color: #fff; }
+.ai-steps li.is-done span { background: #e3f3ea; border-color: #b7dfc8; color: #1f7a4d; }
+.main-content label input, .main-content label textarea, .main-content label > span.text-xs { font-weight: 400 !important; }
+/* One heading size and link style across AI Gateway pages. */
+.ai-page .card-title { font-size: 15px !important; font-weight: 600 !important; letter-spacing: 0 !important; color: #111827 !important; }
+.ai-page a.text-primary-700:hover { text-decoration: underline; }
+.ai-page .table td, .ai-page .table th { vertical-align: middle; }

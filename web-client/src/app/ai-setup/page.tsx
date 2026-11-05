@@ -1,10 +1,7 @@
 'use client'
 
-import { useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import AiRedirect from '@/components/AiRedirect'
 
-export default function AiSetupRedirect() {
-  const router = useRouter()
-  useEffect(() => { router.replace('/ai/setup') }, [router])
-  return null
+export default function Page() {
+  return <AiRedirect to="/ai/setup" />
 }

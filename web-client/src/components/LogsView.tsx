@@ -128,6 +128,11 @@ const logsFromResponse = (data: any): Log[] => {
 
 type OverrideKey = string
 
+// AI mode is embedded in AI Gateway → Usage, which supplies the page frame and title.
+function Frame({ embedded, children }: { embedded: boolean; children: React.ReactNode }) {
+  return embedded ? <>{children}</> : <ProtectedRoute requiredPermission="view_logs"><Layout>{children}</Layout></ProtectedRoute>
+}
+
 export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
   const { permissions, authResolved, logsEnabled } = useAuth()
   const router = useRouter()
@@ -145,7 +150,7 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
   const [expandedRequests, setExpandedRequests] = useState<Set<string>>(new Set())
   const [loadingExpanded, setLoadingExpanded] = useState<Set<string>>(new Set())
   const [currentRequestId, setCurrentRequestId] = useState<string | null>(null)
-  const [hasSearched, setHasSearched] = useState(false)
+  const [hasSearched, setHasSearched] = useState(mode === 'ai')
   const [searchTrigger, setSearchTrigger] = useState(0)
   const [useLocalTime, setUseLocalTime] = useState(true)
   const [hidePlatformLogs, setHidePlatformLogs] = useState(false)
@@ -169,10 +174,12 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
   }, [authResolved, logsEnabled, router])
   const [filters, setFilters] = useState<FilterState>(() => {
     const now = new Date()
-    const today = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0')
+    const day = (date: Date) => date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0')
+    const today = day(now)
 
     return {
-      startDate: today,
+      // AI requests open on the last 7 days so the tab isn't empty on a quiet day.
+      startDate: mode === 'ai' ? day(new Date(now.getTime() - 6 * 86400000)) : today,
       endDate: today,
       // Default to full-day range: 12:00 AM to 11:59 PM
       startTime: '00:00',
@@ -597,28 +604,7 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
 
   if (authResolved && !logsEnabled) return null
 
-  return (
-    <ProtectedRoute requiredPermission="view_logs">
-      <Layout>
-        <div className="signal-logs-workspace space-y-6">
-          <SignalPageHeader
-            kicker={aiOnly ? 'AI gateway' : 'Request operations'}
-            title={aiOnly ? <>AI<br className="sm:hidden" /> Logs.</> : <>Request<br className="sm:hidden" /> Logs.</>}
-            description={aiOnly ? 'AI gateway requests with model, tokens and cost. Prompts appear here when full logging is on.' : 'View and analyze system logs and API requests.'}
-            actions={
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={toggleSecurityAudit}
-                  className={`signal-button text-xs ${
-                    securityAuditActive
-                      ? 'signal-button--primary'
-                      : 'btn-secondary'
-                  }`}
-                  title="Filter logs for security events (401, 403, 429, errors, blocks)"
-                >
-                  {securityAuditActive ? 'Security audit: on' : 'Security audit'}
-                </button>
+  const refreshControls = <>
                 <button
                   type="button"
                   onClick={() => setAutoRefreshInterval(prev => prev ? null : 5)}
@@ -636,17 +622,40 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
                 >
                   {loading ? 'Refreshing…' : 'Refresh now'}
                 </button>
+  </>
+  return (
+    <Frame embedded={aiOnly}>
+        <div className="signal-logs-workspace space-y-6">
+          {aiOnly ? <div className="flex flex-wrap justify-end gap-2">{refreshControls}</div> : <SignalPageHeader
+            kicker={aiOnly ? 'AI gateway' : 'Request operations'}
+            title={aiOnly ? <>AI<br className="sm:hidden" /> Logs.</> : <>Request<br className="sm:hidden" /> Logs.</>}
+            description={aiOnly ? 'AI gateway requests with model, tokens and cost. Prompts appear here when full logging is on.' : 'View and analyze system logs and API requests.'}
+            actions={
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleSecurityAudit}
+                  className={`signal-button text-xs ${
+                    securityAuditActive
+                      ? 'signal-button--primary'
+                      : 'btn-secondary'
+                  }`}
+                  title="Filter logs for security events (401, 403, 429, errors, blocks)"
+                >
+                  {securityAuditActive ? 'Security audit: on' : 'Security audit'}
+                </button>
+                {refreshControls}
               </div>
             }
-          />
+          />}
 
           <div className="card">
-            <div className="card-header">
+            {!aiOnly && <div className="card-header">
               <h3 className="card-title">Filters</h3>
-            </div>
+            </div>}
             <div className="p-6">
               <div className="mb-4 flex flex-col md:flex-row md:items-center md:justify-start gap-3">
-                {canExport && (
+                {canExport && !aiOnly && (
                   <div className="flex flex-wrap gap-2">
                     <button onClick={() => exportLogs('json')} disabled={exporting} className="btn btn-secondary">Download JSON</button>
                     <button onClick={() => exportLogs('csv')} disabled={exporting} className="btn btn-secondary">Download CSV</button>
@@ -657,7 +666,7 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
 
                 <div className="flex items-center ml-auto gap-4">
                   
-                  <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                  {!aiOnly && <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={hidePlatformLogs}
@@ -670,7 +679,7 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
                       className="checkbox"
                     />
                     <span>Hide Platform Logs</span>
-                  </label>
+                  </label>}
                   <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
                     <input
                       type="checkbox"
@@ -1102,7 +1111,6 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
           )}
         </div>
         {viewingPrompt && <AiPromptLogModal logId={viewingPrompt} onClose={() => setViewingPrompt(null)} />}
-      </Layout>
-    </ProtectedRoute>
+    </Frame>
   )
 }

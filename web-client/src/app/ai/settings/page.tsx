@@ -1,8 +1,7 @@
 'use client'
 
-import AiPage from '@/components/AiPage'
-import AiSettingsPanel from '@/components/AiSettingsPanel'
+import AiRedirect from '@/components/AiRedirect'
 
-export default function AiSettingsPage() {
-  return <AiPage title="AI Settings" description="Prompt logging, employee notice, retention and egress IPs." permission="manage_ai"><AiSettingsPanel /></AiPage>
+export default function Page() {
+  return <AiRedirect to="/ai/policies#logging" />
 }
