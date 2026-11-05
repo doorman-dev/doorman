@@ -28,7 +28,7 @@ pub struct PriceTable {
 
 /// Built-in model prices generated from LiteLLM's MIT-licensed price list by
 /// `scripts/update_ai_prices.py`.
-const BUILTIN_PRICES: &str = include_str!("data/ai_prices.json");
+const BUILTIN_PRICES: &str = include_str!("builtin_prices.json");
 
 /// The parsed built-in price list: metadata plus rows in `ai_pricing` shape.
 /// Rows for providers this gateway doesn't support are skipped.

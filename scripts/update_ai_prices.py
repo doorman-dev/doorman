@@ -6,7 +6,7 @@ Run once per release:
     python3 scripts/update_ai_prices.py                 # downloads the latest list
     python3 scripts/update_ai_prices.py path/to/model_prices_and_context_window.json
 
-Writes gateway-rs/src/ai/data/ai_prices.json. LiteLLM's price list is MIT
+Writes gateway-rs/src/ai/builtin_prices.json. LiteLLM's price list is MIT
 licensed (Copyright (c) 2023 Berri AI); the attribution is kept in the output.
 Prices an admin enters in Doorman always override these.
 """
@@ -21,7 +21,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 SOURCE_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-OUTPUT = Path(__file__).resolve().parent.parent / "gateway-rs" / "src" / "ai" / "data" / "ai_prices.json"
+OUTPUT = Path(__file__).resolve().parent.parent / "gateway-rs" / "src" / "ai" / "builtin_prices.json"
 
 # LiteLLM provider -> (Doorman provider id, key prefix to strip).
 PROVIDERS = {

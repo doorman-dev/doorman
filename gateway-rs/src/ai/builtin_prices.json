@@ -1,0 +1,4968 @@
+{
+ "source": "LiteLLM model_prices_and_context_window.json",
+ "source_url": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+ "license": "MIT, Copyright (c) 2023 Berri AI",
+ "generated_at": "2026-11-05",
+ "prices": [
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-fable-5",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-fable-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-haiku-4-5",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-haiku-4-5-20251001",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-haiku-5-5",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-mythos-5",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-mythos-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-mythos-preview",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-5-20251101",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-6",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-6-20260205",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-7",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-7-20260416",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-4-8",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-opus-5-5",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-sonnet-4-5",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-sonnet-4-5-20250929",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-sonnet-4-6",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-sonnet-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "anthropic",
+   "model_pattern": "claude-sonnet-5-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "chat-latest",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "codex-mini",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": 0.375,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "computer-use-preview",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-3.5-turbo",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-35-turbo",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4-0125-preview",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4-1106-preview",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4-turbo",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 33,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4-turbo-2024-04-09",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 33,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4-turbo-vision-preview",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 33,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1-2025-04-14",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1-mini",
+   "input_usd_per_mtok": 0.4,
+   "output_usd_per_mtok": 1.6,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1-mini-2025-04-14",
+   "input_usd_per_mtok": 0.4,
+   "output_usd_per_mtok": 1.6,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1-nano",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4.1-nano-2025-04-14",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-2024-05-13",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-2024-08-06",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-2024-11-20",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-audio-preview-2024-12-17",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-mini",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-mini-2024-07-18",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-4o-mini-audio-preview-2024-12-17",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-2025-08-07",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-chat",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-codex",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-mini",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-mini-2025-08-07",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-nano",
+   "input_usd_per_mtok": 0.05,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.005,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-nano-2025-08-07",
+   "input_usd_per_mtok": 0.05,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.005,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5-pro",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 120,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-2025-11-13",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-chat",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-codex",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-codex-2025-11-13",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-codex-max",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-codex-mini",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.1-codex-mini-2025-11-13",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2-2025-12-11",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2-chat",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2-codex",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2-pro",
+   "input_usd_per_mtok": 21,
+   "output_usd_per_mtok": 168,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.2-pro-2025-12-11",
+   "input_usd_per_mtok": 21,
+   "output_usd_per_mtok": 168,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.3-chat",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.3-codex",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-2026-03-05",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-mini",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 4.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-mini-2026-03-17",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 4.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-nano",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-nano-2026-03-17",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-pro",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": 3,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.4-pro-2026-03-05",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": 3,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.5-2026-04-23",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.5-2026-04-24",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.5-pro",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": 3,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.5-pro-2026-04-23",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": 3,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-luna",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": 0.25
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-luna-2026-07-09",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": 0.25
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-sol",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-sol-2026-07-09",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-terra",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-5.6-terra-2026-07-09",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-astra",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-astra-2026-09-03",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-luna",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-luna-2026-09-22",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6-sol-2026-09-22",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6.1-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6.1-sol-2026-09-29",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-6.1-terra",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.05,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio-1.5",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio-1.5-2026-02-23",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio-2025-08-28",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio-mini",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-audio-mini-2025-10-06",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "gpt-chat-latest",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "mistral-large-2402",
+   "input_usd_per_mtok": 8,
+   "output_usd_per_mtok": 24,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "mistral-large-latest",
+   "input_usd_per_mtok": 8,
+   "output_usd_per_mtok": 24,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "model-router",
+   "input_usd_per_mtok": 0.14,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o1",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": 7.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o1-2024-12-17",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": 7.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o1-mini",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o1-mini-2024-09-12",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-2025-04-16",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-deep-research",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 40,
+   "cache_read_usd_per_mtok": 2.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-mini",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-mini-2025-01-31",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-pro",
+   "input_usd_per_mtok": 20,
+   "output_usd_per_mtok": 80,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o3-pro-2025-06-10",
+   "input_usd_per_mtok": 20,
+   "output_usd_per_mtok": 80,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o4-mini",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "azure_openai",
+   "model_pattern": "o4-mini-2025-04-16",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "ai21.j2-mid-v1",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 12.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "ai21.j2-ultra-v1",
+   "input_usd_per_mtok": 18.8,
+   "output_usd_per_mtok": 18.8,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "ai21.jamba-1-5-large-v1:0",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "ai21.jamba-1-5-mini-v1:0",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "ai21.jamba-instruct-v1:0",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 0.7,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-2-pro-preview-20251202-v1:0",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.3125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-lite-v1:0",
+   "input_usd_per_mtok": 0.06,
+   "output_usd_per_mtok": 0.24,
+   "cache_read_usd_per_mtok": 0.015,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-micro-v1:0",
+   "input_usd_per_mtok": 0.035,
+   "output_usd_per_mtok": 0.14,
+   "cache_read_usd_per_mtok": 0.00875,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-premier-v1:0",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 12.5,
+   "cache_read_usd_per_mtok": 0.625,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.nova-pro-v1:0",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 3.2,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.titan-text-express-v1",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.titan-text-lite-v1",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "amazon.titan-text-premier-v1:0",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-5-haiku-20241022-v1:0",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 4,
+   "cache_read_usd_per_mtok": 0.08,
+   "cache_write_usd_per_mtok": 1
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-7-sonnet-20240620-v1:0",
+   "input_usd_per_mtok": 3.6,
+   "output_usd_per_mtok": 18,
+   "cache_read_usd_per_mtok": 0.36,
+   "cache_write_usd_per_mtok": 4.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-3-opus-20240229-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-fable-5",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-fable-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-haiku-4-5@20251001",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-instant-v1",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-mythos-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-mythos-preview",
+   "input_usd_per_mtok": 27.5,
+   "output_usd_per_mtok": 137.5,
+   "cache_read_usd_per_mtok": 2.75,
+   "cache_write_usd_per_mtok": 34.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-1-20250805-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-20250514-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-5-20251101-v1:0",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-6-v1",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-sonnet-4-20250514-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-v1",
+   "input_usd_per_mtok": 8,
+   "output_usd_per_mtok": 24,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "anthropic.claude-v2:1",
+   "input_usd_per_mtok": 8,
+   "output_usd_per_mtok": 24,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.396,
+   "output_usd_per_mtok": 3.311,
+   "cache_read_usd_per_mtok": 0.099,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.amazon.nova-2-pro-preview-20251202-v1:0",
+   "input_usd_per_mtok": 1.375,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.34375,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.amazon.nova-lite-v1:0",
+   "input_usd_per_mtok": 0.063,
+   "output_usd_per_mtok": 0.252,
+   "cache_read_usd_per_mtok": 0.01575,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.amazon.nova-micro-v1:0",
+   "input_usd_per_mtok": 0.037,
+   "output_usd_per_mtok": 0.148,
+   "cache_read_usd_per_mtok": 0.00925,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.amazon.nova-pro-v1:0",
+   "input_usd_per_mtok": 0.84,
+   "output_usd_per_mtok": 3.36,
+   "cache_read_usd_per_mtok": 0.21,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-fable-5",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-mythos-preview",
+   "input_usd_per_mtok": 27.5,
+   "output_usd_per_mtok": 137.5,
+   "cache_read_usd_per_mtok": 2.75,
+   "cache_write_usd_per_mtok": 34.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "apac.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-fable-5",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-mythos-preview",
+   "input_usd_per_mtok": 27.5,
+   "output_usd_per_mtok": 137.5,
+   "cache_read_usd_per_mtok": 2.75,
+   "cache_write_usd_per_mtok": 34.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-opus-4-6-v1",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "au.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "cohere.command-light-text-v14",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "cohere.command-text-v14",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "deepseek.r1-v1:0",
+   "input_usd_per_mtok": 1.35,
+   "output_usd_per_mtok": 5.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "deepseek.v3-v1:0",
+   "input_usd_per_mtok": 0.58,
+   "output_usd_per_mtok": 1.68,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "deepseek.v3.2",
+   "input_usd_per_mtok": 0.62,
+   "output_usd_per_mtok": 1.85,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.429,
+   "output_usd_per_mtok": 3.597,
+   "cache_read_usd_per_mtok": 0.10725,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.amazon.nova-2-pro-preview-20251202-v1:0",
+   "input_usd_per_mtok": 1.375,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.34375,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.amazon.nova-lite-v1:0",
+   "input_usd_per_mtok": 0.078,
+   "output_usd_per_mtok": 0.312,
+   "cache_read_usd_per_mtok": 0.0195,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.amazon.nova-micro-v1:0",
+   "input_usd_per_mtok": 0.046,
+   "output_usd_per_mtok": 0.184,
+   "cache_read_usd_per_mtok": 0.0115,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.amazon.nova-pro-v1:0",
+   "input_usd_per_mtok": 1.05,
+   "output_usd_per_mtok": 4.2,
+   "cache_read_usd_per_mtok": 0.2625,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-3-5-haiku-20241022-v1:0",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 4,
+   "cache_read_usd_per_mtok": 0.08,
+   "cache_write_usd_per_mtok": 1
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-3-5-sonnet-20240620-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-3-7-sonnet-20250219-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-3-opus-20240229-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-fable-5",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-fable-5-1",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-1-20250805-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-20250514-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-6-v1",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.deepseek.v3.2",
+   "input_usd_per_mtok": 0.74,
+   "output_usd_per_mtok": 2.22,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.meta.llama3-2-1b-instruct-v1:0",
+   "input_usd_per_mtok": 0.13,
+   "output_usd_per_mtok": 0.13,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.meta.llama3-2-3b-instruct-v1:0",
+   "input_usd_per_mtok": 0.19,
+   "output_usd_per_mtok": 0.19,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "eu.mistral.pixtral-large-2502-v1:0",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-fable-5",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-fable-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-mythos-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-4-5-20251101-v1:0",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-4-6-v1",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-sonnet-4-20250514-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.moonshotai.kimi-k3",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-5.4",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-5.5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-5.6-luna",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": 0.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-5.6-sol",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-5.6-terra",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-6-astra",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-6-luna",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-6-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-6.1-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.openai.gpt-6.1-terra",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.05,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.xai.grok-4.6",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.xai.grok-4.7",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "global.zai.glm-5.3",
+   "input_usd_per_mtok": 1.68,
+   "output_usd_per_mtok": 5.28,
+   "cache_read_usd_per_mtok": 0.312,
+   "cache_write_usd_per_mtok": 2.1
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "google.gemma-3-12b-it",
+   "input_usd_per_mtok": 0.09,
+   "output_usd_per_mtok": 0.29,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "google.gemma-3-27b-it",
+   "input_usd_per_mtok": 0.23,
+   "output_usd_per_mtok": 0.38,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "google.gemma-3-4b-it",
+   "input_usd_per_mtok": 0.04,
+   "output_usd_per_mtok": 0.08,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "in.moonshotai.kimi-k3",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.396,
+   "output_usd_per_mtok": 3.311,
+   "cache_read_usd_per_mtok": 0.099,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "jp.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama2-13b-chat-v1",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 1,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama2-70b-chat-v1",
+   "input_usd_per_mtok": 1.95,
+   "output_usd_per_mtok": 2.56,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-1-405b-instruct-v1:0",
+   "input_usd_per_mtok": 2.4,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-1-70b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-1-8b-instruct-v1:0",
+   "input_usd_per_mtok": 0.22,
+   "output_usd_per_mtok": 0.22,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-2-11b-instruct-v1:0",
+   "input_usd_per_mtok": 0.16,
+   "output_usd_per_mtok": 0.16,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-2-1b-instruct-v1:0",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.1,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-2-3b-instruct-v1:0",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-2-90b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-3-70b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-70b-instruct-v1:0",
+   "input_usd_per_mtok": 2.65,
+   "output_usd_per_mtok": 3.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama3-8b-instruct-v1:0",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama4-maverick-17b-instruct-v1:0",
+   "input_usd_per_mtok": 0.24,
+   "output_usd_per_mtok": 0.97,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "meta.llama4-scout-17b-instruct-v1:0",
+   "input_usd_per_mtok": 0.17,
+   "output_usd_per_mtok": 0.66,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "minimax.minimax-m2",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "minimax.minimax-m2.1",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "minimax.minimax-m2.5",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.devstral-2-123b",
+   "input_usd_per_mtok": 0.4,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.magistral-small-2509",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.ministral-3-14b-instruct",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 0.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.ministral-3-3b-instruct",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.1,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.ministral-3-8b-instruct",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mistral-7b-instruct-v0:2",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mistral-large-2402-v1:0",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mistral-large-2407-v1:0",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mistral-large-3-675b-instruct",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mistral-small-2402-v1:0",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 3,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.mixtral-8x7b-instruct-v0:1",
+   "input_usd_per_mtok": 0.45,
+   "output_usd_per_mtok": 0.7,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.pixtral-large-2502-v1:0",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.voxtral-mini-3b-2507",
+   "input_usd_per_mtok": 0.04,
+   "output_usd_per_mtok": 0.04,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "mistral.voxtral-small-24b-2507",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.3,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "moonshot.kimi-k2-thinking",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "moonshotai.kimi-k2.5",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 3,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "moonshotai.kimi-k3",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "nvidia.nemotron-nano-12b-v2",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "nvidia.nemotron-nano-3-30b",
+   "input_usd_per_mtok": 0.06,
+   "output_usd_per_mtok": 0.24,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "nvidia.nemotron-nano-9b-v2",
+   "input_usd_per_mtok": 0.06,
+   "output_usd_per_mtok": 0.23,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "nvidia.nemotron-super-3-120b",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.65,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-6-luna",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-6-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-oss-120b-1:0",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-oss-20b-1:0",
+   "input_usd_per_mtok": 0.07,
+   "output_usd_per_mtok": 0.3,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-oss-safeguard-120b",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "openai.gpt-oss-safeguard-20b",
+   "input_usd_per_mtok": 0.07,
+   "output_usd_per_mtok": 0.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-235b-a22b-2507-v1:0",
+   "input_usd_per_mtok": 0.22,
+   "output_usd_per_mtok": 0.88,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-32b-v1:0",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-coder-30b-a3b-v1:0",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-coder-480b-a35b-v1:0",
+   "input_usd_per_mtok": 0.45,
+   "output_usd_per_mtok": 1.8,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-coder-next",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-next-80b-a3b",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "qwen.qwen3-vl-235b-a22b",
+   "input_usd_per_mtok": 0.53,
+   "output_usd_per_mtok": 2.66,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-fable-5-1",
+   "input_usd_per_mtok": 12,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 15
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.12,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.012,
+   "cache_write_usd_per_mtok": 0.15
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 6,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.6,
+   "cache_write_usd_per_mtok": 7.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 6,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.6,
+   "cache_write_usd_per_mtok": 7.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.8,
+   "output_usd_per_mtok": 24,
+   "cache_read_usd_per_mtok": 0.24,
+   "cache_write_usd_per_mtok": 6
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3.6,
+   "output_usd_per_mtok": 18,
+   "cache_read_usd_per_mtok": 0.36,
+   "cache_write_usd_per_mtok": 4.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.4,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.24,
+   "cache_write_usd_per_mtok": 3
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.4,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.12,
+   "cache_write_usd_per_mtok": 3
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.nvidia.nemotron-nano-12b-v2",
+   "input_usd_per_mtok": 0.24,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.nvidia.nemotron-nano-3-30b",
+   "input_usd_per_mtok": 0.072,
+   "output_usd_per_mtok": 0.288,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.nvidia.nemotron-nano-9b-v2",
+   "input_usd_per_mtok": 0.072,
+   "output_usd_per_mtok": 0.276,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.nvidia.nemotron-super-3-120b",
+   "input_usd_per_mtok": 0.18,
+   "output_usd_per_mtok": 0.78,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.openai.gpt-oss-120b-1:0",
+   "input_usd_per_mtok": 0.18,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.openai.gpt-oss-20b-1:0",
+   "input_usd_per_mtok": 0.084,
+   "output_usd_per_mtok": 0.36,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us-gov.xai.grok-4.6",
+   "input_usd_per_mtok": 2.64,
+   "output_usd_per_mtok": 7.92,
+   "cache_read_usd_per_mtok": 0.66,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.amazon.nova-2-lite-v1:0",
+   "input_usd_per_mtok": 0.33,
+   "output_usd_per_mtok": 2.75,
+   "cache_read_usd_per_mtok": 0.0825,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.amazon.nova-2-pro-preview-20251202-v1:0",
+   "input_usd_per_mtok": 1.375,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.34375,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.amazon.nova-lite-v1:0",
+   "input_usd_per_mtok": 0.06,
+   "output_usd_per_mtok": 0.24,
+   "cache_read_usd_per_mtok": 0.015,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.amazon.nova-micro-v1:0",
+   "input_usd_per_mtok": 0.035,
+   "output_usd_per_mtok": 0.14,
+   "cache_read_usd_per_mtok": 0.00875,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.amazon.nova-pro-v1:0",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 3.2,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+   "input_usd_per_mtok": 0.8,
+   "output_usd_per_mtok": 4,
+   "cache_read_usd_per_mtok": 0.08,
+   "cache_write_usd_per_mtok": 1
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-3-opus-20240229-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-fable-5",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-fable-5-1",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-haiku-5-5",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-mythos-5",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-mythos-5-1",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-mythos-preview",
+   "input_usd_per_mtok": 27.5,
+   "output_usd_per_mtok": 137.5,
+   "cache_read_usd_per_mtok": 2.75,
+   "cache_write_usd_per_mtok": 34.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-20250514-v1:0",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-6-v1",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-7",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-4-8",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 27.5,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": 6.875
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-opus-5-5",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-sonnet-4-6",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-sonnet-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.anthropic.claude-sonnet-5-5",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.deepseek.r1-v1:0",
+   "input_usd_per_mtok": 1.35,
+   "output_usd_per_mtok": 5.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.deepseek.v3.2",
+   "input_usd_per_mtok": 0.62,
+   "output_usd_per_mtok": 1.85,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-1-405b-instruct-v1:0",
+   "input_usd_per_mtok": 2.4,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-1-70b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-1-8b-instruct-v1:0",
+   "input_usd_per_mtok": 0.22,
+   "output_usd_per_mtok": 0.22,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-2-11b-instruct-v1:0",
+   "input_usd_per_mtok": 0.16,
+   "output_usd_per_mtok": 0.16,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-2-1b-instruct-v1:0",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.1,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-2-3b-instruct-v1:0",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-2-90b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama3-3-70b-instruct-v1:0",
+   "input_usd_per_mtok": 0.72,
+   "output_usd_per_mtok": 0.72,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama4-maverick-17b-instruct-v1:0",
+   "input_usd_per_mtok": 0.24,
+   "output_usd_per_mtok": 0.97,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.meta.llama4-scout-17b-instruct-v1:0",
+   "input_usd_per_mtok": 0.17,
+   "output_usd_per_mtok": 0.66,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.mistral.pixtral-large-2502-v1:0",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.moonshotai.kimi-k3",
+   "input_usd_per_mtok": 3.3,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.33,
+   "cache_write_usd_per_mtok": 4.125
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-5.4",
+   "input_usd_per_mtok": 2.75,
+   "output_usd_per_mtok": 16.5,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-5.5",
+   "input_usd_per_mtok": 5.5,
+   "output_usd_per_mtok": 33,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-5.6-luna",
+   "input_usd_per_mtok": 0.22,
+   "output_usd_per_mtok": 1.32,
+   "cache_read_usd_per_mtok": 0.022,
+   "cache_write_usd_per_mtok": 0.275
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-5.6-sol",
+   "input_usd_per_mtok": 4.4,
+   "output_usd_per_mtok": 22,
+   "cache_read_usd_per_mtok": 0.44,
+   "cache_write_usd_per_mtok": 5.5
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-5.6-terra",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 13.2,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-6-astra",
+   "input_usd_per_mtok": 11,
+   "output_usd_per_mtok": 55,
+   "cache_read_usd_per_mtok": 1.1,
+   "cache_write_usd_per_mtok": 13.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-6-luna",
+   "input_usd_per_mtok": 0.11,
+   "output_usd_per_mtok": 0.55,
+   "cache_read_usd_per_mtok": 0.011,
+   "cache_write_usd_per_mtok": 0.1375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-6-sol",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.22,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-6.1-sol",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 11,
+   "cache_read_usd_per_mtok": 0.11,
+   "cache_write_usd_per_mtok": 2.75
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.openai.gpt-6.1-terra",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 5.5,
+   "cache_read_usd_per_mtok": 0.055,
+   "cache_write_usd_per_mtok": 1.375
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.writer.palmyra-x4-v1:0",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.writer.palmyra-x5-v1:0",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.xai.grok-4.6",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 6.6,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.xai.grok-4.7",
+   "input_usd_per_mtok": 2.2,
+   "output_usd_per_mtok": 6.6,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "us.zai.glm-5.3",
+   "input_usd_per_mtok": 1.848,
+   "output_usd_per_mtok": 5.808,
+   "cache_read_usd_per_mtok": 0.3432,
+   "cache_write_usd_per_mtok": 2.31
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "writer.palmyra-vision-7b",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "writer.palmyra-x4-v1:0",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "writer.palmyra-x5-v1:0",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "zai.glm-4.7",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "zai.glm-4.7-flash",
+   "input_usd_per_mtok": 0.07,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "bedrock",
+   "model_pattern": "zai.glm-5",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 3.2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "deep-research-max-preview-04-2026",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "deep-research-preview-04-2026",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "deep-research-pro-preview-12-2025",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-2.5-computer-use-preview-10-2025",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-2.5-flash",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-2.5-flash-lite",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-2.5-pro",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-2.5-pro-preview-tts",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3-flash-preview",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 3,
+   "cache_read_usd_per_mtok": 0.05,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.1-flash-lite",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.1-flash-lite-preview",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.1-pro-preview",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.1-pro-preview-customtools",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.5-flash",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 9,
+   "cache_read_usd_per_mtok": 0.15,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.5-flash-lite",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.6-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.7-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-3.8-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-4-argon",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-exp-1114",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-exp-1206",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-flash-latest",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-flash-lite-latest",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-gemma-2-27b-it",
+   "input_usd_per_mtok": 0.35,
+   "output_usd_per_mtok": 1.05,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-gemma-2-9b-it",
+   "input_usd_per_mtok": 0.35,
+   "output_usd_per_mtok": 1.05,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-omni-1.1-flash",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 9,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-omni-flash-preview",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 9,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-pro-latest",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-robotics-er-2-preview",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemini-robotics-er-2-streaming-preview",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemma-3-27b-it",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemma-4-26b-a4b-it",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "gemma-4-31b-it",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "learnlm-1.5-pro-experimental",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-3-clip-preview",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-3-pro-preview",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-3.5",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-3.5-clip-preview",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-3.5-pro-preview",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "gemini",
+   "model_pattern": "lyria-realtime-exp",
+   "input_usd_per_mtok": 0,
+   "output_usd_per_mtok": 0,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "chat-latest",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "computer-use-preview",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "computer-use-preview-2025-03-11",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "daybreak-blue-latest",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "daybreak-red-latest",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": 15.625
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-3.5-turbo",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-3.5-turbo-0125",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-3.5-turbo-1106",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-3.5-turbo-16k",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4-0613",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4-1106-preview",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4-turbo",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4-turbo-2024-04-09",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1-2025-04-14",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1-mini",
+   "input_usd_per_mtok": 0.4,
+   "output_usd_per_mtok": 1.6,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1-mini-2025-04-14",
+   "input_usd_per_mtok": 0.4,
+   "output_usd_per_mtok": 1.6,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1-nano",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4.1-nano-2025-04-14",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-2024-05-13",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-2024-08-06",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-2024-11-20",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-audio-preview-2024-12-17",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-audio-preview-2025-06-03",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-mini",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-mini-2024-07-18",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-mini-audio-preview-2024-12-17",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-mini-search-preview",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-mini-search-preview-2025-03-11",
+   "input_usd_per_mtok": 0.15,
+   "output_usd_per_mtok": 0.6,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-search-preview",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-4o-search-preview-2025-03-11",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-2025-08-07",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-chat",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-chat-latest",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-codex",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-mini",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-mini-2025-08-07",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-nano",
+   "input_usd_per_mtok": 0.05,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.005,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-nano-2025-08-07",
+   "input_usd_per_mtok": 0.05,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.005,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-pro",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 120,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-pro-2025-10-06",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 120,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-search-api",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5-search-api-2025-10-14",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1-2025-11-13",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1-chat-latest",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1-codex",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1-codex-max",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.1-codex-mini",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 2,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2-2025-12-11",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2-chat-latest",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2-codex",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2-pro",
+   "input_usd_per_mtok": 21,
+   "output_usd_per_mtok": 168,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.2-pro-2025-12-11",
+   "input_usd_per_mtok": 21,
+   "output_usd_per_mtok": 168,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.3-chat-latest",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.3-codex",
+   "input_usd_per_mtok": 1.75,
+   "output_usd_per_mtok": 14,
+   "cache_read_usd_per_mtok": 0.175,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-2026-03-05",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-mini",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 4.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-mini-2026-03-17",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 4.5,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-nano",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-nano-2026-03-17",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-pro",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.4-pro-2026-03-05",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5-2026-04-23",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 30,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5-cyber",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5-cyber-preview",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5-pro",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.5-pro-2026-04-23",
+   "input_usd_per_mtok": 30,
+   "output_usd_per_mtok": 180,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.6",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.6-cyber",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": 15.625
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.6-luna",
+   "input_usd_per_mtok": 0.2,
+   "output_usd_per_mtok": 1.2,
+   "cache_read_usd_per_mtok": 0.02,
+   "cache_write_usd_per_mtok": 0.25
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.6-sol",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-5.6-terra",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6-astra",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6-astra-law",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6-luna",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6-rosalind",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.5,
+   "cache_write_usd_per_mtok": 18.75
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6.1-sol",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-6.1-terra",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.05,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio-1.5",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio-2025-08-28",
+   "input_usd_per_mtok": 2.5,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio-mini",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio-mini-2025-10-06",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-audio-mini-2025-12-15",
+   "input_usd_per_mtok": 0.6,
+   "output_usd_per_mtok": 2.4,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-daybreak-blue-latest",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.4,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-daybreak-red-latest",
+   "input_usd_per_mtok": 12.5,
+   "output_usd_per_mtok": 75,
+   "cache_read_usd_per_mtok": 1.25,
+   "cache_write_usd_per_mtok": 15.625
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-rosalind-discovery",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "gpt-rosalind-research",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o1",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": 7.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o1-2024-12-17",
+   "input_usd_per_mtok": 15,
+   "output_usd_per_mtok": 60,
+   "cache_read_usd_per_mtok": 7.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o1-pro",
+   "input_usd_per_mtok": 150,
+   "output_usd_per_mtok": 600,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o1-pro-2025-03-19",
+   "input_usd_per_mtok": 150,
+   "output_usd_per_mtok": 600,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-2025-04-16",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-deep-research",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 40,
+   "cache_read_usd_per_mtok": 2.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-deep-research-2025-06-26",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 40,
+   "cache_read_usd_per_mtok": 2.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-mini",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-mini-2025-01-31",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.55,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-pro",
+   "input_usd_per_mtok": 20,
+   "output_usd_per_mtok": 80,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o3-pro-2025-06-10",
+   "input_usd_per_mtok": 20,
+   "output_usd_per_mtok": 80,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o4-mini",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o4-mini-2025-04-16",
+   "input_usd_per_mtok": 1.1,
+   "output_usd_per_mtok": 4.4,
+   "cache_read_usd_per_mtok": 0.275,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o4-mini-deep-research",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "openai",
+   "model_pattern": "o4-mini-deep-research-2025-06-26",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 8,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-5-haiku",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-5-haiku@20241022",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-5-sonnet",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-5-sonnet@20240620",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-haiku",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-haiku@20240307",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.25,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-sonnet",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-3-sonnet@20240229",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-fable-5",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-fable-5-1",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-fable-5-1@default",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 0.25,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-fable-5@default",
+   "input_usd_per_mtok": 10,
+   "output_usd_per_mtok": 50,
+   "cache_read_usd_per_mtok": 1,
+   "cache_write_usd_per_mtok": 12.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-haiku-4-5",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-haiku-4-5@20251001",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 1.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-haiku-5-5",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-haiku-5-5@default",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.5,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": 0.125
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-5@20251101",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-6",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-6@default",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-7",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-7@default",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-8",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-4-8@default",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-5",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-5-5",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-5-5@default",
+   "input_usd_per_mtok": 4,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-opus-5@default",
+   "input_usd_per_mtok": 5,
+   "output_usd_per_mtok": 25,
+   "cache_read_usd_per_mtok": 0.5,
+   "cache_write_usd_per_mtok": 6.25
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-4-5",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-4-5@20250929",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-4-6",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-4-6@default",
+   "input_usd_per_mtok": 3,
+   "output_usd_per_mtok": 15,
+   "cache_read_usd_per_mtok": 0.3,
+   "cache_write_usd_per_mtok": 3.75
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-5-5",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-5-5@default",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "claude-sonnet-5@default",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": 2.5
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "deep-research-pro-preview-12-2025",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-computer-use-preview-10-2025",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-flash",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-flash-lite",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-flash-lite-preview-09-2025",
+   "input_usd_per_mtok": 0.1,
+   "output_usd_per_mtok": 0.4,
+   "cache_read_usd_per_mtok": 0.01,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-flash-preview-09-2025",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-pro",
+   "input_usd_per_mtok": 1.25,
+   "output_usd_per_mtok": 10,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-2.5-pro-preview-tts",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 20,
+   "cache_read_usd_per_mtok": 0.125,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3-flash-preview",
+   "input_usd_per_mtok": 0.5,
+   "output_usd_per_mtok": 3,
+   "cache_read_usd_per_mtok": 0.05,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.1-flash-lite",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.1-flash-lite-preview",
+   "input_usd_per_mtok": 0.25,
+   "output_usd_per_mtok": 1.5,
+   "cache_read_usd_per_mtok": 0.025,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.1-pro-preview",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.1-pro-preview-customtools",
+   "input_usd_per_mtok": 2,
+   "output_usd_per_mtok": 12,
+   "cache_read_usd_per_mtok": 0.2,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.5-flash",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 9,
+   "cache_read_usd_per_mtok": 0.15,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.5-flash-lite",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0.03,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.6-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.7-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.8-flash",
+   "input_usd_per_mtok": 0.75,
+   "output_usd_per_mtok": 3.75,
+   "cache_read_usd_per_mtok": 0.075,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-3.8-flash-cyber",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 7.5,
+   "cache_read_usd_per_mtok": 0.15,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-omni-flash-preview",
+   "input_usd_per_mtok": 1.5,
+   "output_usd_per_mtok": 9,
+   "cache_read_usd_per_mtok": null,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-robotics-er-1.5-preview",
+   "input_usd_per_mtok": 0.3,
+   "output_usd_per_mtok": 2.5,
+   "cache_read_usd_per_mtok": 0,
+   "cache_write_usd_per_mtok": null
+  },
+  {
+   "provider": "vertex",
+   "model_pattern": "gemini-robotics-er-2-preview",
+   "input_usd_per_mtok": 1,
+   "output_usd_per_mtok": 5,
+   "cache_read_usd_per_mtok": 0.1,
+   "cache_write_usd_per_mtok": null
+  }
+ ]
+}
