@@ -360,6 +360,11 @@ async fn run_revocation_purge(storage: &SharedStorage, runtime: &GatewayRuntime)
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    match storage.purge_expired_prompt_logs(now).await {
+        Ok(removed) if removed > 0 => info!(removed, "purged expired AI prompt logs"),
+        Ok(_) => {}
+        Err(error_value) => error!(error = %error_value, "expired AI prompt log purge failed"),
+    }
     match storage.purge_expired_revocations(now).await {
         Ok(removed) => {
             runtime

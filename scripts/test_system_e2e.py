@@ -17,7 +17,7 @@ class SystemE2EContractTests(unittest.TestCase):
     def test_union_inventory_and_every_cell_has_a_disposition(self) -> None:
         contract = system_e2e.load_json(system_e2e.SYSTEM / "contract.json")
         self.assertEqual(len(self.ledger["operations"]), 178)
-        self.assertEqual(len(self.ledger["dashboard_routes"]), 51)
+        self.assertEqual(len(self.ledger["dashboard_routes"]), 63)
         self.assertEqual(
             len(self.ledger["operation_cells"]),
             178 * len(contract["operation_classes"]),

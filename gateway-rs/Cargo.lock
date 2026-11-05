@@ -876,6 +876,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hkdf",
+ "hmac 0.12.1",
  "http",
  "http-body-util",
  "jsonwebtoken",

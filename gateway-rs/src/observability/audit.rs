@@ -57,7 +57,9 @@ pub fn redact_record(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
-                if is_sensitive_name(name) {
+                // AI usage counts (`input_tokens`, ...) are numbers, never secrets.
+                let token_count = name.ends_with("_tokens") && value.is_number();
+                if is_sensitive_name(name) && !token_count {
                     *value = serde_json::Value::String(REDACTED.to_owned());
                 } else if name == "message" {
                     if let Some(message) = value.as_str() {

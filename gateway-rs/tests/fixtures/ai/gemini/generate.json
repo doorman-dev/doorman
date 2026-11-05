@@ -1,0 +1,5 @@
+{
+  "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "Gateway ready."}]}, "finishReason": "STOP"}],
+  "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 24, "thoughtsTokenCount": 8, "totalTokenCount": 132},
+  "modelVersion": "gemini-example-flash", "responseId": "gemini-fixture"
+}

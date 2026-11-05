@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package alerts_oxqdv_v2;
+
+service AlertsOxqdvService {
+  rpc GetStatus (StatusRequest) returns (StatusReply) {}
+}
+
+message StatusRequest {
+  string id = 1;
+}
+
+message StatusReply {
+  string status = 1;
+  string message = 2;
+}

@@ -1,0 +1,6 @@
+{
+  "id": "chatcmpl-azure-fixture", "object": "chat.completion", "created": 1792281600,
+  "model": "corp-chat",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "Gateway ready.", "refusal": null}, "finish_reason": "stop", "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}, "violence": {"filtered": false, "severity": "safe"}}}],
+  "usage": {"prompt_tokens": 100, "completion_tokens": 24, "total_tokens": 124, "prompt_tokens_details": {"cached_tokens": 40}, "completion_tokens_details": {"reasoning_tokens": 8}}
+}

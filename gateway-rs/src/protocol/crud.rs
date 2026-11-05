@@ -67,6 +67,7 @@ pub async fn execute(
         DataPlaneProtocol::Soap => BodyLimits::from_env().soap,
         DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => BodyLimits::from_env().grpc,
         DataPlaneProtocol::Rest => BodyLimits::from_env().rest,
+        DataPlaneProtocol::Ai => BodyLimits::from_env().ai,
     };
     let body = match to_bytes(body, BodyLimits::for_path(&request_path, limit)).await {
         Ok(body) => body,
@@ -92,7 +93,7 @@ pub async fn execute(
             )
             .await
         }
-        DataPlaneProtocol::Rest => Ok(policy_error(
+        DataPlaneProtocol::Rest | DataPlaneProtocol::Ai => Ok(policy_error(
             StatusCode::NOT_IMPLEMENTED,
             "CRUD501",
             "CRUD is not supported for this protocol",

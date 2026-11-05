@@ -11,6 +11,8 @@ import { useToast } from '@/contexts/ToastContext'
 import { SERVER_URL } from '@/utils/config'
 import InfoTooltip from '@/components/InfoTooltip'
 import ApiLifecyclePanel from '@/components/ApiLifecyclePanel'
+import AiModelsPanel from '@/components/AiModelsPanel'
+import type { AiApiConfig, AiProvider } from '@/utils/ai'
 import FormHelp from '@/components/FormHelp'
 import SearchableSelect from '@/components/SearchableSelect'
 import { SignalBreadcrumbs, SignalCopyButton } from '@/components/signal/Signal'
@@ -25,6 +27,8 @@ interface API {
   api_allowed_groups: string[]
   api_servers: string[]
   api_type: string
+  api_ai_provider?: AiProvider
+  api_ai_config?: AiApiConfig
   api_allowed_retry_count: number
   api_authorization_field_swap?: string
   api_allowed_headers?: string[]
@@ -316,8 +320,9 @@ const ApiDetailPage = () => {
     }
   }, [api])
 
+  const listPath = api?.api_type === 'AI' ? '/ai/providers' : '/apis'
   const handleBack = () => {
-    router.push('/apis')
+    router.push(listPath)
   }
 
   const handleExport = async () => {
@@ -603,7 +608,7 @@ const ApiDetailPage = () => {
       if (!name || !version) throw new Error('API context missing for delete')
       await delJson(`${SERVER_URL}/platform/api/${encodeURIComponent(name)}/${encodeURIComponent(version)}`)
 
-      router.push('/apis')
+      router.push(listPath)
     } catch (err) {
       if (err instanceof Error) {
         setError(err.message)
@@ -1108,6 +1113,14 @@ const ApiDetailPage = () => {
             </div>
 
           <ApiLifecyclePanel apiName={api.api_name} apiVersion={api.api_version} />
+          {api.api_type === 'AI' && api.api_ai_provider && api.api_ai_config && <AiModelsPanel
+            apiName={api.api_name} apiVersion={api.api_version} provider={api.api_ai_provider} config={api.api_ai_config}
+            onSaved={config => {
+              const updated = { ...api, api_ai_config: config }
+              setApi(updated)
+              try { sessionStorage.setItem('selectedApi', JSON.stringify(updated)) } catch {}
+            }}
+          />}
 
           {/* IP Access Control */}
           <div className="card">

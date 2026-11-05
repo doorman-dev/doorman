@@ -66,6 +66,7 @@ const SecurityPage = () => {
   const [secTab, setSecTab] = useState<'memory' | 'network' | 'gateway' | 'auth'>('memory')
   useEffect(() => {
     const h = window.location.hash.replace('#', '')
+    if (h === 'ai') { window.location.replace('/ai/policies#guardrails'); return }
     if (h === 'memory' || h === 'network' || h === 'gateway' || h === 'auth') setSecTab(h)
   }, [])
   const selectSecTab = (id: 'memory' | 'network' | 'gateway' | 'auth') => { setSecTab(id); try { window.history.replaceState(null, '', `#${id}`) } catch {} }

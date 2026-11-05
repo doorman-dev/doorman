@@ -39,6 +39,7 @@ pub enum DataPlaneProtocol {
     Soap,
     Grpc,
     GrpcWeb,
+    Ai,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +60,7 @@ pub(crate) async fn early_body_limit(
         DataPlaneProtocol::Graphql => limits.graphql,
         DataPlaneProtocol::Soap => limits.soap,
         DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => limits.grpc,
+        DataPlaneProtocol::Ai => limits.ai,
     };
     let limit = BodyLimits::for_path(path, limit);
     let declared = headers
@@ -185,7 +187,7 @@ pub async fn rest_policy_then_proxy(
     } else {
         request.method().clone()
     };
-    let policy_request = PolicyRequest {
+    let mut policy_request = PolicyRequest {
         method: policy_method,
         path,
         headers,
@@ -206,6 +208,7 @@ pub async fn rest_policy_then_proxy(
             && !request.headers().contains_key("x-api-version"),
         route_endpoint_check: protocol == DataPlaneProtocol::Rest,
         endpoint_required: matches!(protocol, DataPlaneProtocol::Rest | DataPlaneProtocol::Soap),
+        ai_principal: None,
     };
 
     let documents = if let Some(injected) = &state.policy_documents {
@@ -221,24 +224,45 @@ pub async fn rest_policy_then_proxy(
     } else {
         Err("shared policy storage is unavailable".to_owned())
     };
+    // AI routes keep the policy documents for credential and config lookup.
+    let mut ai_documents = None;
     let result = match documents {
         Ok(mut documents) => {
+            // AI callers present a `dk_` key or a JWT in provider-style headers.
+            let ai_auth = if protocol == DataPlaneProtocol::Ai && !policy_request.is_preflight {
+                crate::routes::ai::authenticate(
+                    &state,
+                    &mut policy_request,
+                    &documents,
+                    request.extensions().get::<crate::routes::ai::AiRoute>(),
+                    request.uri().query(),
+                )
+            } else {
+                Ok(())
+            };
             // The pinned tier middleware runs before routing, for every gateway
             // request whose token verifies.
             let mut tier_status = None;
             let tier_user = (!state.config.shared_storage.skip_tier_rate_limit
                 && !policy_request.is_preflight)
                 .then(|| {
-                    crate::policy::auth::verify_request_token(
-                        &policy_request.headers,
-                        &state.config.shared_storage,
-                    )
-                    .ok()
-                    .and_then(|claims| claims.sub)
+                    policy_request
+                        .ai_principal
+                        .as_ref()
+                        .map(|principal| principal.username.clone())
+                        .or_else(|| {
+                            crate::policy::auth::verify_request_token(
+                                &policy_request.headers,
+                                &state.config.shared_storage,
+                            )
+                            .ok()
+                            .and_then(|claims| claims.sub)
+                        })
                 })
                 .flatten();
-            let tier_result = match (&state.storage, tier_user.as_deref()) {
-                (Some(storage), Some(user)) => crate::policy::tier::enforce(
+            let tier_result = match (ai_auth, &state.storage, tier_user.as_deref()) {
+                (Err(failure), _, _) => Err(failure),
+                (Ok(()), Some(storage), Some(user)) => crate::policy::tier::enforce(
                     &documents,
                     storage,
                     user,
@@ -247,9 +271,9 @@ pub async fn rest_policy_then_proxy(
                 )
                 .await
                 .map(|status| tier_status = status),
-                _ => Ok(()),
+                (Ok(()), _, _) => Ok(()),
             };
-            match tier_result.and_then(|()| {
+            let outcome = match tier_result.and_then(|()| {
                 evaluate_rest_policy_staged(
                     &mut documents,
                     &policy_request,
@@ -285,7 +309,11 @@ pub async fn rest_policy_then_proxy(
                     }
                 }
                 other => other,
+            };
+            if protocol == DataPlaneProtocol::Ai {
+                ai_documents = Some(documents);
             }
+            outcome
         }
         Err(error) => {
             tracing::error!(error = %error, "rust policy storage unavailable");
@@ -327,7 +355,25 @@ pub async fn rest_policy_then_proxy(
                 .get(header::ORIGIN)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let mut response = execute_rest(&state, request, decision.clone(), protocol).await?;
+            let mut response = if protocol == DataPlaneProtocol::Ai {
+                crate::routes::ai::execute_ai(
+                    &state,
+                    request,
+                    decision.clone(),
+                    ai_documents.as_ref(),
+                )
+                .await?
+            } else {
+                execute_rest(&state, request, decision.clone(), protocol).await?
+            };
+            let ai_activity = response
+                .extensions()
+                .get::<crate::routes::ai::AiActivity>()
+                .map(|activity| activity.0.clone());
+            let endpoint = match response.extensions().get::<crate::routes::ai::AiOperation>() {
+                Some(operation) => Some(operation.0.to_owned()),
+                None => decision.upstream_path.clone(),
+            };
             apply_tier_headers(&mut response, decision.tier_limit_status.as_ref());
             apply_actual_response(&mut response, &decision, origin.as_deref());
             apply_lifecycle_headers(&mut response, decision.lifecycle.as_ref());
@@ -342,8 +388,9 @@ pub async fn rest_policy_then_proxy(
                         .api_name
                         .as_ref()
                         .map(|name| format!("{}:{name}", protocol_name(protocol))),
-                    endpoint: decision.upstream_path.clone(),
+                    endpoint,
                     upstream: decision.upstream.clone(),
+                    ai: ai_activity,
                 });
             Ok(response)
         }
@@ -454,6 +501,7 @@ fn protocol_name(protocol: DataPlaneProtocol) -> &'static str {
         DataPlaneProtocol::Graphql => "graphql",
         DataPlaneProtocol::Soap => "soap",
         DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => "grpc",
+        DataPlaneProtocol::Ai => "ai",
     }
 }
 
@@ -632,6 +680,7 @@ async fn execute_rest(
         DataPlaneProtocol::Graphql => limits.graphql,
         DataPlaneProtocol::Soap => limits.soap,
         DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => limits.grpc,
+        DataPlaneProtocol::Ai => limits.ai,
     };
     let body = match to_bytes(body, BodyLimits::for_path(&request_path, body_limit)).await {
         Ok(body) => body,
@@ -957,7 +1006,9 @@ async fn execute_rest(
         .unwrap_or(match protocol {
             DataPlaneProtocol::Soap => "application/xml",
             DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => "application/grpc",
-            DataPlaneProtocol::Rest | DataPlaneProtocol::Graphql => "application/json",
+            DataPlaneProtocol::Rest | DataPlaneProtocol::Graphql | DataPlaneProtocol::Ai => {
+                "application/json"
+            }
         })
         .to_owned();
     let (body, content_type) = match protocol {
@@ -967,12 +1018,13 @@ async fn execute_rest(
         DataPlaneProtocol::Grpc | DataPlaneProtocol::GrpcWeb => {
             (bytes.to_vec(), upstream_content_type)
         }
-        DataPlaneProtocol::Rest if !is_json => (
+        // AI traffic never reaches execute_rest; it is handled like REST if it ever does.
+        DataPlaneProtocol::Rest | DataPlaneProtocol::Ai if !is_json => (
             serde_json::to_vec(&String::from_utf8_lossy(&bytes))
                 .unwrap_or_else(|_| b"null".to_vec()),
             "application/json".to_owned(),
         ),
-        DataPlaneProtocol::Rest => (bytes.to_vec(), upstream_content_type),
+        DataPlaneProtocol::Rest | DataPlaneProtocol::Ai => (bytes.to_vec(), upstream_content_type),
     };
     let mut response = Response::builder()
         .status(status)
@@ -1440,6 +1492,8 @@ fn validate_protocol_request_with_registry(
     validators: &crate::validation::json::ValidatorRegistry,
 ) -> Result<(), crate::policy::PolicyFailure> {
     match protocol {
+        // AI bodies are validated by the provider adapter, not endpoint schemas.
+        DataPlaneProtocol::Ai => Ok(()),
         DataPlaneProtocol::Rest => {
             if let Some(schema) = endpoint_validation {
                 let document: Value = serde_json::from_slice(body)
@@ -1616,7 +1670,7 @@ fn protocol_failure(
     )
 }
 
-async fn retry_backoff(attempt: u32) {
+pub(crate) async fn retry_backoff(attempt: u32) {
     let base_ms = std::env::var("HTTP_RETRY_BASE_DELAY")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
@@ -1644,7 +1698,7 @@ async fn retry_backoff(attempt: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 }
 
-fn is_hop_by_hop(name: &HeaderName) -> bool {
+pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str().to_ascii_lowercase().as_str(),
         "connection"

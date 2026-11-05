@@ -4,6 +4,8 @@ import React from 'react'
 import {
   LineChart,
   Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -26,6 +28,10 @@ interface TimeSeriesChartProps {
   color?: string
   showGrid?: boolean
   height?: number
+  series?: { key: string; label: string; color: string }[]
+  stacked?: boolean
+  valueFormatter?: (value: number) => string
+  timestampFormatter?: (timestamp: number) => string
 }
 
 export default function TimeSeriesChart({
@@ -34,10 +40,16 @@ export default function TimeSeriesChart({
   dataKey = 'count',
   color = '#3b82f6',
   showGrid = true,
-  height = 300
+  height = 300,
+  series,
+  stacked = false,
+  valueFormatter,
+  timestampFormatter,
 }: TimeSeriesChartProps) {
+  const Chart = stacked ? AreaChart : LineChart
   // Format timestamp for display
   const formatTimestamp = (timestamp: number): string => {
+    if (timestampFormatter) return timestampFormatter(timestamp)
     const date = new Date(timestamp * 1000)
     const hours = date.getHours().toString().padStart(2, '0')
     const minutes = date.getMinutes().toString().padStart(2, '0')
@@ -46,6 +58,7 @@ export default function TimeSeriesChart({
 
   // Format value for display
   const formatValue = (value: number): string => {
+    if (valueFormatter) return valueFormatter(value)
     if (dataKey === 'avg_ms') {
       return `${value.toFixed(1)}ms`
     }
@@ -63,7 +76,7 @@ export default function TimeSeriesChart({
       return (
         <div className="bg-white dark:bg-gray-800 p-3 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
           <p className="text-sm font-medium text-gray-900 dark:text-white mb-2">
-            {date.toLocaleString()}
+            {timestampFormatter ? timestampFormatter(data.timestamp) : date.toLocaleString()}
           </p>
           {payload.map((entry: any, index: number) => (
             <p key={index} className="text-sm" style={{ color: entry.color }}>
@@ -85,7 +98,7 @@ export default function TimeSeriesChart({
       )}
       
       <ResponsiveContainer width="100%" height={height}>
-        <LineChart
+        <Chart
           data={data}
           margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
         >
@@ -119,7 +132,7 @@ export default function TimeSeriesChart({
             iconType="line"
           />
           
-          <Line
+          {series ? series.map(item => stacked ? <Area key={item.key} type="monotone" dataKey={item.key} name={item.label} stackId="spend" stroke={item.color} fill={item.color} fillOpacity={0.6} /> : <Line key={item.key} type="monotone" dataKey={item.key} name={item.label} stroke={item.color} strokeWidth={2} dot={false} />) : <Line
             type="monotone"
             dataKey={dataKey}
             stroke={color}
@@ -127,8 +140,8 @@ export default function TimeSeriesChart({
             dot={false}
             activeDot={{ r: 6 }}
             name={dataKey === 'count' ? 'Requests' : dataKey === 'avg_ms' ? 'Avg Latency' : dataKey}
-          />
-        </LineChart>
+          />}
+        </Chart>
       </ResponsiveContainer>
     </div>
   )

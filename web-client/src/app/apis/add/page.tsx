@@ -11,6 +11,10 @@ import { postJson, fetchAllPaginated } from '@/utils/api'
 import ConfirmModal from '@/components/ConfirmModal'
 import { getJson } from '@/utils/api'
 import SearchableSelect from '@/components/SearchableSelect'
+import { AiModelFields } from '@/components/AiModelsPanel'
+import { useAiProviders } from '@/hooks/useAiProviders'
+import { SignalCopyButton } from '@/components/signal/Signal'
+import { aiSdkBaseUrl, aiValidationErrors, defaultAiConfig, providerLabel, type AiProvider } from '@/utils/ai'
 
 const STEPS = [
   { id: 'basics', title: 'Basics', hint: 'Name and protocol' },
@@ -20,11 +24,12 @@ const STEPS = [
   { id: 'review', title: 'Review', hint: 'Confirm and create' },
 ]
 
-function Field({ label, htmlFor, hint, tip, required, children }: { label: string; htmlFor?: string; hint?: React.ReactNode; tip?: string; required?: boolean; children: React.ReactNode }) {
+function Field({ label, htmlFor, hint, tip, required, children, error }: { error?: string; label: string; htmlFor?: string; hint?: React.ReactNode; tip?: string; required?: boolean; children: React.ReactNode }) {
   return <div>
     <label htmlFor={htmlFor} className="block text-sm font-medium text-gray-800 mb-1">{label}{required && <span className="text-red-600"> *</span>}{tip && <InfoTooltip text={tip} />}</label>
     {children}
     {hint && <p className="text-xs text-gray-500 mt-1">{hint}</p>}
+    {error && <p role="alert" className="text-sm text-red-600 mt-1">{error}</p>}
   </div>
 }
 
@@ -48,12 +53,17 @@ function Section({ title, description, children }: { title: string; description?
 
 const AddApiPage = () => {
   const router = useRouter()
+  const { providers, loading: providersLoading, error: providersError } = useAiProviders()
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [formData, setFormData] = useState({
     api_name: '',
     api_version: '',
     api_type: 'REST',
+    api_ai_provider: 'openai' as AiProvider,
+    api_ai_config: defaultAiConfig(),
+    api_public: false,
     api_description: '',
     api_hostname: '',
     api_allowed_retry_count: 0,
@@ -88,6 +98,31 @@ const AddApiPage = () => {
   const [protoFile, setProtoFile] = useState<File | null>(null)
   const [uploadProto, setUploadProto] = useState(false)
   const [step, setStep] = useState(0)
+  const isAi = formData.api_type === 'AI'
+  const steps = isAi ? [...STEPS.slice(0, 2), { id: 'models', title: 'Models', hint: 'Allowed models and limits' }, ...STEPS.slice(2)] : STEPS
+  const stepId = steps[step]?.id || 'basics'
+  const providerPreset = providers.find(provider => provider.id === formData.api_ai_provider)
+  const sdkBaseUrl = aiSdkBaseUrl(SERVER_URL, formData.api_name, formData.api_version, providerPreset?.sdk_base_url_suffix ?? (formData.api_ai_provider === 'openai' || formData.api_ai_provider === 'openai_compatible' ? '/v1' : ''))
+  React.useEffect(() => {
+    // `/apis/add?type=AI` (from AI Gateway → Providers & Models) opens the AI form.
+    if (new URLSearchParams(window.location.search).get('type') !== 'AI') return
+    setFormData(previous => ({ ...previous, api_type: 'AI', api_version: previous.api_version || 'v1', api_public: false, api_auth_required: true, api_anonymous_allowed: false, api_authorization_field_swap: '' }))
+  }, [])
+  React.useEffect(() => {
+    if (!isAi) return
+    const server = providers.find(provider => provider.id === formData.api_ai_provider)?.default_server
+    if (server) setFormData(previous => previous.api_servers.length ? previous : { ...previous, api_servers: [server] })
+  }, [isAi, formData.api_ai_provider, providers])
+
+  const fetchCredentials = async (): Promise<string[]> => {
+    const items = await fetchAllPaginated<{ api_credit_group: string }>(
+      (page, size) => `${SERVER_URL}/platform/credit/defs?page=${page}&page_size=${size}`,
+      data => Array.isArray(data) ? data : data.items || data.response?.items || []
+    )
+    const names = items.map(item => item.api_credit_group)
+    return formData.api_ai_provider === 'openai_compatible' ? [...names, 'none'] : names
+  }
+
 
   React.useEffect(() => {
     (async () => {
@@ -133,9 +168,20 @@ const AddApiPage = () => {
     e?.preventDefault()
     setLoading(true)
     setError(null)
+    setFieldErrors({})
 
     try {
       const payload: any = { ...formData }
+      if (isAi) {
+        if (!payload.api_ai_config.credential_group || !payload.api_ai_config.allowed_models.length || !payload.api_servers.length) throw new Error('Choose a provider credential, an upstream server and at least one allowed model.')
+        payload.api_public = false
+        payload.api_auth_required = true
+        payload.api_anonymous_allowed = false
+        delete payload.api_authorization_field_swap
+      } else {
+        delete payload.api_ai_provider
+        delete payload.api_ai_config
+      }
       payload.api_ip_whitelist = ipWhitelistText.split(/\r?\n|,/).map((s:string) => s.trim()).filter(Boolean)
       payload.api_ip_blacklist = ipBlacklistText.split(/\r?\n|,/).map((s:string) => s.trim()).filter(Boolean)
       if (!payload.api_authorization_field_swap) delete payload.api_authorization_field_swap
@@ -155,7 +201,7 @@ const AddApiPage = () => {
       const createdApi = created?.api || created?.response?.api || created
       
       // Upload proto file if provided
-      if (uploadProto && protoFile) {
+      if (!isAi && uploadProto && protoFile) {
         try {
           const formData = new FormData()
           formData.append('file', protoFile)
@@ -175,11 +221,18 @@ const AddApiPage = () => {
       const newId = createdApi?.api_id
       if (newId) {
         try { sessionStorage.setItem('selectedApi', JSON.stringify(createdApi)) } catch {}
-        router.push(`/apis/${encodeURIComponent(String(newId))}/endpoints?add=1`)
+        router.push(isAi ? `/apis/${encodeURIComponent(String(newId))}` : `/apis/${encodeURIComponent(String(newId))}/endpoints?add=1`)
       } else {
-        router.push('/apis')
+        router.push(isAi ? '/ai/providers' : '/apis')
       }
     } catch (err) {
+      const errors = aiValidationErrors(err)
+      setFieldErrors(errors)
+      const first = Object.keys(errors)[0]
+      if (first) {
+        const target = first === 'api_ai_provider' ? 'basics' : first === 'api_servers' || first.includes('credential') ? 'upstream' : first === 'api_public' || first === 'api_auth_required' ? 'access' : 'models'
+        setStep(steps.findIndex(item => item.id === target))
+      }
       setError(err instanceof Error && err.message ? err.message : 'Unable to create the API. Please try again.')
     } finally {
       setLoading(false)
@@ -188,6 +241,11 @@ const AddApiPage = () => {
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     const { name, value, type } = e.target
+    if (name === 'api_type' && value === 'AI') {
+      setFormData(previous => ({ ...previous, api_type: value, api_version: previous.api_version || 'v1', api_public: false, api_auth_required: true, api_anonymous_allowed: false, api_authorization_field_swap: '' }))
+      return
+    }
+    if (isAi && ['api_public', 'api_auth_required', 'api_anonymous_allowed'].includes(name)) return
     if (name === 'api_public' && type === 'checkbox') {
       const checked = (e.target as HTMLInputElement).checked
       if (checked) {
@@ -304,9 +362,9 @@ const AddApiPage = () => {
 
   const fd = formData as any
   const nameOk = formData.api_name.trim().length > 0 && formData.api_version.trim().length > 0
-  const stepError = step === 0 && !nameOk ? 'Enter an API name and version to continue.' : null
-  const isLast = step === STEPS.length - 1
-  const goNext = () => { if (stepError) { setError(stepError); return } setError(null); setStep(s => Math.min(s + 1, STEPS.length - 1)) }
+  const stepError = stepId === 'basics' && !nameOk ? 'Enter an API name and version to continue.' : isAi && stepId === 'upstream' && (!formData.api_ai_config.credential_group || !formData.api_servers.length) ? 'Choose a provider credential and add an upstream server.' : isAi && stepId === 'models' && !formData.api_ai_config.allowed_models.length ? 'Add at least one allowed model.' : null
+  const isLast = step === steps.length - 1
+  const goNext = () => { if (stepError) { setError(stepError); return } setError(null); setStep(s => Math.min(s + 1, steps.length - 1)) }
   const goBack = () => { setError(null); setStep(s => Math.max(s - 1, 0)) }
   const jump = (i: number) => { if (i > 0 && !nameOk) { setError('Enter an API name and version to continue.'); setStep(0); return } setError(null); setStep(i) }
 
@@ -325,7 +383,12 @@ const AddApiPage = () => {
     ['IP policy', formData.api_ip_mode === 'whitelist' ? `Allow list only (${parseList(ipWhitelistText).length} entries)` : 'Allow all'],
     ['Blocked IPs', String(parseList(ipBlacklistText).length)],
     ['Credits', formData.api_credits_enabled ? `On (${formData.api_credit_group || 'no group'})` : 'Off'],
-    ['gRPC proto file', uploadProto && protoFile ? protoFile.name : '—'],
+    ...(!isAi ? [['gRPC proto file', uploadProto && protoFile ? protoFile.name : '—'] as [string, React.ReactNode]] : [
+      ['Provider', providerLabel(formData.api_ai_provider)] as [string, React.ReactNode],
+      ['Models', String(formData.api_ai_config.allowed_models.length)] as [string, React.ReactNode],
+      ['Credential', formData.api_ai_config.credential_group] as [string, React.ReactNode],
+      ['SDK base URL', <span key="sdk" className="inline-flex gap-2 items-center"><code className="break-all">{sdkBaseUrl}</code><SignalCopyButton text={sdkBaseUrl} label="Copy SDK base URL" /></span>] as [string, React.ReactNode],
+    ]),
   ]
 
   return (
@@ -334,13 +397,13 @@ const AddApiPage = () => {
         <div className="page-header">
           <div>
             <h1 className="page-title">Add API</h1>
-            <p className="text-gray-600 mt-1">Step {step + 1} of {STEPS.length}: {STEPS[step].hint}</p>
+            <p className="text-gray-600 mt-1">Step {step + 1} of {steps.length}: {steps[step]?.hint}</p>
           </div>
-          <Link href="/apis" className="btn btn-secondary">Cancel</Link>
+          <Link href={isAi ? '/ai/providers' : '/apis'} className="btn btn-secondary">Cancel</Link>
         </div>
 
         <ol className="flex items-center gap-2" aria-label="Progress">
-          {STEPS.map((s, i) => (
+          {steps.map((s, i) => (
             <li key={s.id} className="flex flex-1 items-center gap-2">
               <button type="button" onClick={() => jump(i)} aria-current={i === step ? 'step' : undefined}
                 className={`flex w-full items-center gap-2 rounded border px-3 py-2 text-left text-sm ${i === step ? 'border-primary-600 bg-primary-50 text-gray-900' : i < step ? 'border-gray-300 bg-white text-gray-700' : 'border-gray-200 bg-white text-gray-500'}`}>
@@ -354,7 +417,7 @@ const AddApiPage = () => {
         {error && <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{error}</div>}
 
         <form onSubmit={(e) => { e.preventDefault(); if (isLast) handleSubmit(); else goNext() }} className="card space-y-6 !p-6">
-          {step === 0 && (
+          {stepId === 'basics' && (
             <Section title="Basics" description="These identify the API and form the base path clients call, e.g. /name/version.">
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <Field label="API name" htmlFor="api_name" required hint="Unique identifier, e.g. user-service">
@@ -371,9 +434,17 @@ const AddApiPage = () => {
               </Field>
               <Field label="Protocol" htmlFor="api_type" hint="The protocol this API speaks to its upstream servers.">
                 <select id="api_type" name="api_type" className="input md:w-1/2" value={formData.api_type} onChange={handleChange} disabled={loading}>
-                  <option value="REST">REST</option><option value="GraphQL">GraphQL</option><option value="gRPC">gRPC</option><option value="SOAP">SOAP</option>
+                  <option value="AI">AI (LLM provider)</option><option value="REST">REST</option><option value="GraphQL">GraphQL</option><option value="gRPC">gRPC</option><option value="SOAP">SOAP</option>
                 </select>
               </Field>
+              {isAi && <Field label="Provider" htmlFor="api_ai_provider" required error={fieldErrors.api_ai_provider}>
+                {providersError && <p role="alert" className="text-sm text-red-600">{providersError}</p>}
+                <select id="api_ai_provider" className="input" value={formData.api_ai_provider} disabled={loading || providersLoading} onChange={e => {
+                  const provider = e.target.value as AiProvider
+                  const preset = providers.find(item => item.id === provider)
+                  setFormData(previous => ({ ...previous, api_ai_provider: provider, api_servers: preset?.default_server ? [preset.default_server] : [], api_ai_config: defaultAiConfig() }))
+                }}>{providers.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select>
+              </Field>}
               <Field label="Description" htmlFor="api_description" hint="Optional. Shown in the API list.">
                 <textarea id="api_description" name="api_description" rows={3} className="input resize-none" placeholder="What does this API do?" value={formData.api_description} onChange={handleChange} disabled={loading} />
               </Field>
@@ -381,9 +452,9 @@ const AddApiPage = () => {
             </Section>
           )}
 
-          {step === 1 && (<>
+          {stepId === 'upstream' && (<>
             <Section title="Upstream servers" description="Base URLs that requests are proxied to. You can override these per endpoint later.">
-              <Field label="Server URL" hint="Include scheme and port, e.g. http://localhost:8080. Press Enter to add." tip="Base URLs for upstreams. Include scheme and port.">
+              <Field label="Server URL" error={fieldErrors.api_servers} hint="Include scheme and port, e.g. http://localhost:8080. Press Enter to add." tip="Base URLs for upstreams. Include scheme and port.">
                 <div className="flex gap-2">
                   <input type="text" className="input flex-1" placeholder="http://localhost:8080" value={newServer} onChange={(e) => setNewServer(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addServer() } }} disabled={loading} />
                   <button type="button" onClick={addServer} className="btn btn-secondary" disabled={loading}>Add server</button>
@@ -394,6 +465,22 @@ const AddApiPage = () => {
                 {formData.api_servers.length === 0 && <p className="text-xs text-gray-500">No servers added yet.</p>}
               </div>
             </Section>
+            {isAi && <Section title="Provider credential" description="Use your organization's own provider API key stored in Credit definitions.">
+              <Field label="Credential group" required error={fieldErrors['api_ai_config.credential_group']}>
+                <SearchableSelect key={formData.api_ai_provider} value={formData.api_ai_config.credential_group} onChange={credential_group => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_group } }))} fetchOptions={fetchCredentials} restrictToOptions disabled={loading} placeholder="Select provider credential" />
+                <Link className="text-sm text-primary-700 underline" href={`/credit-defs/add?preset=${encodeURIComponent(formData.api_ai_provider)}`}>Create provider credential</Link>
+              </Field>
+              <p className="text-xs text-gray-500">Consumer subscriptions are unsupported. Credential group “none” is available only for private OpenAI-compatible upstreams.</p>
+              <div className="space-y-2"><p className="text-sm font-medium">Per-group credential overrides</p>
+                {formData.api_ai_config.credential_overrides.map((override, index) => <div key={index} className="grid sm:grid-cols-[1fr_1fr_auto] gap-2">
+                  <SearchableSelect value={override.group} onChange={group => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_overrides: previous.api_ai_config.credential_overrides.map((row, i) => i === index ? { ...row, group } : row) } }))} fetchOptions={fetchGroups} restrictToOptions disabled={loading} placeholder="Doorman group" />
+                  <SearchableSelect value={override.credential_group} onChange={credential_group => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_overrides: previous.api_ai_config.credential_overrides.map((row, i) => i === index ? { ...row, credential_group } : row) } }))} fetchOptions={fetchCredentials} restrictToOptions disabled={loading} placeholder="Provider credential" />
+                  <button type="button" className="btn btn-ghost" onClick={() => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_overrides: previous.api_ai_config.credential_overrides.filter((_, i) => i !== index) } }))}>Remove</button>
+                </div>)}
+                <button type="button" className="btn btn-secondary" onClick={() => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_overrides: [...previous.api_ai_config.credential_overrides, { group: '', credential_group: '' }] } }))}>Add group override</button>
+                {fieldErrors['api_ai_config.credential_overrides'] && <p role="alert" className="text-sm text-red-600">{fieldErrors['api_ai_config.credential_overrides']}</p>}
+              </div>
+            </Section>}
             <Section title="Routing and requests">
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <Field label="Custom hostname (optional)" htmlFor="api_hostname" tip="Requests with this Host header are routed to this API, preserving the original path and query." hint="Leave blank to use the standard path-based URL.">
@@ -403,9 +490,9 @@ const AddApiPage = () => {
                   <input id="api_allowed_retry_count" type="number" name="api_allowed_retry_count" className="input" min={0} value={formData.api_allowed_retry_count} onChange={handleChange} disabled={loading} />
                 </Field>
               </div>
-              <Field label="Forward Authorization as header (optional)" htmlFor="api_authorization_field_swap" tip="Copies the inbound Authorization header into a different header name expected by the upstream, e.g. X-Api-Key." hint="Header name the upstream expects instead of Authorization.">
+              {!isAi && <Field label="Forward Authorization as header (optional)" htmlFor="api_authorization_field_swap" tip="Copies the inbound Authorization header into a different header name expected by the upstream, e.g. X-Api-Key." hint="Header name the upstream expects instead of Authorization.">
                 <input id="api_authorization_field_swap" type="text" name="api_authorization_field_swap" className="input md:w-1/2" placeholder="X-Api-Key" value={formData.api_authorization_field_swap} onChange={handleChange} disabled={loading} />
-              </Field>
+              </Field>}
             </Section>
             {formData.api_type === 'gRPC' && (
               <Section title="gRPC proto file (optional)" description="Uploaded and compiled automatically after the API is created.">
@@ -428,12 +515,15 @@ const AddApiPage = () => {
             )}
           </>)}
 
-          {step === 2 && (<>
+          {isAi && stepId === 'models' && <Section title="Models" description="Only these models can be requested through this API."><AiModelFields value={formData.api_ai_config} onChange={api_ai_config => setFormData(previous => ({ ...previous, api_ai_config }))} disabled={loading} errors={fieldErrors} /></Section>}
+
+          {stepId === 'access' && (<>
             <Section title="Authentication" description="Controls whether callers must sign in.">
-              <Toggle id="api_auth_required" name="api_auth_required" checked={!!formData.api_auth_required} onChange={handleChange} disabled={loading} title="Require authentication" description="Callers must present a valid platform token and pass subscription and group checks." />
+              {isAi && <p className="text-sm text-gray-600">AI APIs always require an authenticated user (compliance). Public and anonymous access are disabled.</p>}
+              <Toggle id="api_auth_required" name="api_auth_required" checked={!!formData.api_auth_required} onChange={handleChange} disabled={loading || isAi} title="Require authentication" description="Callers must present a valid platform token and pass subscription and group checks." />
               <Toggle id="api_anonymous_allowed" name="api_anonymous_allowed" checked={!!formData.api_anonymous_allowed} onChange={handleChange} disabled={loading || !!formData.api_auth_required} title="Allow anonymous access" description={formData.api_auth_required ? 'Turn off “Require authentication” to enable.' : 'Unauthenticated callers are tracked as anonymous users by IP.'} />
               {fd.api_public && fd.api_credits_enabled && <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">Public + credits: anyone can call this API and the group API key is injected. Per-user deductions are skipped.</div>}
-              <Toggle id="api_public" name="api_public" checked={!!fd.api_public} onChange={handleChange} disabled={loading || fd.api_credits_enabled === true} title="Public access" description={fd.api_credits_enabled ? 'Turn off credits to change this.' : 'Anyone with the URL can call this API. Authentication, subscription and group checks are skipped. Use with care.'} />
+              <Toggle id="api_public" name="api_public" checked={!!fd.api_public} onChange={handleChange} disabled={loading || isAi || fd.api_credits_enabled === true} title="Public access" description={fd.api_credits_enabled ? 'Turn off credits to change this.' : 'Anyone with the URL can call this API. Authentication, subscription and group checks are skipped. Use with care.'} />
             </Section>
             <Section title="Who can call it" description="Enforced only when authentication is required.">
               <Field label="Allowed groups" tip="Users must belong to at least one listed group. ALL allows any group." hint="Add ALL to allow every group.">
@@ -447,7 +537,7 @@ const AddApiPage = () => {
             </Section>
           </>)}
 
-          {step === 3 && (<>
+          {stepId === 'policies' && (<>
             <Section title="IP access control" description="Optional network restrictions for this API.">
               {ipWarning && <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">{ipWarning.text}<div className="text-xs mt-1">Your IP: {ipWarning.ip}{ipWarning.xff ? ' (from X-Forwarded-For)' : ''}</div></div>}
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -494,7 +584,7 @@ const AddApiPage = () => {
             </Section>
           </>)}
 
-          {step === 4 && (
+          {stepId === 'review' && (
             <Section title="Review" description="Check the details below. After you create the API you can add its endpoints right away.">
               <dl className="divide-y divide-gray-100 rounded border border-gray-200">
                 {reviewRows.map(([k, v]) => <div key={k} className="grid grid-cols-3 gap-4 px-4 py-2 text-sm"><dt className="text-gray-500">{k}</dt><dd className="col-span-2 break-words text-gray-900">{v}</dd></div>)}
@@ -506,7 +596,7 @@ const AddApiPage = () => {
           <div className="flex items-center justify-between border-t border-gray-200 pt-4">
             <button type="button" className="btn btn-secondary" onClick={goBack} disabled={step === 0 || loading}>Back</button>
             {isLast ? (
-              <button type="submit" disabled={loading || !nameOk} className="btn btn-primary">{loading ? 'Creating…' : 'Create API and add endpoints'}</button>
+              <button type="submit" disabled={loading || !nameOk} className="btn btn-primary">{loading ? 'Creating…' : isAi ? 'Create AI API' : 'Create API and add endpoints'}</button>
             ) : (
               <button type="submit" className="btn btn-primary" disabled={loading}>Continue</button>
             )}

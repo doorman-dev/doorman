@@ -57,6 +57,29 @@ pub struct PolicyRequest {
     /// Only the pinned REST and SOAP gateways require a registered endpoint;
     /// GraphQL and gRPC forward any call for an existing API.
     pub endpoint_required: bool,
+    /// Set when an AI route authenticated a `dk_` access key; it stands in for
+    /// JWT verification, while revocation and active-user checks still run.
+    pub ai_principal: Option<crate::ai::keys::AiPrincipal>,
+}
+
+/// JWT claims for the request, or the AI access-key principal's equivalent
+/// (`jti = "aik:{key_id}"`, so revoking that jti also revokes the key).
+fn request_claims(
+    request: &PolicyRequest,
+    storage_config: &SharedStorageConfig,
+) -> Result<super::auth::AuthClaims, PolicyFailure> {
+    match &request.ai_principal {
+        Some(principal) => Ok(super::auth::AuthClaims {
+            sub: Some(principal.username.clone()),
+            jti: Some(format!("aik:{}", principal.key_id)),
+            role: None,
+            exp: None,
+            iss: None,
+            iat: None,
+            aud: None,
+        }),
+        None => verify_request_token(&request.headers, storage_config),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -192,7 +215,7 @@ fn evaluate_resolved_api(
     let api_auth_required = bool_field(&api, "api_auth_required").unwrap_or(true);
     let mut authenticated: Option<(String, Option<u64>)> = None;
     if !api_public && api_auth_required {
-        let claims = verify_request_token(&request.headers, storage_config)?;
+        let claims = request_claims(request, storage_config)?;
         let username = claims.sub.as_deref().unwrap_or_default();
         if is_revoked(&documents.revocations, username, claims.jti.as_deref()) {
             // auth_required's broad except re-raises every failure as a bare Unauthorized.
@@ -233,8 +256,14 @@ fn evaluate_resolved_api(
             }
         }
         subscription_keys.dedup();
+        // AI APIs can grant access by group membership alone (AI setup).
+        let group_access_only = crate::platform_contract::is_ai_api(&api)
+            && api
+                .pointer("/api_ai_config/require_subscription")
+                .and_then(Value::as_bool)
+                == Some(false);
         let mut subscription = Ok(());
-        for key in &subscription_keys {
+        for key in subscription_keys.iter().filter(|_| !group_access_only) {
             subscription = enforce_subscription(
                 key,
                 &user,
@@ -323,7 +352,7 @@ fn evaluate_resolved_api(
     };
     let username = authenticated.as_ref().map(|(name, _)| name.clone());
     let tier_username = username.clone().or_else(|| {
-        verify_request_token(&request.headers, storage_config)
+        request_claims(request, storage_config)
             .ok()
             .and_then(|claims| claims.sub)
     });
@@ -817,6 +846,73 @@ mod tests {
     }
 
     #[test]
+    fn ai_principal_replaces_jwt_and_honours_revocation() {
+        let mut documents = PolicyDocuments {
+            apis: vec![
+                json!({"api_id":"ai", "api_name":"corp-claude", "api_version":"v1",
+                "api_type":"AI", "api_public":false, "api_auth_required":true,
+                "api_allowed_groups":["ALL"], "api_servers":["http://127.0.0.1:9"]}),
+            ],
+            users: vec![
+                json!({"username":"alice", "role":"developer", "groups":["ALL"], "active":true}),
+            ],
+            subscriptions: vec![json!({"username":"alice", "apis":["corp-claude/v1"]})],
+            ..Default::default()
+        };
+        let mut request = PolicyRequest {
+            method: Method::POST,
+            path: "/api/rest/corp-claude/v1/v1/messages".to_owned(),
+            headers: HeaderMap::new(),
+            direct_ip: Some("127.0.0.1".parse().unwrap()),
+            now_millis: 0,
+            content_length: 0,
+            peer_certificates: Vec::new(),
+            native_tls: false,
+            is_preflight: false,
+            group_version_missing: false,
+            route_endpoint_check: false,
+            endpoint_required: false,
+            ai_principal: None,
+        };
+        let evaluate = |documents: &mut PolicyDocuments, request: &PolicyRequest| {
+            evaluate_rest_policy(
+                documents,
+                request,
+                &SharedStorageConfig::default(),
+                &PolicyRuntime::default(),
+            )
+        };
+        // No JWT and no principal: rejected.
+        assert_eq!(
+            evaluate(&mut documents, &request).unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+        request.ai_principal = Some(crate::ai::keys::AiPrincipal {
+            username: "alice".to_owned(),
+            key_id: "k1".to_owned(),
+        });
+        let decision = evaluate(&mut documents, &request).unwrap().unwrap();
+        assert_eq!(decision.username.as_deref(), Some("alice"));
+        assert_eq!(decision.tier_username.as_deref(), Some("alice"));
+        // Revoking the key's jti (or all of the user's tokens) blocks it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        documents.revocations = vec![json!({"type":"jti", "username":"alice", "jti":"aik:k1",
+            "expires_at": now + 60})];
+        assert_eq!(
+            evaluate(&mut documents, &request).unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+        documents.revocations = vec![json!({"type":"revoke_all", "username":"alice"})];
+        assert!(evaluate(&mut documents, &request).is_err());
+        documents.revocations.clear();
+        documents.users[0]["active"] = json!(false);
+        assert!(evaluate(&mut documents, &request).is_err());
+    }
+
+    #[test]
     fn mixed_settings_records_cannot_override_api_proxy_policy() {
         let mut documents = PolicyDocuments {
             apis: vec![
@@ -848,6 +944,7 @@ mod tests {
             group_version_missing: false,
             route_endpoint_check: false,
             endpoint_required: true,
+            ai_principal: None,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -916,6 +1013,7 @@ mod tests {
             group_version_missing: false,
             route_endpoint_check: false,
             endpoint_required: true,
+            ai_principal: None,
         }
     }
 
@@ -1001,6 +1099,7 @@ mod tests {
             group_version_missing: false,
             route_endpoint_check: false,
             endpoint_required: true,
+            ai_principal: None,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -1036,6 +1135,7 @@ mod tests {
             group_version_missing: false,
             route_endpoint_check: false,
             endpoint_required: true,
+            ai_principal: None,
         };
         let failure = evaluate_rest_policy(
             &mut documents,
@@ -1088,6 +1188,7 @@ mod tests {
             group_version_missing: false,
             route_endpoint_check: false,
             endpoint_required: true,
+            ai_principal: None,
         };
         let decision = evaluate_rest_policy(
             &mut documents,

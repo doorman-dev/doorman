@@ -1588,3 +1588,53 @@ async fn external_lifecycle_round_trip_clears_dates_and_reaches_second_router() 
     let _ = to_bytes(response.into_body(), 64 * 1024).await;
     upstream.abort();
 }
+
+#[tokio::test]
+async fn external_ai_usage_rollup_increments_and_upserts() {
+    if !enabled() {
+        eprintln!("set DOORMAN_EXTERNAL_STORAGE_TEST=1 to run external storage coverage");
+        return;
+    }
+    let mongo_port =
+        std::env::var("DOORMAN_TEST_MONGO_PORT").unwrap_or_else(|_| "27018".to_owned());
+    let redis_port =
+        std::env::var("DOORMAN_TEST_REDIS_PORT").unwrap_or_else(|_| "16379".to_owned());
+    let nonce = Uuid::new_v4().simple().to_string();
+    let config = SharedStorageConfig {
+        storage_mode: "REDIS".to_owned(),
+        mongo_uri_override: Some(format!("mongodb://127.0.0.1:{mongo_port}/?replicaSet=rs0")),
+        mongo_database: format!("doorman_external_test_{nonce}"),
+        redis_host: "127.0.0.1".to_owned(),
+        redis_port: redis_port.parse().unwrap(),
+        redis_password: None,
+        ..Default::default()
+    };
+    let storage = SharedStorage::connect(&config).await.unwrap();
+    assert!(!storage.is_memory());
+    let id = "2026-10-18|corp-openai/v1|gpt-x|alice";
+    let set_on_insert = json!({"day": "2026-10-18", "api": "corp-openai/v1", "provider": "openai",
+        "model": "gpt-x", "username": "alice", "groups": ["ALL"]});
+    for _ in 0..2 {
+        storage
+            .ai_usage_increment(
+                id,
+                &set_on_insert,
+                &[("requests", 1), ("input_tokens", 9), ("cost_nanos", 34_000)],
+            )
+            .await
+            .unwrap();
+    }
+    let rows = storage
+        .find_many("ai_usage_daily", &json!({"username": "alice"}))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["requests"], 2);
+    assert_eq!(rows[0]["input_tokens"], 18);
+    assert_eq!(rows[0]["cost_nanos"], 68_000);
+    assert_eq!(rows[0]["groups"], json!(["ALL"]));
+    storage
+        .ai_live_increment(1_700_000_000, &[("req", 1), ("in", 9)])
+        .await
+        .unwrap();
+}

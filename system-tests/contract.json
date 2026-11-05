@@ -88,7 +88,7 @@
     "secret-data-logging-export-redaction",
     "native-mtls-auth-rbac-credits"
   ],
-  "expected_dashboard_routes": 51,
-  "dashboard_routes_sha256": "06a4e914ebad825abcc108f62dfcfd58fa92d34c547a2e68508d8da62371dc5f",
+  "expected_dashboard_routes": 63,
+  "dashboard_routes_sha256": "ad8db48095d59ab52de57dd707989ec9a4222c32b27fb806dca0fa534fa58b74",
   "approved_differences": []
 }

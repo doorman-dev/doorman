@@ -19,6 +19,7 @@ export default function DocumentationPage() {
               <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">API Reference</h1>
             </div>
             <div className="flex items-center gap-2">
+              <a href="/docs/ai-gateway.md" target="_blank" rel="noreferrer" className="btn btn-outline">AI Gateway guide</a>
               <a href={openapiUrl} target="_blank" rel="noreferrer" className="btn btn-outline">OpenAPI JSON</a>
               <a href={swaggerUrl} target="_blank" rel="noreferrer" className="btn btn-secondary">Swagger UI</a>
             </div>

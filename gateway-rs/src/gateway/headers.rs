@@ -3,6 +3,7 @@ pub const SENSITIVE_HEADERS: &[&str] = &[
     "proxy-authorization",
     "www-authenticate",
     "x-api-key",
+    "x-goog-api-key",
     "api-key",
     "cookie",
     "set-cookie",

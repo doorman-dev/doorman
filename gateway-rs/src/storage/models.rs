@@ -27,6 +27,9 @@ pub struct PolicyDocuments {
     pub revocations: Vec<Value>,
     pub tiers: Vec<Value>,
     pub tier_assignments: Vec<Value>,
+    pub ai_access_keys: Vec<Value>,
+    pub ai_budgets: Vec<Value>,
+    pub ai_guardrails: Vec<Value>,
 }
 
 pub fn api_name_version(name: &str, version: &str, leading_slash: bool) -> String {

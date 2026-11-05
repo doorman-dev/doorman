@@ -23,6 +23,7 @@ interface CreateRoleData {
   manage_tiers: boolean
   manage_rate_limits: boolean
   manage_credits: boolean
+  manage_ai: boolean
   manage_auth: boolean
   view_analytics: boolean
   view_builder_tables: boolean
@@ -49,6 +50,7 @@ const AddRolePage = () => {
     manage_tiers: false,
     manage_rate_limits: false,
     manage_credits: false,
+    manage_ai: false,
     manage_auth: false,
     view_analytics: false,
     view_builder_tables: false,
@@ -99,6 +101,7 @@ const AddRolePage = () => {
     { key: 'manage_subscriptions', label: 'Manage Subscriptions', description: 'Manage API subscriptions and billing' },
     { key: 'manage_security', label: 'Manage Security', description: 'Manage security settings and memory dump policy' },
     { key: 'manage_credits', label: 'Manage Credits', description: 'Manage API credits and user credit balances' },
+    { key: 'manage_ai', label: 'Manage AI (pricing, budgets, settings)', description: 'Manage AI gateway pricing, budgets and logging settings' },
     { key: 'manage_auth', label: 'Manage Auth', description: 'Revoke tokens and enable/disable users' },
     { key: 'view_analytics', label: 'View Analytics', description: 'View analytics dashboard and usage metrics' },
     { key: 'view_builder_tables', label: 'View Tables', description: 'Explore tables created by API Builder' },

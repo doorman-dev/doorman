@@ -1,0 +1,5 @@
+{
+  "object": "list", "model": "text-embedding-example",
+  "data": [{"object": "embedding", "index": 0, "embedding": [0.1, -0.2, 0.3]}],
+  "usage": {"prompt_tokens": 12, "total_tokens": 12}
+}

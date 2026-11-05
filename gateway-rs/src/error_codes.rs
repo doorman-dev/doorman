@@ -164,6 +164,16 @@ impl ErrorCode {
     pub const VAL_INVALID_JSON: &str = "VAL001";
     pub const JWT_DECODE_ERROR: &str = "JWT001";
     pub const RATE_LIMIT_EXCEEDED: &str = "RATE_LIMIT_EXCEEDED";
+    pub const AI_OPERATION_NOT_ALLOWED: &str = "AI001";
+    pub const AI_MODEL_NOT_ALLOWED: &str = "AI002";
+    pub const AI_INVALID_REQUEST: &str = "AI003";
+    pub const AI_BUDGET_EXCEEDED: &str = "AI004";
+    pub const AI_GUARDRAIL_BLOCKED: &str = "AI005";
+    pub const AI_CREDENTIAL_UNAVAILABLE: &str = "AI006";
+    pub const AI_ACCESS_KEY_INVALID: &str = "AI007";
+    pub const AI_STREAM_NOT_ALLOWED: &str = "AI008";
+    pub const AI_INVALID_CONFIG: &str = "AI009";
+    pub const AI_FIRST_BYTE_TIMEOUT: &str = "AI010";
 }
 
 pub type ErrorCodes = ErrorCode;

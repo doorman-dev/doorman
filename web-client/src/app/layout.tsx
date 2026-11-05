@@ -5,8 +5,8 @@ import { ToastProvider } from '@/contexts/ToastContext'
 import { Toaster } from 'react-hot-toast'
 
 export const metadata: Metadata = {
-  title: 'Doorman — API + AI Gateway',
-  description: 'Doorman operational API gateway control plane',
+  title: 'Doorman',
+  description: 'Gateway for your APIs and AI providers.',
   icons: { icon: [{ url: '/doorman-mark.svg?v=doorman-site', type: 'image/svg+xml' }], apple: [{ url: '/apple-touch-icon.png?v=doorman-site', sizes: '180x180', type: 'image/png' }] },
 }
 

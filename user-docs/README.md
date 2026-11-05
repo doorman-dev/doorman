@@ -51,6 +51,10 @@ Built-in tools for troubleshooting and validation
 - Diagnostic endpoints
 - Log analysis
 
+### 8. [AI Gateway](./08-ai-gateway.md)
+Connect organization-owned AI providers, govern model access, measure tokens and
+cost, and configure budgets, guardrails and prompt privacy.
+
 ---
 
 ## Quick Links

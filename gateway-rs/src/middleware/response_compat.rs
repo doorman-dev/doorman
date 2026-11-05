@@ -31,6 +31,7 @@ pub async fn response_compat(
             | "/platform/monitor/readiness"
             | "/platform/openapi.json"
     ) || path.starts_with("/api/soap/")
+        || path.starts_with("/api/ai/")
     {
         return response;
     }

@@ -5,12 +5,14 @@ import ConfirmModal from '@/components/ConfirmModal'
 import Link from 'next/link'
 import { useRouter, useParams } from 'next/navigation'
 import Layout from '@/components/Layout'
+import AiBudgetUsageCard from '@/components/AiBudgetUsageCard'
 import InfoTooltip from '@/components/InfoTooltip'
 import FormHelp from '@/components/FormHelp'
 import { fetchJson } from '@/utils/http'
 import { PROTECTED_USERS, SERVER_URL } from '@/utils/config'
 import { getJson, fetchAllPaginated } from '@/utils/api'
 import SearchableSelect from '@/components/SearchableSelect'
+import AiKeysPanel from '@/components/AiKeysPanel'
 
 interface User {
   username: string
@@ -528,6 +530,8 @@ const UserDetailPage = () => {
               </div>
             )}
             {/* Basic Information */}
+            <AiBudgetUsageCard scope="user" target={user.username} />
+            <AiKeysPanel username={user.username} />
             <div className="card">
               <div className="border-b border-gray-200 dark:border-white/[0.08] px-6 py-4 flex items-center justify-between">
                 <h3 className="text-[15px] font-semibold text-gray-900 dark:text-white">Basic Information</h3>

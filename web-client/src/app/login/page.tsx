@@ -6,7 +6,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { SERVER_URL } from '@/utils/config'
 import { postJson, getJson } from '@/utils/api'
 
-const DEFAULT_AUTH_REDIRECT = '/dashboard'
+const DEFAULT_AUTH_REDIRECT = '/'
 
 function SiteHeader() {
   const [open, setOpen] = useState(false)
