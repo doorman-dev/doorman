@@ -468,7 +468,7 @@ const AddApiPage = () => {
             {isAi && <Section title="Provider credential" description="Use your organization's own provider API key stored in Credit definitions.">
               <Field label="Credential group" required error={fieldErrors['api_ai_config.credential_group']}>
                 <SearchableSelect key={formData.api_ai_provider} value={formData.api_ai_config.credential_group} onChange={credential_group => setFormData(previous => ({ ...previous, api_ai_config: { ...previous.api_ai_config, credential_group } }))} fetchOptions={fetchCredentials} restrictToOptions disabled={loading} placeholder="Select provider credential" />
-                <Link className="text-sm text-primary-700 underline" href={`/credit-defs/add?preset=${formData.api_ai_provider}`}>Create provider credential</Link>
+                <Link className="text-sm text-primary-700 underline" href={`/credit-defs/add?preset=${encodeURIComponent(formData.api_ai_provider)}`}>Create provider credential</Link>
               </Field>
               <p className="text-xs text-gray-500">Consumer subscriptions are unsupported. Credential group “none” is available only for private OpenAI-compatible upstreams.</p>
               <div className="space-y-2"><p className="text-sm font-medium">Per-group credential overrides</p>
