@@ -16,8 +16,8 @@
     "@types/dompurify": "^3.0.5",
     "clsx": "^2.1.0",
     "date-fns": "^4.1.0",
-    "dompurify": "^3.4.15",
-    "next": "15.5.27",
+    "dompurify": "^3.4.17",
+    "next": "15.5.28",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-hot-toast": "^2.6.0",
@@ -31,14 +31,14 @@
     "@types/react-dom": "^19",
     "dotenv-cli": "^11.0.0",
     "eslint": "^9",
-    "eslint-config-next": "15.5.27",
+    "eslint-config-next": "15.5.28",
     "postcss": "8.5.28",
     "tailwindcss": "^3.4.1",
     "typescript": "5.8.2"
   },
   "overrides": {
     "next": {
-      ".": "15.5.27",
+      ".": "15.5.28",
       "postcss": "8.5.28",
       "sharp": "0.35.5"
     },
