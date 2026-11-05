@@ -7987,11 +7987,14 @@ async fn dashboard(state: &AppState, request_id: &str) -> Response {
     let Some(storage) = &state.storage else {
         return unexpected(request_id);
     };
+    // The API dashboard leaves AI APIs to the AI Gateway section.
     let new_apis = storage
         .find_many("apis", &json!({}))
         .await
         .unwrap_or_default()
-        .len();
+        .iter()
+        .filter(|api| !crate::platform_contract::is_ai_api(api))
+        .count();
     let subscriptions = storage
         .find_many("subscriptions", &json!({}))
         .await
@@ -13660,6 +13663,15 @@ fn extract_log_fields(message: &str) -> Map<String, Value> {
 
 fn log_record_matches(record: &Value, query: &HashMap<String, String>) -> bool {
     let value = |key: &str| record.get(key).and_then(Value::as_str).unwrap_or_default();
+    // Rust extension: the API Gateway's Logs page leaves AI gateway traffic to
+    // AI Gateway → Usage → Requests.
+    if query.get("exclude_ai").is_some_and(|flag| flag == "true")
+        && (value("api").starts_with("ai:")
+            || value("type") == "ai_usage"
+            || record.get("ai").is_some_and(|ai| !ai.is_null()))
+    {
+        return false;
+    }
     if let Some(start_date) = query.get("start_date")
         && value("timestamp").get(..10).unwrap_or_default() < start_date.as_str()
     {
@@ -15183,6 +15195,17 @@ mod tests {
         assert!(!log_record_matches(
             &record,
             &HashMap::from([("exclude_type".to_owned(), "gateway".to_owned())])
+        ));
+        // The API Gateway's Logs page hides AI gateway traffic.
+        let exclude_ai = HashMap::from([("exclude_ai".to_owned(), "true".to_owned())]);
+        assert!(log_record_matches(&record, &exclude_ai));
+        assert!(!log_record_matches(
+            &json!({"timestamp": "2026-09-26T10:11:12", "api": "ai:corp-openai"}),
+            &exclude_ai
+        ));
+        assert!(!log_record_matches(
+            &json!({"timestamp": "2026-09-26T10:11:12", "api": "rest:x", "ai": {"model": "gpt-x"}}),
+            &exclude_ai
         ));
 
         let debug =

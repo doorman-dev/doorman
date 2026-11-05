@@ -160,14 +160,14 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
   const [promptLogIds, setPromptLogIds] = useState<Map<string, string>>(new Map())
   const [viewingPrompt, setViewingPrompt] = useState<string | null>(null)
   useEffect(() => {
-    if (!permissions?.view_logs) return
+    if (!permissions?.view_logs || !aiOnly) return
     let active = true
     getJson<AiSettings>(`${SERVER_URL}/platform/ai/settings`)
       .then(settings => settings.log_level === 'full' ? getJson<{ logs: { log_id: string; request_id: string }[] }>(`${SERVER_URL}/platform/ai/prompt-logs?limit=1000`) : null)
       .then(result => { if (active && result) setPromptLogIds(new Map(result.logs.map(log => [log.request_id, log.log_id]))) })
       .catch(() => {})
     return () => { active = false }
-  }, [permissions?.view_logs])
+  }, [permissions?.view_logs, aiOnly])
 
   useEffect(() => {
     if (authResolved && !logsEnabled) router.replace('/dashboard')
@@ -250,6 +250,8 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
 
     // AI gateway request records carry api "ai:{name}"; filter server-side so AI rows aren't limited to the loaded page.
     if (aiOnly && !f.api) qp.append('api', 'ai:')
+    // The API Gateway's Logs page leaves AI traffic to AI Gateway → Usage → Requests.
+    if (!aiOnly) qp.append('exclude_ai', 'true')
 
     // Handle Date/Time
     if (useLocalTime) {
@@ -508,7 +510,7 @@ export default function LogsView({ mode = 'api' }: { mode?: 'api' | 'ai' }) {
       })
     })
   }, [groupedLogs, securityAuditActive, aiOnly])
-  const showAiColumns = aiOnly || displayedGroups.some(group => (group.expanded_logs || group.logs).some(log => !!log.ai))
+  const showAiColumns = aiOnly
 
   const handleSearch = () => {
     setLogsPage(1)

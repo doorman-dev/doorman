@@ -96,7 +96,10 @@ pub async fn track_active_requests(
     let should_audit_platform_request =
         matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH")
             || path.starts_with("/platform/");
-    let record_analytics = path.starts_with("/api/") || path.starts_with("/grpc-web/");
+    // AI gateway traffic has its own analytics (AI Gateway → Usage), so it stays
+    // out of the API analytics behind the API dashboard and Analytics pages.
+    let record_analytics = (path.starts_with("/api/") && !path.starts_with("/api/ai/"))
+        || path.starts_with("/grpc-web/");
     let bytes_in = estimated_request_size(&request);
     let is_test = test_request(request.headers());
     state
