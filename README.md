@@ -1,13 +1,14 @@
-<img src="web-client/public/doorman-logo.svg" alt="Doorman" width="240">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/doorman-logo-dark-mode.png">
+  <img src="docs/images/doorman-logo-light-mode.png" alt="Doorman" width="240">
+</picture>
 
 ![Release](https://img.shields.io/github/v/release/doorman-dev/doorman?color=111111)
 ![Rust](https://img.shields.io/badge/Rust-1.88-111111)
 ![License](https://img.shields.io/badge/license-Apache%202.0-111111)
 ![Last commit](https://img.shields.io/github/last-commit/doorman-dev/doorman?color=111111)
 
-# Doorman
-
-One gateway for your team's AI and APIs.
+### One gateway for your team's AI and APIs.
 
 Give people AI with personal keys and allowances, put your APIs behind one set of
 policies, and see every request and every dollar. In your own infrastructure.
@@ -41,9 +42,13 @@ policies, and see every request and every dollar. In your own infrastructure.
 - In-memory mode with encrypted snapshots for a single node, or MongoDB and Redis for several
 - Multi-arch images (amd64, arm64) with an SBOM and provenance
 
-| AI policies | APIs |
-| :---: | :---: |
-| ![AI policies](docs/images/ai-policies.webp) | ![APIs](docs/images/apis.webp) |
+**Guardrails:** redact or block secrets and personal data before a prompt leaves your network.
+
+![Doorman AI policies](docs/images/ai-policies.webp)
+
+**APIs:** every REST, SOAP, GraphQL and gRPC API behind one set of policies.
+
+![Doorman APIs](docs/images/apis.webp)
 
 ## Quick demo
 
