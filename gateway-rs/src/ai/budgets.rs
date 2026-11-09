@@ -1,9 +1,13 @@
 //! AI budgets: resolution, pre-check and charge (plan P3.1, decision D6).
 //!
-//! Budgets are soft limits: concurrent in-flight requests can each overshoot
-//! by at most one request. Counters live in shared storage (Redis or memory)
-//! under `ai_budget:{budget_id}:{period_key}`. A storage error never blocks a
-//! request; it is logged and the budget is skipped.
+//! Budgets are soft limits. The pre-check reads the counter and the charge
+//! happens after the response, with no reservation, so every request in flight
+//! when the limit is crossed is charged in full: total overshoot is up to
+//! (requests in flight) x (cost of each). Counters live in shared storage
+//! (Redis or memory) under `ai_budget:{budget_id}:{period_key}`. Storage errors
+//! fail open: a failed read counts as 0 used and a failed charge is logged
+//! and lost. Only successful (2xx) responses are charged. A model with no
+//! price costs 0, so USD budgets do not advance for it.
 //!
 //! A budget can be limited to one `provider`, and a global, group or API
 //! budget can be `per_user`: each member then gets their own allowance under

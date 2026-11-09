@@ -32,7 +32,7 @@ sudo apt install -y nginx certbot python3-certbot-nginx
 ```bash
 mkdir ~/app
 cd ~/app
-git clone https://github.com/apidoorman/doorman.git
+git clone https://github.com/doorman-dev/doorman.git
 cd doorman
 git checkout {version}
 

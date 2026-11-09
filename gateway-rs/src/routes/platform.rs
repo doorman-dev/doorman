@@ -7964,11 +7964,17 @@ async fn readiness(state: &AppState, privileged: bool, request_id: &str) -> Resp
         .unwrap_or(false);
     let ready = mongo_ok && redis_ok && missing_grpc_descriptors == 0 && tls_certificates_valid;
     let status = if ready { "ready" } else { "degraded" };
+    // 503 lets load balancers and orchestrator probes act without parsing the body.
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     if !privileged {
-        return success(StatusCode::OK, json!({"status": status}), request_id);
+        return success(code, json!({"status": status}), request_id);
     }
     success(
-        StatusCode::OK,
+        code,
         json!({
             "status": status,
             "mongodb": mongo_ok,

@@ -8,7 +8,7 @@ services:
       args:
         NEXT_PUBLIC_PROTECTED_USERS: demo@doorman.dev
         NEXT_PUBLIC_GATEWAY_URL: ""
-    image: doorman-demo:latest
+    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.0.1}
     container_name: doorman-demo
     ports:
       - "${PORT:-3001}:${PORT:-3001}"
@@ -19,6 +19,7 @@ services:
       DOORMAN_ADMIN_EMAIL: demo@doorman.dev
       DOORMAN_ADMIN_PASSWORD: DemoPassword123!
       DOORMAN_IN_DOCKER: "1"
+      ENV: development
       JWT_SECRET_KEY: demo-secret-change-me-please-32-bytes-min
       MEM_ENCRYPTION_KEY: demo-memory-key-change-me
       MEM_OR_EXTERNAL: MEM
@@ -37,6 +38,12 @@ services:
       LOGS_DIR: /app/logs
       PORT: 3001
       WEB_PORT: 3000
+      # The demo uses published credentials, so it listens on loopback only.
+      # Set DEMO_BIND_HOST=0.0.0.0 to expose it on your network.
+      HOST: ${DEMO_BIND_HOST:-127.0.0.1}
+      WEB_HOST: ${DEMO_BIND_HOST:-127.0.0.1}
+      # Keyless OpenAI-compatible model for the AI demo (service below).
+      DEMO_LOCAL_LLM_URL: http://127.0.0.1:11435
     restart: "no"
     network_mode: "host"
     networks: !reset []
@@ -50,3 +57,14 @@ services:
         tmpfs:
           mode: 01777
 
+  demo-llm:
+    image: python:3.12-slim
+    container_name: doorman-demo-llm
+    command: ["python", "/demo-llm.py"]
+    environment:
+      DEMO_LLM_HOST: ${DEMO_BIND_HOST:-127.0.0.1}
+      DEMO_LLM_PORT: "11435"
+    volumes:
+      - ./docker/demo-llm.py:/demo-llm.py:ro
+    restart: "no"
+    network_mode: "host"

@@ -4871,14 +4871,14 @@ async fn management_permissions_readiness_tools_and_restart_preserve_contract() 
         )
         .await
         .unwrap();
-    assert_eq!(public_readiness.status(), StatusCode::OK);
+    let public_status = public_readiness.status();
     let public_readiness: Value =
         serde_json::from_slice(&to_bytes(public_readiness.into_body(), 4096).await.unwrap())
             .unwrap();
     assert_eq!(public_readiness.as_object().unwrap().len(), 1);
     assert!(matches!(
-        public_readiness["status"].as_str(),
-        Some("ready" | "degraded")
+        (public_status, public_readiness["status"].as_str()),
+        (StatusCode::OK, Some("ready")) | (StatusCode::SERVICE_UNAVAILABLE, Some("degraded"))
     ));
 
     let admin_readiness = app
@@ -5125,7 +5125,7 @@ async fn readiness_degrades_when_an_active_grpc_api_lacks_a_descriptor() {
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let readiness = response_json(response).await;
     assert_eq!(readiness["status"], "degraded");
     assert_eq!(readiness["missing_grpc_descriptors"], 1);

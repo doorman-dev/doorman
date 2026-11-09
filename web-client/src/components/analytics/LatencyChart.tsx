@@ -97,7 +97,7 @@ export default function LatencyChart({
           {showGrid && (
             <CartesianGrid
               strokeDasharray="3 3"
-              stroke="#e5e7eb"
+              stroke="#232327"
               className="dark:stroke-gray-700"
             />
           )}
@@ -105,14 +105,14 @@ export default function LatencyChart({
           <XAxis
             dataKey="timestamp"
             tickFormatter={formatTimestamp}
-            stroke="#9ca3af"
+            stroke="#6e6e78"
             className="dark:stroke-gray-500"
             style={{ fontSize: '12px' }}
           />
           
           <YAxis
             tickFormatter={formatLatency}
-            stroke="#9ca3af"
+            stroke="#6e6e78"
             className="dark:stroke-gray-500"
             style={{ fontSize: '12px' }}
           />

@@ -60,7 +60,7 @@ cost, and configure budgets, guardrails and prompt privacy.
 ## Quick Links
 
 - **Main README**: [../README.md](../README.md)
-- **GitHub Repository**: [https://github.com/apidoorman/doorman](https://github.com/apidoorman/doorman)
+- **GitHub Repository**: [https://github.com/doorman-dev/doorman](https://github.com/doorman-dev/doorman)
 - **License**: [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
 
 ## Need Help?

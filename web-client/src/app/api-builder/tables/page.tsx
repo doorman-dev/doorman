@@ -1008,7 +1008,7 @@ const TablesPage = () => {
                 </div>
                 <div>
                   <h4 className="text-sm font-medium text-gray-800 dark:text-gray-200 mb-2">API Preview</h4>
-                  <pre className="bg-gray-900 text-green-300 rounded p-3 text-xs overflow-auto max-h-80">
+                  <pre className="bg-gray-50 border border-gray-200 text-gray-800 rounded p-3 text-xs overflow-auto max-h-80">
                     {generateJsonPreview(createFields)}
                   </pre>
                 </div>
@@ -1046,7 +1046,7 @@ const TablesPage = () => {
                 </div>
                 <div>
                   <h4 className="text-sm font-medium text-gray-800 dark:text-gray-200 mb-2">API Preview</h4>
-                  <pre className="bg-gray-900 text-green-300 rounded p-3 text-xs overflow-auto max-h-80">
+                  <pre className="bg-gray-50 border border-gray-200 text-gray-800 rounded p-3 text-xs overflow-auto max-h-80">
                     {generateJsonPreview(editFields)}
                   </pre>
                 </div>

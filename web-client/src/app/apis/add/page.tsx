@@ -407,7 +407,7 @@ const AddApiPage = () => {
             <li key={s.id} className="flex flex-1 items-center gap-2">
               <button type="button" onClick={() => jump(i)} aria-current={i === step ? 'step' : undefined}
                 className={`flex w-full items-center gap-2 rounded border px-3 py-2 text-left text-sm ${i === step ? 'border-primary-600 bg-primary-50 text-gray-900' : i < step ? 'border-gray-300 bg-white text-gray-700' : 'border-gray-200 bg-white text-gray-500'}`}>
-                <span className={`flex h-5 w-5 flex-none items-center justify-center rounded-full text-xs font-semibold ${i === step ? 'bg-primary-600 text-white' : i < step ? 'bg-gray-700 text-white' : 'bg-gray-200 text-gray-600'}`}>{i < step ? '✓' : i + 1}</span>
+                <span className={`flex h-5 w-5 flex-none items-center justify-center rounded-full text-xs font-semibold ${i === step ? 'bg-gray-950 text-white' : i < step ? 'bg-gray-700 text-white' : 'bg-gray-200 text-gray-600'}`}>{i < step ? '✓' : i + 1}</span>
                 <span className="font-medium">{s.title}</span>
               </button>
             </li>

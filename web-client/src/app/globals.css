@@ -1,3 +1,4 @@
+@import './doorman-ui.css';
 @import './signal.css';
 @tailwind base;
 @tailwind components;
@@ -9,8 +10,8 @@
   }
   
   body {
-    @apply bg-gray-50 dark:bg-dark-bg text-gray-900 dark:text-dark-text;
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    @apply bg-dark-bg text-gray-900;
+    font-family: var(--font-sans);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -34,8 +35,8 @@
   .markdown a { @apply text-blue-600 dark:text-blue-400 underline; }
   .markdown a:hover { @apply opacity-90; }
   .markdown code { @apply rounded bg-gray-100 dark:bg-white/10 px-1 py-0.5 text-[90%]; }
-  .markdown pre { @apply my-3 overflow-auto rounded bg-gray-50 dark:bg-[#0f172a] p-3 text-[12px]; }
-  .markdown pre code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  .markdown pre { @apply my-3 overflow-auto rounded bg-gray-50 p-3 text-[12px]; }
+  .markdown pre code { font-family: var(--font-mono); }
   .markdown ul { @apply my-2 list-disc pl-6; }
   .markdown ol { @apply my-2 list-decimal pl-6; }
   .markdown li { @apply my-1; }

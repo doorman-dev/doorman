@@ -115,7 +115,7 @@ const ToolsPage = () => {
               </div>
             </div>
             <div className="mt-4">
-              <button onClick={onCheck} disabled={loading} className="px-4 py-2 rounded-md bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50">{loading ? 'Checking…' : 'Check'}</button>
+              <button onClick={onCheck} disabled={loading} className="px-4 py-2 rounded-md bg-gray-950 text-white hover:bg-gray-800 disabled:opacity-50">{loading ? 'Checking…' : 'Check'}</button>
             </div>
 
             {error && <div className="mt-3 text-sm text-red-600">{error}</div>}

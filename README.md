@@ -1,69 +1,107 @@
-<img src="web-client/public/doorman-logo.svg?v=white-wordmark" alt="Doorman logo" width="336">
+<img src="web-client/public/doorman-logo.svg" alt="Doorman" width="240">
 
-![api-gateway](https://img.shields.io/badge/API-Gateway-blue)
-![Rust](https://img.shields.io/badge/Rust-1.88-orange)
-![License](https://img.shields.io/badge/license-Apache%202.0-green)
-![Last Commit](https://img.shields.io/github/last-commit/apidoorman/doorman)
-![GitHub issues](https://img.shields.io/github/issues/apidoorman/doorman)
+![Release](https://img.shields.io/github/v/release/doorman-dev/doorman?color=111111)
+![Rust](https://img.shields.io/badge/Rust-1.88-111111)
+![License](https://img.shields.io/badge/license-Apache%202.0-111111)
+![Last commit](https://img.shields.io/github/last-commit/doorman-dev/doorman?color=111111)
 
-# Doorman API Gateway
+# Doorman
 
-A Rust API gateway and control plane for REST, SOAP, GraphQL, gRPC, gRPC-Web, and AI APIs.
+One gateway for your team's AI and APIs.
 
-Get started: [Quick Demo](#get-started-quick-demo), [Self-Hosting](#get-started-self-hosting), or [Let Us Manage For You!](https://app.doorman.dev/signup)
+Give people AI with personal keys and allowances, put your APIs behind one set of
+policies, and see every request and every dollar. In your own infrastructure.
 
-## Key features
+[Run the AI demo](#ai-demo-no-provider-key-needed) · [Self-host](#self-hosting) · [doorman.dev](https://doorman.dev) · [Request a pilot](https://doorman.dev/contact.html?interest=pilot)
 
-- Multi-protocol gateway: REST, SOAP, GraphQL, native gRPC, and gRPC-Web
-- Semantic API versions with major-line resolution, deprecation, and sunset lifecycle
-- Native control plane: authentication, users, APIs, endpoints, roles, groups, routing, subscriptions, credits, tiers, quotas, security, discovery, and monitoring
-- Traffic policy: rate limits, throttling, bandwidth limits, routing, retries, circuit breaking, credits, and schema validation
-- Dual storage: a self-contained in-memory mode or shared MongoDB and Redis
-- Encrypted in-memory snapshots compatible with the former DMP1 dump format
-- Next.js management UI served alongside the Rust service
+![Doorman AI usage dashboard](docs/images/ai-usage.webp)
 
-## Control plane
+## What it does
 
-The built-in control plane centralizes gateway configuration, access management, traffic controls, and operations in one self-hosted interface.
+**AI gateway**
 
-![Doorman control plane](docs/images/control-plane.png)
+- One endpoint for OpenAI, Anthropic, Gemini, Azure OpenAI and any OpenAI-compatible model
+- Personal `dk_` keys for each employee; provider keys never leave the gateway
+- Allowances in dollars, tokens or requests, per person, group, tier or API, that warn, block or switch to a smaller model
+- Backup providers on outages, model allow lists and aliases
+- Guardrails that redact, block or log secrets and personal data in prompts and responses
+- Spend and usage by person, team, model and provider, with your own contract prices
 
-- **API lifecycle:** catalog and visual builder, protocol and endpoint configuration, schema validation, and API discovery.
-- **Access and consumption:** authentication, users, roles, groups, subscriptions, credits, tiers, and quotas.
-- **Traffic management:** routing, rate limits, throttling, bandwidth limits, retries, and circuit breaking.
-- **Operations and security:** analytics, request logs, monitoring, audit and security controls, and configuration import/export.
+**API gateway**
 
-## Get Started: Quick Demo
+- REST, SOAP, GraphQL, native gRPC and gRPC-Web behind one set of policies
+- Users, roles, groups, subscriptions, credits, tiers and quotas
+- Rate limits, throttling, bandwidth limits, routing, retries, circuit breaking and schema validation
+- Versioned APIs with deprecation and sunset dates
+- Request logs, analytics, audit trail, and configuration import and export
+
+**Runs where you do**
+
+- One container: a Rust gateway with the dashboard built in
+- In-memory mode with encrypted snapshots for a single node, or MongoDB and Redis for several
+- Multi-arch images (amd64, arm64) with an SBOM and provenance
+
+| AI policies | APIs |
+| :---: | :---: |
+| ![AI policies](docs/images/ai-policies.webp) | ![APIs](docs/images/apis.webp) |
+
+## Quick demo
 
 ```bash
 cp .env.demo .env
-docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up
 ```
 
-- Web UI: [http://localhost:3000](http://localhost:3000)
+- Dashboard: [http://localhost:3000](http://localhost:3000)
 - Gateway and platform API: [http://localhost:3001](http://localhost:3001)
-- Admin: `demo@doorman.dev` / `DemoPassword123!`
-- Storage: in memory; MongoDB and Redis are not required
+- Sign in as `demo@doorman.dev` / `DemoPassword123!`
+- Runs in memory, so MongoDB and Redis are not needed
+- Listens on `127.0.0.1` only, because the login above is public. Set `DEMO_BIND_HOST=0.0.0.0` to expose it on your network.
 
-## Get Started: Self-Hosting
+### AI demo (no provider key needed)
+
+The demo includes a keyless local model (`demo-local-llm/v1`). With the stack running:
+
+```bash
+./scripts/demo-ai-walkthrough.sh
+```
+
+It creates a team with a 3-request allowance, adds an employee who creates their own
+AI key, sends 4 requests (the 4th is blocked with `AI004`), and prints the usage. It is
+safe to re-run. To call the model yourself with an AI key from **My AI**:
+
+```bash
+curl http://127.0.0.1:3001/api/ai/demo-local-llm/v1/v1/chat/completions \
+  -H "Authorization: Bearer dk_..." -H "Content-Type: application/json" \
+  -d '{"model":"llama-demo","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+![My AI page](docs/images/my-ai.webp)
+
+## Self-hosting
 
 Copy the template, then replace its deliberately invalid administrator credentials
-and JWT secret before launching. The development defaults are configured for the
-bundled HTTP dashboard at `http://localhost:3000`; set your TLS, CORS, issuer,
-audience, and discovery values before switching to `ENV=production`.
+and JWT secret before you start. The development defaults suit the bundled dashboard
+at `http://localhost:3000`; set your TLS, CORS, issuer, audience and discovery values
+before switching to `ENV=production`.
 
 ```bash
 cp .env.example .env
-docker compose up -d --build
+docker compose up -d
 ```
 
 The default is `MEM_OR_EXTERNAL=MEM`. For a shared, multi-instance deployment:
 
 ```bash
-MEM_OR_EXTERNAL=REDIS docker compose --profile external up -d --build
+MEM_OR_EXTERNAL=REDIS docker compose --profile external up -d
 ```
 
-Shared mode uses MongoDB for durable configuration and Redis for caches, counters, revocations, routing state, and analytics.
+Shared mode keeps configuration in MongoDB and caches, counters, revocations, routing
+state and analytics in Redis.
+
+Compose pulls the published image, `ghcr.io/doorman-dev/doorman`, pinned to the current
+release. To build from source, add `--build` and set `DOORMAN_IMAGE=doorman:dev` so your
+local build does not replace the release tag.
 
 ### Configuration
 
@@ -71,15 +109,17 @@ Shared mode uses MongoDB for durable configuration and Redis for caches, counter
 | :--- | :--- | :--- |
 | `DOORMAN_ADMIN_EMAIL` | Yes | Initial administrator email |
 | `DOORMAN_ADMIN_PASSWORD` | Yes | Initial administrator password |
-| `JWT_SECRET_KEY` or `JWT_KEYS` | Yes | Access-token signing configuration |
+| `JWT_SECRET_KEY` or `JWT_KEYS` | Yes | Access-token signing |
+| `TOKEN_ENCRYPTION_KEY` | In production with MongoDB and Redis | Encrypts provider and API keys at rest; 32+ characters |
 | `MEM_OR_EXTERNAL` | No | `MEM` (default) or `REDIS` for MongoDB plus Redis |
-| `MEM_ENCRYPTION_KEY` | In memory mode | Encrypts automatic and manual DMP1 snapshots |
-| `MEM_DUMP_PATH` | No | Snapshot path hint; defaults to `data/memory_dump.bin` |
-| `NEXT_PUBLIC_GATEWAY_URL` | No | Browser gateway target; same-origin by default |
+| `MEM_ENCRYPTION_KEY` | In memory mode | Encrypts memory snapshots |
+| `MEM_DUMP_PATH` | No | Snapshot path; defaults to `data/memory_dump.bin` |
+| `NEXT_PUBLIC_GATEWAY_URL` | No | Gateway URL for the browser; same origin by default |
 
-Public protocol URLs and platform API request/response contracts remain unchanged. There is no legacy-process proxy or fallback in the runtime image.
+Every variable is described in [Configuration](user-docs/02-configuration.md).
 
-Unauthenticated self-registration is available at `/platform/authorization/register` and is protected by the configured registration IP rate limit.
+Self-registration at `/platform/authorization/register` is open without authentication
+and limited by the registration IP rate limit.
 
 ## Repository structure
 
@@ -95,12 +135,22 @@ doorman/
 
 ## Documentation
 
-- [Getting Started](user-docs/01-getting-started.md)
+- [Getting started](user-docs/01-getting-started.md)
 - [Configuration](user-docs/02-configuration.md)
-- [Security and Hardening](user-docs/03-security.md)
-- [API Workflows](user-docs/04-api-workflows.md)
-- [Production Operations](user-docs/05-operations.md)
+- [Security and hardening](user-docs/03-security.md)
+- [API workflows](user-docs/04-api-workflows.md)
+- [Operations: backup, upgrades, key rotation, outages](user-docs/05-operations.md)
+- [Tools](user-docs/06-tools.md)
+- [Reverse proxy](user-docs/07-reverse-proxy.md)
+- [AI gateway](user-docs/08-ai-gateway.md)
 - [Testing](user-docs/TESTS.md)
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md).
+
+## Working with us
+
+Doorman is free to self-host under Apache 2.0. If you want help, we run assisted
+pilots in your own cloud or VPC. [Request a pilot](https://doorman.dev/contact.html?interest=pilot).
 
 ## License
 

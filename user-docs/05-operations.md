@@ -390,13 +390,14 @@ GET /platform/monitor/readiness
 }
 ```
 
-Readiness returns HTTP 200 only when the gateway is ready. A missing dependency
-or active gRPC API without a usable descriptor returns HTTP 503 with
-`"status": "degraded"`, so load balancers and Kubernetes stop sending traffic
-to the instance. Privileged readiness also exposes the current memory-snapshot,
-metrics-persistence, revocation-purge, gateway-activity-log, and security-audit-log
-health; a failed background task or configured log sink returns HTTP 503 until
-its next successful write. Expired per-token revocations are purged at startup
+Readiness returns HTTP 200 with `"status": "ready"`, or HTTP 503 with
+`"status": "degraded"`. It reports degraded when MongoDB or Redis is
+unreachable, an active gRPC API has no usable descriptor, or a native TLS
+certificate has expired, so a plain HTTP probe takes a degraded instance out of
+rotation.
+If MongoDB is down, every platform request, including readiness, fails closed with
+503. Privileged readiness also returns `mongodb`, `redis`, `mode`,
+`missing_grpc_descriptors` and `tls_certificates_valid`. Expired per-token revocations are purged at startup
 and every five minutes by default; set
 `REVOCATION_PURGE_INTERVAL_SECONDS` only when a different cleanup interval is
 required.
@@ -426,7 +427,7 @@ metadata:
 spec:
   containers:
   - name: backend
-    image: doorman:latest
+    image: ghcr.io/doorman-dev/doorman:3.0.1
     livenessProbe:
       httpGet:
         path: /platform/monitor/liveness
@@ -899,64 +900,145 @@ MAX_PAGE_SIZE=100
 
 ---
 
-## Backup and Disaster Recovery
+## Backup, Recovery, Upgrades and Key Rotation
 
-### Database Backups
+Every procedure in this section was run against a real gateway (memory mode, and
+MongoDB 7 + Redis 7 for shared mode) on 8 November 2026. The results quoted are
+what happened, not what is expected.
 
-**MongoDB:**
+### Where state lives
+
+| Storage mode | Durable state | Lost if this goes away |
+| --- | --- | --- |
+| Memory (`MEM_OR_EXTERNAL=MEM`) | Encrypted dump files in the directory of `MEM_DUMP_PATH`, plus `SECURITY_SETTINGS_FILE` | Everything since the last dump if the process is killed without SIGTERM |
+| Shared (`MEM_OR_EXTERNAL=REDIS`) | MongoDB: APIs, users, groups, roles, credentials, AI settings, keys, usage | Redis holds sessions, rate-limit and budget counters, revocations and caches. Losing Redis signs people out and resets short-lived counters; configuration is safe |
+
+In memory mode the dump directory **is** the database. Put it on a persistent
+volume and back that volume up.
+
+### Memory mode: backup and restore
+
+A dump is written:
+
+- on demand, with `POST /platform/memory/dump` (needs `manage_security`);
+- on SIGTERM or SIGINT, after in-flight requests drain (`docker stop` sends SIGTERM);
+- on SIGUSR1, without stopping;
+- every `MEM_AUTO_SAVE_FREQ` seconds when `MEM_AUTO_SAVE_ENABLED=true`.
+
+Each dump is a new timestamped file, for example `dump-20261108T205822Z.bin`,
+in the directory of `MEM_DUMP_PATH`. On start the gateway loads the newest one.
+
 ```bash
-# Dump to file
-mongodump --host mongo.internal --out /backups/$(date +%Y%m%d)
+# Take a dump now (cookie from POST /platform/authorization)
+curl -s -b cookies -H "x-csrf-token: $CSRF" -X POST \
+  http://127.0.0.1:3001/platform/memory/dump
+# {"response":{"path":"/data/dump-20261108T205822Z.bin"}}
 
-# Restore from file
-mongorestore --host mongo.internal /backups/20240115
+# Back up: copy the whole dump directory and the settings file off the host
+docker run --rm -v doorman-data:/data -v "$PWD":/backup alpine:3.20 \
+  tar czf /backup/doorman-$(date +%Y%m%d%H%M).tgz -C /data .
+
+# Restore: stop the gateway, put the files back, start it with the same MEM_ENCRYPTION_KEY
+docker compose stop doorman
+docker run --rm -v doorman-data:/data -v "$PWD":/backup alpine:3.20 \
+  sh -c 'rm -f /data/dump-*.bin && tar xzf /backup/doorman-202611082100.tgz -C /data'
+docker compose start doorman
 ```
 
-**Redis:**
-```bash
-# Manual save
-redis-cli -h redis.internal SAVE
+What the test showed:
 
-# Automated snapshots (redis.conf)
-save 900 1      # After 900 sec if 1 key changed
-save 300 10     # After 300 sec if 10 keys changed
-save 60 10000   # After 60 sec if 10000 keys changed
+| Step | Result |
+| --- | --- |
+| Create an API, `docker stop` (SIGTERM), start again | API present. The final dump on shutdown included it |
+| Create an API, `docker kill -s KILL`, start again | That API was **gone**: only the last dump survives a hard kill |
+| Start with a different `MEM_ENCRYPTION_KEY` | Refused to start: `memory snapshot restore failed; refusing to start with empty state`. Dump files unchanged (same SHA-256) |
+
+To bound what a crash can lose, set `MEM_AUTO_SAVE_ENABLED=true` and a
+`MEM_AUTO_SAVE_FREQ` you can live with (minimum 60 seconds).
+
+### Shared mode: backup and restore
+
+Back up MongoDB. Redis does not need a backup for recovery.
+
+```bash
+# Backup (one compressed archive per database)
+mongodump --uri "mongodb://USER:PASS@mongo:27017/?authSource=admin" \
+  --db doorman --archive=/backups/doorman-$(date +%Y%m%d%H%M).archive --gzip
+
+# Restore (replaces the collections in the archive), then restart the gateways
+mongorestore --uri "mongodb://USER:PASS@mongo:27017/?authSource=admin" \
+  --archive=/backups/doorman-202611082100.archive --gzip --drop
+docker compose restart doorman
 ```
 
-### Memory Dumps
+Tested: an API created before the dump was present after dropping the database,
+restoring and restarting; an API created after the dump was not, as expected.
+`--drop` makes the restore exact, so anything created after the backup is lost.
+Take a fresh dump right before an upgrade.
 
-**Autosave runtime configuration:**
+### Upgrade and rollback
+
+Doorman images are published as `ghcr.io/doorman-dev/doorman:<version>`, and
+`docker-compose.yml` pins one through `DOORMAN_IMAGE`.
+
 ```bash
-PUT /platform/security/settings
-{
-  "enable_auto_save": true
-}
+# 1. Back up first (dump directory, or mongodump)
+# 2. Point at the new version and pull it
+export DOORMAN_IMAGE=ghcr.io/doorman-dev/doorman:3.0.2
+docker compose pull doorman
+# 3. Replace the container (SIGTERM, so memory mode writes its final dump first)
+docker compose up -d doorman
+# 4. Check
+curl -s http://127.0.0.1:3001/platform/monitor/liveness
+curl -s http://127.0.0.1:3001/platform/monitor/readiness   # body must say "ready"
+
+# Roll back: same steps with the previous tag. If the new version changed stored
+# data in a way the old one cannot read, restore the backup from step 1 first.
+export DOORMAN_IMAGE=ghcr.io/doorman-dev/doorman:3.0.1
+docker compose up -d doorman
 ```
 
-Use `POST /platform/memory/dump` for an authenticated on-demand dump. A
-security-settings update immediately enables/disables or retimes autosave; the
-environment variables establish its startup defaults.
+Read the release notes before upgrading; they call out anything that needs action,
+such as a new required setting. Managed tenants started by `doorman-wrapper` are
+upgraded one at a time from the operator console's **Versions** page, which
+swaps the container and puts the old one back if the new one fails its health
+check. Upgrade one test tenant first.
 
-When enabled at startup or by an accepted update, autosave writes a dump
-immediately before waiting for its interval. Disabled autosave stays disabled.
-Accepted security-settings updates also write a JSON mirror to
-`SECURITY_SETTINGS_FILE`; keep that path on a writable persistent volume.
-Writes use an atomic file replacement. As in Python, mirror failures are logged
-but do not undo the authoritative database update. In memory mode the file is
-a startup fallback only when no settings document was restored; MongoDB never
-loads settings from this file. This mirror is not a substitute for a full dump.
+### Key rotation
 
-**Automatic on shutdown:**
+| Key | What rotating it does | Procedure |
+| --- | --- | --- |
+| `JWT_SECRET_KEY` | Every session and access token stops working; data is untouched | Change it and restart. Everyone signs in again |
+| `DOORMAN_ADMIN_PASSWORD` | Only used to create the first admin; an existing admin keeps their password (test `bootstrap_admin_seed_matches_python_and_preserves_existing_credentials`) | Change the password in **Settings** instead |
+| Provider API keys | None for users | Edit the provider credential in **AI Gateway → Providers**. Requests use the new key at once |
+| `TOKEN_ENCRYPTION_KEY` | **Every personal AI key (`dk_...`) stops working** (tested), and stored secrets encrypted with the old key can no longer be read (from the code: there is no re-encryption step) | Plan it: set the new key, restart, re-enter every provider key and API credential, and ask everyone to create a new AI key in **My AI** |
+| `MEM_ENCRYPTION_KEY` | The gateway cannot read its existing dumps and will not start. In memory mode without `TOKEN_ENCRYPTION_KEY` it is also the key material for secrets and `dk_` keys | No in-place rotation. Treat it as permanent for the lifetime of the data, or move to shared mode |
 
-- SIGTERM or SIGINT drains active requests, stops snapshot workers, and writes an encrypted final dump, including writes completed during draining.
-- SIGUSR1 writes an on-demand dump without stopping the process. Autosave may remain disabled.
-- Both use the current security setting's `dump_path`; `MEM_DUMP_PATH` establishes its default. Timestamped snapshots go in that path's directory.
+Tested on a running gateway:
 
-**Restore:**
+| Step | Result |
+| --- | --- |
+| Old session cookie after changing `JWT_SECRET_KEY` | `401 GTW998 Unauthorized`; a fresh login worked and all data was present |
+| A `dk_` key after a plain restart | `200`, still valid |
+| The same `dk_` key after adding `TOKEN_ENCRYPTION_KEY` | `401 AI007 Invalid AI access key`; admin login unaffected |
 
-- Keep the saved settings file and its snapshot directory on the persistent volume.
-- Start the gateway to load the latest timestamped dump before autosave starts.
-- A wrong-key or corrupt selected dump prevents startup and is left unchanged.
+For `MEM_ENCRYPTION_KEY`, `/platform/config/export/all` and `/platform/config/import`
+carry APIs, endpoints, groups, roles and routings across to a gateway with a new
+key, but **not** users, credentials, AI settings or keys. Those must be recreated.
+
+### Degraded-mode behaviour
+
+Tested with MongoDB 7 and Redis 7, by stopping each container while the gateway ran:
+
+| Outage | Liveness | Readiness | Platform API | Recovery |
+| --- | --- | --- | --- | --- |
+| Redis down | 200 | 503 with `"status": "degraded"` | Reads with an existing session worked; sign-in returned 503 | Automatic when Redis returned |
+| MongoDB down | 503 | 503 | Every request returned `503 SEC012 Security policy is temporarily unavailable` (fails closed) | Automatic: reads, writes and sign-in worked once MongoDB returned |
+| Upstream API or AI provider down | 200 | 200 | Only that route fails. AI fallback targets take over when configured; a provider 429 is passed through, never moved to a backup (covered by the AI gateway tests, not by this run) | Automatic |
+
+During a Redis outage readiness returns 503, so a readiness probe takes the
+instance out of rotation even though reads still work. Alert on readiness or on
+failed sign-ins.
 
 ---
 

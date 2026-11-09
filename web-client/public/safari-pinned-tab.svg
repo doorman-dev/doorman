@@ -1,7 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Doorman">
-  <rect x="11" y="11" width="45" height="45" fill="#94a3b8"/>
-  <rect x="4" y="4" width="45" height="45" fill="#e2e8f0" stroke="#14213d" stroke-width="4"/>
-  <path d="M18 47V17h21v30" fill="#ffffff" stroke="#14213d" stroke-width="4" stroke-linejoin="miter"/>
-  <path d="M24 22v20" stroke="#14213d" stroke-width="3"/>
-  <circle cx="34" cy="33" r="2.5" fill="#14213d"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path fill-rule="evenodd" d="M19 4h26a15 15 0 0 1 15 15v26a15 15 0 0 1-15 15H19A15 15 0 0 1 4 45V19A15 15 0 0 1 19 4zM21 52h22V15H21zm16.5-20.3a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6z"/></svg>

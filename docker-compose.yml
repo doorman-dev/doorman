@@ -1,7 +1,10 @@
 # Doorman API Gateway
 #
-# Memory mode (default): docker compose up --build
-# Shared mode: MEM_OR_EXTERNAL=REDIS docker compose --profile external up --build
+# Memory mode (default): docker compose up -d
+# Shared mode: MEM_OR_EXTERNAL=REDIS docker compose --profile external up -d
+#
+# Pulls the published image. Add --build to build from source instead
+# (set DOORMAN_IMAGE=doorman:dev so the local build does not shadow the release tag).
 
 services:
   doorman:
@@ -11,7 +14,8 @@ services:
       args:
         NEXT_PUBLIC_PROTECTED_USERS: ${NEXT_PUBLIC_PROTECTED_USERS:-}
         NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL:-}
-    image: doorman:latest
+    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.0.1}
+    pull_policy: missing
     container_name: doorman
     ports:
       - "${PORT:-3001}:${PORT:-3001}"
@@ -91,13 +95,14 @@ services:
     container_name: doorman-mongo
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_DB_USER:-doorman_admin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_DB_PASSWORD:?MONGO_DB_PASSWORD must be set}
+      # Checked inside the container: a compose-level ${VAR:?} check would also stop memory mode.
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_DB_PASSWORD:-}
     volumes:
       - mongo-data:/data/db
     networks:
       - backend
     restart: unless-stopped
-    command: --bind_ip_all
+    entrypoint: ["sh", "-c", "[ -n \"$$MONGO_INITDB_ROOT_PASSWORD\" ] || { echo 'MONGO_DB_PASSWORD must be set' >&2; exit 1; }; exec docker-entrypoint.sh mongod --bind_ip_all"]
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
