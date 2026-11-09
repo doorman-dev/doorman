@@ -53,7 +53,7 @@ pub static USAGE_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
 const PRICE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Price tables keyed by storage instance (one per gateway in production).
-type CachedPrices = std::collections::HashMap<usize, (Instant, Arc<PriceTable>)>;
+type CachedPrices = std::collections::HashMap<u64, (Instant, Arc<PriceTable>)>;
 
 fn price_cache() -> &'static RwLock<CachedPrices> {
     static CACHE: std::sync::OnceLock<RwLock<CachedPrices>> = std::sync::OnceLock::new();
@@ -70,7 +70,9 @@ pub fn invalidate_price_table() {
 /// The `ai_pricing` table, cached for 60 s. Invalid rows are skipped (and
 /// logged) so one bad row never unprices everything.
 pub async fn price_table(storage: Option<&SharedStorage>) -> Arc<PriceTable> {
-    let cache_key = storage.map_or(0, |storage| storage as *const SharedStorage as usize);
+    // A per-storage id, not its address: a freed storage's address can be
+    // reused by a new one, which would then see stale prices.
+    let cache_key = storage.map_or(0, SharedStorage::instance_id);
     if let Ok(cache) = price_cache().read()
         && let Some((loaded_at, table)) = cache.get(&cache_key)
         && loaded_at.elapsed() < PRICE_CACHE_TTL

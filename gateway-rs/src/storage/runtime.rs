@@ -27,6 +27,14 @@ pub struct SharedStorage {
     policy_cache_ttl: Duration,
     tls_mutation_mutex: Arc<tokio::sync::Mutex<()>>,
     tls_mutation_key: String,
+    /// Unique per storage created (clones share it); keys per-storage caches.
+    instance_id: u64,
+}
+
+static NEXT_STORAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_storage_id() -> u64 {
+    NEXT_STORAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct TlsMutationGuard {
@@ -97,6 +105,11 @@ pub struct GatewayMetric<'a> {
 }
 
 impl SharedStorage {
+    /// Identifies this storage for caches keyed per gateway instance.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub async fn connect(config: &SharedStorageConfig) -> Result<Self, StorageError> {
         if config.storage_mode.eq_ignore_ascii_case("MEM") {
             return Ok(Self {
@@ -107,6 +120,7 @@ impl SharedStorage {
                 policy_cache_ttl: Duration::from_secs(config.policy_cache_ttl_seconds),
                 tls_mutation_mutex: Arc::new(tokio::sync::Mutex::new(())),
                 tls_mutation_key: String::new(),
+                instance_id: next_storage_id(),
             });
         }
         // Bound server selection so a MongoDB outage fails requests quickly
@@ -138,6 +152,7 @@ impl SharedStorage {
             policy_cache_ttl: Duration::from_secs(config.policy_cache_ttl_seconds),
             tls_mutation_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_mutation_key: format!("doorman:tls-mutation:{}", config.mongo_database),
+            instance_id: next_storage_id(),
         })
     }
 
