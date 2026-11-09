@@ -1595,7 +1595,9 @@ async fn logs_endpoint_returns_ai_usage_records() {
 
     let admin = login(&h.app, "admin@doorman.dev", fixture_password()).await;
     let mut usage_lines = Vec::new();
-    for _ in 0..50 {
+    // Up to 5s: the usage line is written in the background, which is slower
+    // when the whole file runs in parallel.
+    for _ in 0..250 {
         let logs = json_body(
             request(
                 &h.app,
@@ -3490,6 +3492,11 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
         doorman_gateway::platform_contract::validate_ai_api(api)
             .unwrap_or_else(|e| panic!("{api}: {e:?}"));
         let group = api["api_ai_config"]["credential_group"].as_str().unwrap();
+        if group == "none" {
+            // demo-local-llm is keyless: it uses no credential group at all.
+            assert_eq!(api["api_name"], "demo-local-llm");
+            continue;
+        }
         let def = storage
             .find_one("credit_defs", &json!({"api_credit_group": group}))
             .await
@@ -3498,7 +3505,8 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
         assert_eq!(def["api_key"], "", "demo credentials never hold a key");
     }
     let pricing = storage.find_many("ai_pricing", &json!({})).await.unwrap();
-    assert_eq!(pricing.len(), 4);
+    // Four Claude models plus the keyless local demo model.
+    assert_eq!(pricing.len(), 5);
     assert!(
         pricing
             .iter()
@@ -3550,7 +3558,7 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
             .await
             .unwrap()
             .len(),
-        4
+        5
     );
 
     // A call to a demo API is rejected with AI006 (no key is ever seeded).
@@ -4069,7 +4077,7 @@ async fn budget_charged_once_when_fallback_provider_serves() {
     .await;
     let backup = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
     let h = harness(
-        "failover-openai",
+        "budget-failover-openai",
         "openai",
         &primary.url,
         json!({"api_ai_config": {
@@ -4097,7 +4105,7 @@ async fn budget_charged_once_when_fallback_provider_serves() {
     let response = send(
         &h.app,
         Method::POST,
-        "/api/ai/failover-openai/v1/v1/chat/completions",
+        "/api/ai/budget-failover-openai/v1/v1/chat/completions",
         &[("authorization", &auth)],
         Some(chat_body("gpt-x")),
     )
