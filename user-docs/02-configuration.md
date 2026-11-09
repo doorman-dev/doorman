@@ -65,7 +65,7 @@ localStorage.setItem('API_URL', 'https://api.doorman.example.com')
 | `AUTH_EXPIRE_TIME_FREQ` | `minutes` | `seconds`, `minutes`, `hours`, `days` |
 | `AUTH_REFRESH_EXPIRE_TIME` | `7` | Refresh token expiration (numeric) |
 | `AUTH_REFRESH_EXPIRE_FREQ` | `days` | `seconds`, `minutes`, `hours`, `days` |
-| `TOKEN_ENCRYPTION_KEY` | - | Encrypt API keys at rest (recommended) |
+| `TOKEN_ENCRYPTION_KEY` | - | Encrypts provider and API keys at rest. **Required in production with external storage** (32+ characters). Set it before first start: changing it later invalidates every personal AI key. |
 | `HTTPS_ONLY` | `false` | **Required in production.** Enforces HTTPS, secure cookies, CSRF |
 | `DOWNSTREAM_TLS_MODE` | `proxy` | `proxy` keeps external TLS termination; `native` terminates TLS in the Rust listener. |
 | `DOWNSTREAM_TLS_CERT_FILE` | unset | PEM certificate chain for native TLS. Required when mode is `native`. |

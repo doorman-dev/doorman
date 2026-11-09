@@ -588,7 +588,7 @@ const ApiBuilderPage = () => {
 
           <div className="card p-4 h-fit">
             <h3 className="font-medium mb-2 text-sm">API Preview</h3>
-            <pre className="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-auto max-h-[500px]">
+            <pre className="bg-gray-50 border border-gray-200 text-gray-800 p-3 rounded text-xs overflow-auto max-h-[500px]">
               {JSON.stringify(apiPreview, null, 2)}
             </pre>
             <p className="text-xs text-gray-500 mt-2">

@@ -303,6 +303,18 @@ pub async fn record_usage(ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostRes
     });
     if let Some(storage) = ctx.storage.as_ref() {
         if success {
+            if cost.unpriced
+                && ctx
+                    .budget_charges
+                    .iter()
+                    .any(|charge| charge.unit == crate::ai::budgets::BudgetUnit::Cost)
+            {
+                tracing::warn!(
+                    provider = ctx.provider.as_str(),
+                    model = %ctx.model,
+                    "AI model has no price; USD budgets are not charged for this request. Add a price under AI Gateway pricing"
+                );
+            }
             crate::ai::budgets::charge(storage, &ctx.budget_charges, &usage, cost.cost_nanos).await;
         }
         if let Some(log) = ctx.prompt_log.as_ref() {

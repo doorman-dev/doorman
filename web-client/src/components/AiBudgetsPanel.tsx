@@ -6,7 +6,7 @@ import ConfirmModal from '@/components/ConfirmModal'
 import { delJson, fetchAllPaginated, getJson, postJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
 import AiBudgetBar from '@/components/AiBudgetBar'
-import { aiValidationErrors, formatBudgetAmount, providerLabel, type AiApiConfig, type AiBudget, type AiBudgetListRow, type AiBudgetScope, type AiProvider } from '@/utils/ai'
+import { aiValidationErrors, formatBudgetAmount, providerLabel, type AiApiConfig, type AiBudget, type AiBudgetListRow, type AiBudgetScope, type AiPricingRow, type AiProvider } from '@/utils/ai'
 
 type Api = { api_name: string; api_version: string; api_type: string; api_ai_provider?: AiProvider; api_ai_config?: AiApiConfig }
 const SCOPES: [AiBudgetScope, string][] = [['global', 'Everyone'], ['group', 'Group'], ['tier', 'Tier'], ['user', 'One user'], ['api', 'One AI API']]
@@ -28,6 +28,7 @@ export default function AiBudgetsPanel() {
   const [error, setError] = useState<string | null>(null)
   const [fields, setFields] = useState<Record<string, string>>({})
   const [removing, setRemoving] = useState<AiBudgetListRow | null>(null)
+  const [pricing, setPricing] = useState<AiPricingRow[] | null>(null)
   const load = useCallback(async () => {
     setLoading(true); setError(null)
     try {
@@ -41,6 +42,9 @@ export default function AiBudgetsPanel() {
     let active = true
     fetchAllPaginated<Api>((page, size) => `${SERVER_URL}/platform/api/all?page=${page}&page_size=${size}`, data => Array.isArray(data) ? data : data.apis || [])
       .then(result => { if (active) setApis(result.filter(api => api.api_type === 'AI')) })
+      .catch(() => {})
+    getJson<{ pricing: AiPricingRow[] }>(`${SERVER_URL}/platform/ai/pricing`)
+      .then(result => { if (active) setPricing(result.pricing) })
       .catch(() => {})
     return () => { active = false }
   }, [])
@@ -62,6 +66,12 @@ export default function AiBudgetsPanel() {
     const result = await fetchAllPaginated<Record<string, string>>((page, size) => `${SERVER_URL}/platform/${kind}/all?page=${page}&page_size=${size}`, data => Array.isArray(data) ? data : data[`${kind}s`] || [])
     return result.map(row => row[kind === 'user' ? 'username' : 'group_name']).filter(Boolean)
   }
+  // Models these APIs allow that have no price: a USD limit never counts their spend.
+  const unpricedModels = draft?.limit_type === 'cost' && pricing ? [...new Set(apis
+    .filter(api => (draft.scope !== 'api' || `${api.api_name}/${api.api_version}` === draft.target) && (!draft.provider || api.api_ai_provider === draft.provider))
+    .flatMap(api => (api.api_ai_config?.allowed_models || []).filter(model => !model.endsWith('*'))
+      .filter(model => !pricing.some(row => row.provider === api.api_ai_provider && (row.model_pattern.endsWith('*') ? model.startsWith(row.model_pattern.slice(0, -1)) : row.model_pattern === model)))
+      .map(model => `${providerLabel(api.api_ai_provider || '')} ${model}`)))].sort() : []
   const models = [...new Set(apis.flatMap(api => [...(api.api_ai_config?.allowed_models || []).filter(model => !model.endsWith('*')), ...Object.values(api.api_ai_config?.model_aliases || {})]))].sort()
   const update = (value: Partial<Draft>) => setDraft(current => current ? { ...current, ...value } : current)
   const save = async (event: React.FormEvent) => {
@@ -112,6 +122,7 @@ export default function AiBudgetsPanel() {
       <label className="block text-sm">Period<select className="input w-full mt-1" value={draft.period} onChange={event => { const period = event.target.value as AiBudget['period']; update({ period, ...(shortWindow(period) ? { action: 'block' } : {}) }) }}>{Object.entries(PERIOD_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{shortWindow(draft.period) && <span className="text-xs text-gray-500">Per-minute and per-hour limits always block.</span>}{issue('period')}</label>
       <label className="block text-sm">Limit type<select className="input w-full mt-1" value={draft.limit_type} onChange={event => update({ limit_type: event.target.value as AiBudget['limit_type'], limit: '' })}><option value="cost">USD ($)</option><option value="tokens">Tokens</option><option value="requests">Requests</option></select>{issue('limit_type')}</label>
       <label className="block text-sm">Limit {draft.limit_type === 'cost' ? '(USD)' : draft.limit_type === 'requests' ? '(requests)' : '(tokens)'}<input className="input w-full mt-1" inputMode="decimal" required value={draft.limit} onChange={event => update({ limit: event.target.value })} />{issue('limit_value')}</label>
+      {unpricedModels.length > 0 && <p className="text-sm rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">These models have no price, so their spend counts as $0 toward this limit: {unpricedModels.join(', ')}. <a href="/ai/providers#prices" className="font-medium">Add model prices →</a></p>}
       <label className="block text-sm">Action<select className="input w-full mt-1" value={draft.action} disabled={shortWindow(draft.period)} onChange={event => update({ action: event.target.value as AiBudget['action'] })}>{['warn', 'downgrade', 'block'].map(value => <option key={value}>{value}</option>)}</select>{issue('action')}</label>
       {draft.action === 'downgrade' && <div className="text-sm"><p className="mb-1">Downgrade model</p><SearchableSelect value={draft.downgrade_model || ''} onChange={downgrade_model => update({ downgrade_model })} fetchOptions={async () => models} placeholder="Allowed model ID" /><p className="text-xs text-gray-500 mt-1">Select an allowed model or enter a concrete ID allowed by a wildcard. The target API must also allow it.</p>{issue('downgrade_model')}</div>}
       <label className="block text-sm">Warn at %<input className="input w-full mt-1" type="number" min={1} max={99} required value={draft.warn_at_percent} onChange={event => update({ warn_at_percent: Number(event.target.value) })} />{issue('warn_at_percent')}</label>

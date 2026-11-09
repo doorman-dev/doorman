@@ -687,6 +687,7 @@ impl SharedStorage {
         bytes: u64,
         ttl_seconds: u64,
     ) -> Result<u64, StorageError> {
+        Self::chaos_guard("redis")?;
         if let Some(memory) = &self.memory {
             return Ok(memory.increment(key, bytes, ttl_seconds).await);
         }
@@ -821,6 +822,7 @@ impl SharedStorage {
     }
 
     pub async fn current_counter(&self, key: &str) -> Result<u64, StorageError> {
+        Self::chaos_guard("redis")?;
         if let Some(memory) = &self.memory {
             return Ok(memory
                 .get_value(key)

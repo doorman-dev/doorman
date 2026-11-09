@@ -8,19 +8,46 @@
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/apidoorman/doorman.git
+git clone https://github.com/doorman-dev/doorman.git
 cd doorman
 
 # Copy and edit .env
 cp .env.example .env
 # Set: DOORMAN_ADMIN_EMAIL, DOORMAN_ADMIN_PASSWORD, JWT_SECRET_KEY
 
-# Start
-docker compose up
+# Start (pulls the published image, ghcr.io/doorman-dev/doorman)
+docker compose up -d
 ```
 
 **Access:** Backend `http://localhost:3001`, Web UI `http://localhost:3000`
+
+To build from source instead, run `DOORMAN_IMAGE=doorman:dev docker compose up -d --build`.
+
+## Your first AI request
+
+The demo stack includes a keyless local model, so you can try the AI gateway before
+connecting a provider:
+
+```bash
+cp .env.demo .env
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+./scripts/demo-ai-walkthrough.sh
+```
+
+The script signs in as the demo admin, creates a team with a 3-request allowance, adds an
+employee who creates a personal AI key, and sends 4 requests. The 4th is blocked with
+`AI004`. Then it prints the usage. To call the model yourself, sign in at
+`http://localhost:3000` as `demo@doorman.dev` / `DemoPassword123!`, create a key under
+**My AI**, and run:
+
+```bash
+curl http://127.0.0.1:3001/api/ai/demo-local-llm/v1/v1/chat/completions \
+  -H "Authorization: Bearer dk_..." -H "Content-Type: application/json" \
+  -d '{"model":"llama-demo","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+To connect OpenAI, Anthropic, Gemini or Azure OpenAI with your own key, see
+/docs/ai-gateway.md.
 
 ## Environment Variables
 

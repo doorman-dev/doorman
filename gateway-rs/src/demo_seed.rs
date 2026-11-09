@@ -63,7 +63,10 @@ pub async fn run_seed(
     seed_subscriptions(storage, &users, &api_keys, &mut rng).await?;
     seed_ai(storage, &users, &mut rng).await?;
     seed_logs(options.logs, &users, &apis, &mut rng)?;
-    seed_protos(options.protos, &apis, &mut rng)?;
+    // Sample .proto files are optional; the container root is read-only.
+    if let Err(error) = seed_protos(options.protos, &apis, &mut rng) {
+        tracing::warn!(%error, "demo seed skipped sample proto files");
+    }
     seed_metrics(&users, &apis, &mut rng);
 
     let mut result = serde_json::Map::new();
@@ -293,18 +296,24 @@ fn ai_example_pricing() -> Vec<Value> {
         json!({"pricing_id": "demo-claude-opus-5-5", "provider": "anthropic", "model_pattern": "claude-opus-5-5", "input_usd_per_mtok": 4.0, "output_usd_per_mtok": 20.0, "cache_read_usd_per_mtok": 0.2, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
         json!({"pricing_id": "demo-claude-sonnet-5-5", "provider": "anthropic", "model_pattern": "claude-sonnet-5-5", "input_usd_per_mtok": 2.0, "output_usd_per_mtok": 10.0, "cache_read_usd_per_mtok": 0.2, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
         json!({"pricing_id": "demo-claude-haiku-5-5", "provider": "anthropic", "model_pattern": "claude-haiku-5-5", "input_usd_per_mtok": 0.1, "output_usd_per_mtok": 0.5, "cache_read_usd_per_mtok": null, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify; >100K-token prompts priced higher"}),
+        json!({"pricing_id": "demo-llama-demo", "provider": "openai_compatible", "model_pattern": "llama-demo", "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0, "cache_read_usd_per_mtok": null, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "demo price for the keyless local model"}),
         json!({"pricing_id": "demo-claude-fable-5-1", "provider": "anthropic", "model_pattern": "claude-fable-5-1", "input_usd_per_mtok": 10.0, "output_usd_per_mtok": 50.0, "cache_read_usd_per_mtok": null, "cache_write_usd_per_mtok": null, "effective_from": "2026-10-06", "note": "verify"}),
     ]
 }
 
 /// One AI API per provider. Their credential groups hold **no key** (never
-/// seed real keys), so calls answer `AI006` until an admin adds one. Also an
-/// example pricing set, one budget, one guardrail and 30 days of usage.
+/// seed real keys), so calls answer `AI006` until an admin adds one. The
+/// exception is `demo-local-llm`, a keyless OpenAI-compatible upstream at
+/// `DEMO_LOCAL_LLM_URL` (default `http://localhost:11434`, Ollama's port; the
+/// demo compose file points it at `docker/demo-llm.py`). Also an example
+/// pricing set, one budget, one guardrail and 30 days of usage.
 async fn seed_ai(
     storage: &SharedStorage,
     users: &[String],
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let local_llm =
+        std::env::var("DEMO_LOCAL_LLM_URL").unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let apis = [
         (
             "demo-openai",
@@ -341,20 +350,21 @@ async fn seed_ai(
         (
             "demo-local-llm",
             "openai_compatible",
-            "http://ollama:11434",
-            "local-llm-demo",
+            local_llm.as_str(),
+            "none",
             "authorization",
             vec!["llama-demo"],
         ),
     ];
     for (name, provider, server, credential_group, header, models) in &apis {
-        if storage
-            .find_one(
-                "credit_defs",
-                &json!({"api_credit_group": credential_group}),
-            )
-            .await?
-            .is_none()
+        if *credential_group != "none"
+            && storage
+                .find_one(
+                    "credit_defs",
+                    &json!({"api_credit_group": credential_group}),
+                )
+                .await?
+                .is_none()
         {
             storage
                 .insert_one(
@@ -377,7 +387,11 @@ async fn seed_ai(
                 json!({
                     "api_id": Uuid::new_v4().to_string(), "api_name": name, "api_version": "v1",
                     "api_path": format!("/{name}/v1"), "api_type": "AI", "api_ai_provider": provider,
-                    "api_description": format!("Demo {provider} AI API (add a provider key to {credential_group} to use it)"),
+                    "api_description": if *credential_group == "none" {
+                        "Demo local model (no provider key needed)".to_owned()
+                    } else {
+                        format!("Demo {provider} AI API (add a provider key to {credential_group} to use it)")
+                    },
                     "api_servers": [server], "api_allowed_groups": ["ALL"], "api_allowed_roles": [],
                     "api_public": false, "api_auth_required": true, "api_allowed_retry_count": 0,
                     "api_credits_enabled": false, "active": true,

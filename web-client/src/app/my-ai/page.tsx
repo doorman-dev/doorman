@@ -48,7 +48,7 @@ function Connect({ apis }: { apis: AiMyApi[] }) {
     </dl>
     <div>
       <div role="tablist" aria-label="Setup instructions" className="flex flex-wrap gap-1 border-b border-gray-200">{snippets.map(snippet => <button key={snippet.id} type="button" role="tab" aria-selected={snippet.id === active.id} onClick={() => setTab(snippet.id)} className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${snippet.id === active.id ? 'border-primary-600 text-primary-700 font-medium' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{snippet.label}</button>)}</div>
-      <div className="relative mt-3"><pre className="bg-gray-900 text-gray-100 text-xs p-4 pr-20 rounded overflow-x-auto"><code>{active.code}</code></pre><div className="absolute top-2 right-2"><SignalCopyButton text={active.code} label="Copy" /></div></div>
+      <div className="relative mt-3"><pre className="bg-gray-50 border border-gray-200 text-gray-800 text-xs p-4 pr-20 rounded-lg overflow-x-auto"><code>{active.code}</code></pre><div className="absolute top-2 right-2"><SignalCopyButton text={active.code} label="Copy" /></div></div>
       <p className="text-xs text-gray-500 mt-2">Replace <code>dk_your_key_here</code> with your access key.</p>
     </div>
   </section>

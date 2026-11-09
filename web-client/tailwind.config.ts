@@ -9,82 +9,38 @@ export default {
   darkMode: 'class',
   theme: {
     extend: {
+      // doorman.dev design system (dark). The markup was written for a light
+      // theme, so each scale runs from the darkest tint (50) to the brightest
+      // text (950): light-theme classes render as the site's dark UI.
       colors: {
-        signal: { ink: '#111827', warm: '#f6f7f9', lime: '#dbeafe', blue: '#eff6ff', terra: '#2563eb', mist: '#6b7280' },
-        // Kept as aliases so existing page behavior can be restyled without changing markup.
-        primary: {
-          50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa',
-          500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a', 950: '#172554',
-        },
-        blue: {
-          50: '#DEEBFF',
-          600: '#0052CC',
-          700: '#0747A6',
-        },
-        // Orcha Neutral Palette
-        gray: {
-          50: '#F4F5F7',
-          100: '#EBECF0',
-          200: '#DFE1E6',
-          300: '#B3BAC5',
-          400: '#7A869A',
-          500: '#5E6C84',
-          600: '#42526E',
-          700: '#344563',
-          800: '#253858',
-          900: '#172B4D',
-          950: '#172B4D',
-        },
-        // Orcha Accent Colors
-        success: {
-          50: '#E3FCEF',
-          100: '#ABF5D1',
-          200: '#79F2C0',
-          300: '#57D9A3',
-          400: '#36B37E',
-          500: '#00875A',
-          600: '#006644',
-          700: '#00875A',
-          800: '#00875A',
-          900: '#00875A',
-        },
-        warning: {
-          50: '#FFFAE6',
-          100: '#FFF0B3',
-          200: '#FFE380',
-          300: '#FFC400',
-          400: '#FFAB00',
-          500: '#FF991F',
-          600: '#FF8B00',
-          700: '#FF991F',
-          800: '#FF991F',
-          900: '#FF991F',
-        },
-        error: {
-          50: '#FFEBE6',
-          100: '#FFBDAD',
-          200: '#FF8F73',
-          300: '#FF7452',
-          400: '#FF5630',
-          500: '#DE350B',
-          600: '#BF2600',
-          700: '#DE350B',
-          800: '#DE350B',
-          900: '#DE350B',
-        },
-        // Dark mode specific colors (Orcha dark theme)
-        dark: {
-          bg: '#1a1a1a',
-          surface: '#1f1f1f',
-          surfaceHover: '#252525',
-          border: 'rgba(255, 255, 255, 0.08)',
-          text: '#ffffff',
-          textSecondary: 'rgba(255, 255, 255, 0.6)',
-        }
+        white: '#111114',
+        black: '#000000',
+        signal: { ink: '#f4f4f5', warm: '#0e0e11', lime: '#13203a', blue: '#0f1626', terra: '#6b9bff', mist: '#a1a1aa' },
+        gray: { 50: '#0e0e11', 100: '#17171b', 200: '#232327', 300: '#303036', 400: '#6e6e78', 500: '#8b8b95', 600: '#a1a1aa', 700: '#d4d4d8', 800: '#e4e4e7', 900: '#f4f4f5', 950: '#fafafa' },
+        slate: { 50: '#0e0e11', 100: '#17171b', 200: '#232327', 300: '#303036', 400: '#6e6e78', 500: '#8b8b95', 600: '#a1a1aa', 700: '#d4d4d8', 800: '#e4e4e7', 900: '#f4f4f5', 950: '#fafafa' },
+        zinc: { 50: '#0e0e11', 100: '#17171b', 200: '#232327', 300: '#303036', 400: '#6e6e78', 500: '#8b8b95', 600: '#a1a1aa', 700: '#d4d4d8', 800: '#e4e4e7', 900: '#f4f4f5', 950: '#fafafa' },
+        neutral: { 50: '#0e0e11', 100: '#17171b', 200: '#232327', 300: '#303036', 400: '#6e6e78', 500: '#8b8b95', 600: '#a1a1aa', 700: '#d4d4d8', 800: '#e4e4e7', 900: '#f4f4f5', 950: '#fafafa' },
+        primary: { 50: '#0f1626', 100: '#13203a', 200: '#1b2f57', 300: '#2a4a8a', 400: '#4a7ae0', 500: '#2f6bf2', 600: '#6b9bff', 700: '#8fb3ff', 800: '#b3cbff', 900: '#d6e3ff', 950: '#ebf1ff' },
+        blue: { 50: '#0f1626', 100: '#13203a', 200: '#1b2f57', 300: '#2a4a8a', 400: '#4a7ae0', 500: '#2f6bf2', 600: '#6b9bff', 700: '#8fb3ff', 800: '#b3cbff', 900: '#d6e3ff', 950: '#ebf1ff' },
+        sky: { 50: '#0f1626', 100: '#13203a', 200: '#1b2f57', 300: '#2a4a8a', 400: '#4a7ae0', 500: '#2f6bf2', 600: '#6b9bff', 700: '#8fb3ff', 800: '#b3cbff', 900: '#d6e3ff', 950: '#ebf1ff' },
+        indigo: { 50: '#0f1626', 100: '#13203a', 200: '#1b2f57', 300: '#2a4a8a', 400: '#4a7ae0', 500: '#2f6bf2', 600: '#6b9bff', 700: '#8fb3ff', 800: '#b3cbff', 900: '#d6e3ff', 950: '#ebf1ff' },
+        success: { 50: '#0c1a12', 100: '#10241a', 200: '#17402a', 300: '#1f6b40', 400: '#22c55e', 500: '#4ade80', 600: '#4ade80', 700: '#86efac', 800: '#bbf7d0', 900: '#dcfce7', 950: '#f0fdf4' },
+        green: { 50: '#0c1a12', 100: '#10241a', 200: '#17402a', 300: '#1f6b40', 400: '#22c55e', 500: '#4ade80', 600: '#4ade80', 700: '#86efac', 800: '#bbf7d0', 900: '#dcfce7', 950: '#f0fdf4' },
+        emerald: { 50: '#0c1a12', 100: '#10241a', 200: '#17402a', 300: '#1f6b40', 400: '#22c55e', 500: '#4ade80', 600: '#4ade80', 700: '#86efac', 800: '#bbf7d0', 900: '#dcfce7', 950: '#f0fdf4' },
+        warning: { 50: '#1f1806', 100: '#2a200a', 200: '#4a370f', 300: '#7c5a14', 400: '#f59e0b', 500: '#fbbf24', 600: '#fbbf24', 700: '#fcd34d', 800: '#fde68a', 900: '#fef3c7', 950: '#fffbeb' },
+        amber: { 50: '#1f1806', 100: '#2a200a', 200: '#4a370f', 300: '#7c5a14', 400: '#f59e0b', 500: '#fbbf24', 600: '#fbbf24', 700: '#fcd34d', 800: '#fde68a', 900: '#fef3c7', 950: '#fffbeb' },
+        yellow: { 50: '#1f1806', 100: '#2a200a', 200: '#4a370f', 300: '#7c5a14', 400: '#f59e0b', 500: '#fbbf24', 600: '#fbbf24', 700: '#fcd34d', 800: '#fde68a', 900: '#fef3c7', 950: '#fffbeb' },
+        orange: { 50: '#1f1806', 100: '#2a200a', 200: '#4a370f', 300: '#7c5a14', 400: '#f59e0b', 500: '#fbbf24', 600: '#fbbf24', 700: '#fcd34d', 800: '#fde68a', 900: '#fef3c7', 950: '#fffbeb' },
+        error: { 50: '#1f0f10', 100: '#2a1314', 200: '#4a1d1f', 300: '#7f2b2d', 400: '#ef4444', 500: '#f87171', 600: '#f87171', 700: '#fca5a5', 800: '#fecaca', 900: '#fee2e2', 950: '#fff1f1' },
+        red: { 50: '#1f0f10', 100: '#2a1314', 200: '#4a1d1f', 300: '#7f2b2d', 400: '#ef4444', 500: '#f87171', 600: '#f87171', 700: '#fca5a5', 800: '#fecaca', 900: '#fee2e2', 950: '#fff1f1' },
+        rose: { 50: '#1f0f10', 100: '#2a1314', 200: '#4a1d1f', 300: '#7f2b2d', 400: '#ef4444', 500: '#f87171', 600: '#f87171', 700: '#fca5a5', 800: '#fecaca', 900: '#fee2e2', 950: '#fff1f1' },
+        purple: { 50: '#18122a', 100: '#21183a', 200: '#352560', 300: '#5b3fa3', 400: '#8b5cf6', 500: '#a78bfa', 600: '#a78bfa', 700: '#c4b5fd', 800: '#ddd6fe', 900: '#ede9fe', 950: '#f5f3ff' },
+        violet: { 50: '#18122a', 100: '#21183a', 200: '#352560', 300: '#5b3fa3', 400: '#8b5cf6', 500: '#a78bfa', 600: '#a78bfa', 700: '#c4b5fd', 800: '#ddd6fe', 900: '#ede9fe', 950: '#f5f3ff' },
+        dark: { bg: '#09090b', surface: '#111114', surfaceHover: '#17171b', border: '#232327', text: '#f4f4f5', textSecondary: '#a1a1aa' },
       },
       fontFamily: {
-        sans: ['IBM Plex Sans', 'Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'monospace'],
+        sans: ['"Instrument Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
       },
       animation: {
         'fade-in': 'fadeIn 0.5s ease-in-out',
@@ -112,11 +68,11 @@ export default {
         },
       },
       borderRadius: {
-        'xs': '0px', 'sm': '0px', 'md': '0px', 'lg': '0px', 'xl': '0px',
+        'xs': '4px', 'sm': '6px', 'md': '8px', 'lg': '10px', 'xl': '12px', '2xl': '16px',
       },
       boxShadow: {
-        'soft': '4px 4px 0 #d87458', 'medium': '6px 6px 0 #d87458', 'strong': '8px 8px 0 #19201c',
-        'xl': '0 20px 60px rgba(0, 0, 0, 0.15)',
+        'soft': '0 1px 2px rgba(0, 0, 0, 0.3)', 'medium': '0 10px 30px -12px rgba(0, 0, 0, 0.6)', 'strong': '0 30px 80px -20px rgba(0, 0, 0, 0.8)',
+        'xl': '0 30px 80px -20px rgba(0, 0, 0, 0.8)',
       },
       backdropBlur: {
         xs: '2px',

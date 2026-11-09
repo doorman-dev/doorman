@@ -3840,3 +3840,377 @@ async fn short_window_allowances_must_block() {
     .await;
     assert_eq!(block.status(), StatusCode::CREATED);
 }
+
+// --- Budget guarantees (soft limits) ---
+
+async fn wait_for_budget(storage: &SharedStorage, id: &str, at_least: u64) -> u64 {
+    for _ in 0..100 {
+        let used = budget_used(storage, id).await;
+        if used >= at_least {
+            return used;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    budget_used(storage, id).await
+}
+
+#[tokio::test]
+async fn budget_concurrent_requests_overshoot_by_in_flight_count() {
+    let fake = FakeProvider::start(vec![Reply::Delayed(
+        Duration::from_millis(300),
+        Box::new(Reply::ok(chat_reply())),
+    )])
+    .await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one(
+            "ai_budgets",
+            budget("b1", "user", "alice", "tokens", 1, "block"),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let in_flight = 5;
+    let headers = [("authorization", auth.as_str())];
+    let responses = futures_util::future::join_all((0..in_flight).map(|_| {
+        send(
+            &h.app,
+            Method::POST,
+            CHAT,
+            &headers,
+            Some(chat_body("gpt-x")),
+        )
+    }))
+    .await;
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::OK, "pre-check saw 0 used");
+    }
+    // No reservation: every in-flight request is charged in full.
+    assert_eq!(wait_for_budget(&h.storage, "b1", 55).await, 11 * in_flight);
+    let blocked = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn budget_not_charged_for_upstream_error() {
+    let fake = FakeProvider::start(vec![Reply::status(
+        400,
+        json!({"error": {"message": "bad request"}}),
+    )])
+    .await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one(
+            "ai_budgets",
+            budget("b1", "user", "alice", "requests", 10, "block"),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    wait_for_usage(&h.storage, 1).await;
+    assert_eq!(budget_used(&h.storage, "b1").await, 0);
+}
+
+#[tokio::test]
+async fn budget_charged_when_client_disconnects_mid_stream() {
+    let mut chunks = vec![(Duration::ZERO, OPENAI_SSE[0])];
+    chunks.extend((0..20).map(|_| (Duration::from_millis(100), "data: {\"choices\":[]}\n\n")));
+    let fake = FakeProvider::start(vec![Reply::Sse(chunks)]).await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one(
+            "ai_budgets",
+            budget("b1", "user", "alice", "tokens", 1_000, "block"),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let mut body = chat_body("gpt-x");
+    body["stream"] = json!(true);
+    let response = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    use futures_util::StreamExt;
+    stream.next().await.unwrap().unwrap();
+    drop(stream);
+    assert!(
+        wait_for_budget(&h.storage, "b1", 1).await > 0,
+        "estimated usage must still be charged"
+    );
+}
+
+/// Documents a known gap: a model with no price costs 0, so a dollar budget
+/// never advances and never blocks. Token and request budgets still apply.
+#[tokio::test]
+async fn cost_budget_does_not_advance_for_unpriced_model() {
+    let fake = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    for doc in [
+        budget("cost", "user", "alice", "cost", 1, "block"),
+        budget("reqs", "user", "alice", "requests", 100, "block"),
+    ] {
+        h.storage.insert_one("ai_budgets", doc).await.unwrap();
+    }
+    let auth = bearer(&h.key);
+    for _ in 0..3 {
+        let response = send(
+            &h.app,
+            Method::POST,
+            CHAT,
+            &[("authorization", &auth)],
+            Some(chat_body("gpt-x")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(wait_for_budget(&h.storage, "reqs", 3).await, 3);
+    assert_eq!(budget_used(&h.storage, "cost").await, 0);
+}
+
+/// Collects everything the gateway logs, at every level, for leak checks.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn provider_keys_and_prompts_never_reach_logs() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let fake = FakeProvider::start(vec![
+        Reply::ok(chat_reply()),
+        Reply::status(500, json!({"error": {"message": "upstream exploded"}})),
+    ])
+    .await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    let prompt = "PROMPT-MARKER-7f3a confidential merger notes";
+    let bogus_key = "dk_bogusLeakCheckKey0123456789";
+    let body = json!({"model": "gpt-x", "messages": [{"role": "user", "content": prompt}]});
+
+    for key in [h.key.as_str(), h.key.as_str(), bogus_key] {
+        let auth = bearer(key);
+        send(
+            &h.app,
+            Method::POST,
+            CHAT,
+            &[("authorization", &auth)],
+            Some(body.clone()),
+        )
+        .await;
+    }
+    wait_for_usage(&h.storage, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("/api/ai/corp-openai"),
+        "expected request logs, got: {logs}"
+    );
+    for (what, secret) in [
+        ("provider key", UPSTREAM_KEY),
+        ("personal AI key", h.key.as_str()),
+        ("rejected AI key", bogus_key),
+        ("prompt text", "PROMPT-MARKER-7f3a"),
+    ] {
+        assert!(!logs.contains(secret), "{what} leaked into logs:\n{logs}");
+    }
+}
+
+#[tokio::test]
+async fn budget_charged_once_when_fallback_provider_serves() {
+    let primary = FakeProvider::start(vec![Reply::status(
+        503,
+        json!({"error": {"message": "overloaded"}}),
+    )])
+    .await;
+    let backup = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness(
+        "failover-openai",
+        "openai",
+        &primary.url,
+        json!({"api_ai_config": {
+            "credential_group": "prov-cred",
+            "allowed_models": ["gpt-x"],
+            "fallback_targets": [{"credential_group": "backup-cred", "server": backup.url}],
+        }}),
+    )
+    .await;
+    h.storage
+        .insert_one(
+            "credit_defs",
+            json!({"api_credit_group": "backup-cred", "api_key": "BACKUP_KEY",
+                "api_key_header": "authorization", "credit_tiers": []}),
+        )
+        .await
+        .unwrap();
+    for b in [
+        budget("req", "user", "alice", "requests", 10, "block"),
+        budget("tok", "user", "alice", "tokens", 1000, "block"),
+    ] {
+        h.storage.insert_one("ai_budgets", b).await.unwrap();
+    }
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        "/api/ai/failover-openai/v1/v1/chat/completions",
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-doorman-ai-fallbacks"], "1");
+    wait_for_usage(&h.storage, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One request reached a provider that answered: one request and its tokens are
+    // charged, not one per attempted target.
+    assert_eq!(budget_used(&h.storage, "req").await, 1);
+    assert_eq!(budget_used(&h.storage, "tok").await, 11);
+    assert_eq!(primary.calls().len(), 1);
+    assert_eq!(backup.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn budget_counters_reset_after_memory_restore() {
+    // Documented limit (user-docs/08-ai-gateway.md): memory-mode dumps hold
+    // collections, not the counters that enforce allowances. After a restart the
+    // period's usage history is intact but allowances start again from zero.
+    let fake = FakeProvider::start(vec![Reply::ok(chat_reply())]).await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one(
+            "ai_budgets",
+            budget("b1", "user", "alice", "requests", 10, "block"),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_usage(&h.storage, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(budget_used(&h.storage, "b1").await, 1);
+
+    let collections = h.storage.dump_memory_data().await.unwrap();
+    h.storage.restore_memory_data(collections).await.unwrap();
+    assert_eq!(budget_used(&h.storage, "b1").await, 0);
+    assert!(
+        !h.storage
+            .find_many("ai_usage_daily", &json!({}))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn budget_fails_open_and_uncharged_during_counter_store_outage() {
+    use doorman_gateway::middleware::chaos::{CHAOS_ENABLED, CHAOS_REDIS_OUTAGE};
+    use std::sync::atomic::Ordering;
+    // The outage switch is process-wide, so run this test alone in a child process.
+    if run_in_child(
+        "budget_fails_open_and_uncharged_during_counter_store_outage",
+        &[],
+    ) {
+        return;
+    }
+    let fake = FakeProvider::start(vec![Reply::ok(chat_reply()), Reply::ok(chat_reply())]).await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one(
+            "ai_budgets",
+            budget("b1", "user", "alice", "requests", 1, "block"),
+        )
+        .await
+        .unwrap();
+    set_budget_used(&h.storage, "b1", 1).await;
+    let auth = bearer(&h.key);
+
+    CHAOS_ENABLED.store(true, Ordering::Relaxed);
+    CHAOS_REDIS_OUTAGE.store(true, Ordering::Relaxed);
+    let during = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    let during_status = during.status();
+    let during_body = body_bytes(during).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    CHAOS_REDIS_OUTAGE.store(false, Ordering::Relaxed);
+    CHAOS_ENABLED.store(false, Ordering::Relaxed);
+    // Fails open: the counter cannot be read, so an over-allowance user gets through
+    // (logged as an error), and the request is not charged because the write fails too.
+    assert_eq!(
+        during_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&during_body)
+    );
+    assert_eq!(fake.calls().len(), 1);
+    assert_eq!(budget_used(&h.storage, "b1").await, 1);
+    // Once the store is back, the allowance is enforced again.
+    let after = send(
+        &h.app,
+        Method::POST,
+        CHAT,
+        &[("authorization", &auth)],
+        Some(chat_body("gpt-x")),
+    )
+    .await;
+    assert_eq!(after.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(fake.calls().len(), 1);
+}

@@ -1375,11 +1375,11 @@ async fn monitor_dashboard_liveness_readiness_and_metrics_parity() {
         )
         .await
         .unwrap();
-    assert_eq!(readiness.status(), StatusCode::OK);
+    let readiness_status = readiness.status();
     let (_, readiness) = response_json(readiness).await;
     assert!(matches!(
-        readiness["status"].as_str(),
-        Some("ready" | "degraded")
+        (readiness_status, readiness["status"].as_str()),
+        (StatusCode::OK, Some("ready")) | (StatusCode::SERVICE_UNAVAILABLE, Some("degraded"))
     ));
 }
 

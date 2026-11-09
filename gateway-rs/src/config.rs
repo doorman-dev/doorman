@@ -459,6 +459,16 @@ fn validate_production_secrets(storage: &SharedStorageConfig) -> Result<(), Conf
                 "production external storage requires a unique Redis password of at least 16 characters".to_owned(),
             ));
         }
+        // Provider keys and other secrets in MongoDB are only encrypted when a
+        // field-encryption key is set (MEM mode uses MEM_ENCRYPTION_KEY above).
+        let token_key = env_non_empty("TOKEN_ENCRYPTION_KEY").unwrap_or_default();
+        if token_key.len() < 32
+            || ["change-me-in-prod", "please-change-me", "changeme"].contains(&token_key.as_str())
+        {
+            return Err(ConfigError::InvalidConfiguration(
+                "production external storage requires a unique TOKEN_ENCRYPTION_KEY of at least 32 characters, so provider keys are encrypted at rest".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -740,6 +750,87 @@ mod tests {
         }
         let shared = SharedStorageConfig::from_env().unwrap();
         assert!(validate_runtime_environment(&shared).is_ok());
+    }
+
+    #[test]
+    fn unedited_env_example_is_rejected_at_startup() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let template =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env.example"))
+                .unwrap();
+        let values: Vec<(&'static str, &str)> = template
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(name, _)| !name.trim_start().starts_with('#'))
+            .map(|(name, value)| {
+                let value = value.split(" #").next().unwrap().trim();
+                (&*Box::leak(name.trim().to_owned().into_boxed_str()), value)
+            })
+            .collect();
+        let _environment = EnvRestore::set(&values);
+
+        // The template's admin password is exactly 16 characters, so the
+        // default-value check, not the length check, has to catch it.
+        assert_eq!(
+            std::env::var("DOORMAN_ADMIN_PASSWORD").unwrap(),
+            "please-change-me"
+        );
+        let storage = SharedStorageConfig::from_env().unwrap();
+        let error = validate_runtime_environment(&storage)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("DOORMAN_ADMIN_PASSWORD must not use a default value"),
+            "{error}"
+        );
+
+        unsafe { std::env::set_var("DOORMAN_ADMIN_PASSWORD", "A-real-admin-password-42") };
+        let storage = SharedStorageConfig::from_env().unwrap();
+        let error = validate_runtime_environment(&storage)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("JWT_SECRET_KEY must be at least 32 characters"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn production_external_storage_requires_token_encryption_key() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _environment = EnvRestore::set(&[
+            ("ENV", "production"),
+            ("HTTPS_ONLY", "true"),
+            ("MEM_OR_EXTERNAL", "REDIS"),
+            ("THREADS", "1"),
+            ("DOORMAN_ADMIN_PASSWORD", "ProductionAdminPassword123!"),
+            ("MONGO_DB_PASSWORD", "production-mongo-password"),
+            ("REDIS_PASSWORD", "production-redis-password"),
+            ("TOKEN_ENCRYPTION_KEY", ""),
+            ("JWT_ISSUER", "doorman-production"),
+            ("JWT_AUDIENCE", "doorman-production-api"),
+            ("ALLOWED_ORIGINS", "https://console.example.test"),
+            ("CORS_STRICT", "true"),
+            ("LOCAL_HOST_IP_BYPASS", "false"),
+            ("DISCOVERY_ALLOWED_HOSTS", "api.example.test"),
+        ]);
+        for weak in ["", "please-change-me", "too-short-for-a-key"] {
+            unsafe { std::env::set_var("TOKEN_ENCRYPTION_KEY", weak) };
+            let storage = SharedStorageConfig::from_env().unwrap();
+            let error = validate_runtime_environment(&storage)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("TOKEN_ENCRYPTION_KEY"), "{weak:?}: {error}");
+        }
+
+        unsafe {
+            std::env::set_var(
+                "TOKEN_ENCRYPTION_KEY",
+                "a-unique-token-encryption-key-of-32-plus-chars",
+            )
+        };
+        let storage = SharedStorageConfig::from_env().unwrap();
+        assert!(validate_runtime_environment(&storage).is_ok());
     }
 
     #[test]

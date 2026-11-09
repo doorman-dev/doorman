@@ -309,7 +309,7 @@ export default function FilterPanel({
                     onClick={() => toggleStatusCode(option.value)}
                     className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
                       selectedStatusCodes.includes(option.value)
-                        ? 'bg-primary-600 text-white'
+                        ? 'bg-gray-950 text-white'
                         : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
                     }`}
                   >
@@ -331,7 +331,7 @@ export default function FilterPanel({
                     onClick={() => toggleMethod(method)}
                     className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
                       selectedMethods.includes(method)
-                        ? 'bg-primary-600 text-white'
+                        ? 'bg-gray-950 text-white'
                         : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
                     }`}
                   >

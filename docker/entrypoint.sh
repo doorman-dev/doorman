@@ -113,7 +113,7 @@ if [ "${DEMO_SEED:-false}" = "true" ]; then
     if curl -sc "$cookie_file" --connect-timeout 5 --max-time 15 -H 'Content-Type: application/json' \
       -d "{\"email\":\"${DOORMAN_ADMIN_EMAIL:-admin@doorman.dev}\",\"password\":\"${DOORMAN_ADMIN_PASSWORD:-change-me}\"}" \
       "$base/platform/authorization" >/dev/null 2>&1; then
-      if curl -sb "$cookie_file" --connect-timeout 5 --max-time 300 -X POST "$base/platform/demo/seed" >/dev/null 2>&1; then
+      if curl -sfb "$cookie_file" --connect-timeout 5 --max-time 300 -X POST "$base/platform/demo/seed" >/dev/null 2>&1; then
         echo "[entrypoint] Demo seeding completed successfully"
       else
         echo "[entrypoint] Demo seeding failed (HTTP POST /platform/demo/seed returned error)"

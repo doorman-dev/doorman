@@ -1,7 +1,5 @@
 # AI Gateway
 
-Draft: endpoint and UI verification will be completed with the AI gateway rollout.
-
 Doorman gives employees and internal applications one governed endpoint for your
 organization's AI providers. Your organization supplies its own provider API keys
 (BYOK). Doorman applies existing authentication, subscriptions, groups, roles,
@@ -271,9 +269,35 @@ successfully, and token counts are known only after a response, so one large
 request can go slightly over. Doorman's normal per-user request rate limits
 also apply to AI APIs.
 
-Budgets are **soft limits**: requests already in flight can each exceed the limit
-by one request. They do not reserve cost before a generation starts. Cost limits
-are entered in dollars in the UI and stored as integer nanos in the API.
+Budgets are **soft limits**. Doorman checks the counter before a request and
+charges it after the response finishes; nothing is reserved up front. What that
+means in practice:
+
+- **Concurrent requests overshoot together.** Every request already in flight
+  when the limit is crossed is charged in full, so the total overshoot is up to
+  *requests in flight × cost of each request*.
+- **Only successful responses are charged.** Provider errors (non-2xx) do not
+  count. A stream the client abandons is still charged, using estimated usage
+  if the provider never reported it.
+- **Models without a price do not count toward USD budgets.** Their cost is
+  recorded as $0, so a USD budget never advances or blocks for them, and the
+  gateway logs a warning. Add a price for every model you budget in dollars,
+  or use a token or request budget instead. Analytics counts these as
+  *unpriced requests*.
+- **A fallback provider is charged once.** When the primary fails and a backup
+  answers, the request and the backup's tokens are charged once, not once per
+  attempted provider.
+- **Storage failures fail open.** If the counter store (Redis, or memory) cannot
+  be read, the request is allowed even for someone over their allowance; if a
+  charge cannot be written, it is logged and that spend is not counted.
+  Enforcement resumes as soon as the store is back.
+- **Counters do not survive every restart.** In shared mode they live in Redis,
+  so they survive a gateway restart but not the loss of Redis data. In memory
+  mode they are not part of the dump: after a restart, allowances start again
+  from zero for the rest of the period, although the usage history in
+  **Usage** is kept.
+
+Cost limits are entered in dollars in the UI and stored as integer nanos in the API.
 
 Review your own usage in **My AI**, **Quota → AI usage** or **My AI**.
 Administrators manage budgets in **AI Gateway → Allowances**; Groups and Users have
