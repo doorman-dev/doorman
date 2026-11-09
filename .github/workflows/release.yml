@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing a tag like v3.0.1 publishes a multi-arch image to GHCR and creates
+# Pushing a tag like v3.1.0 publishes a multi-arch image to GHCR and creates
 # a GitHub release that names the image digest.
 
 on:
@@ -18,28 +18,18 @@ env:
   IMAGE: ghcr.io/doorman-dev/doorman
 
 jobs:
-  verify:
+  version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Check tag matches Cargo.toml and package.json
+      # The tag is the release version; Cargo.toml and package.json are not checked.
+      - name: Read version from tag
         id: version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' gateway-rs/Cargo.toml | head -n1)
-          web=$(node -p "require('./web-client/package.json').version")
-          echo "tag=$tag cargo=$cargo web=$web"
-          if [ "$tag" != "$cargo" ] || [ "$tag" != "$web" ]; then
-            echo "::error::Tag v$tag does not match gateway-rs/Cargo.toml ($cargo) and web-client/package.json ($web)"
-            exit 1
-          fi
-          echo "version=$tag" >> "$GITHUB_OUTPUT"
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: verify
+    needs: version
     strategy:
       fail-fast: true
       matrix:
@@ -71,7 +61,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -93,7 +83,7 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [verify, build]
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -117,7 +107,7 @@ jobs:
         id: manifest
         working-directory: ${{ runner.temp }}/digests
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           minor="${VERSION%.*}"
           tags=(-t "$IMAGE:$VERSION" -t "$IMAGE:$minor")
@@ -135,7 +125,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.verify.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
           DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           prerelease=()

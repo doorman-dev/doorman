@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "doorman-gateway"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "aes-gcm",
  "axum",
