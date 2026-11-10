@@ -1932,7 +1932,7 @@ fn ai_allowance_error(limits: &Value, request_id: &str) -> Option<Response> {
         .filter(|(field, _)| {
             limits
                 .get(*field)
-                .is_some_and(|value| !value.is_null() && !value.as_u64().is_some_and(|n| n > 0))
+                .is_some_and(|value| !value.is_null() && value.as_u64().is_none_or(|n| n == 0))
         })
         .map(|(field, _)| {
             json!({
