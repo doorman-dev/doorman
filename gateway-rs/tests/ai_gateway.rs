@@ -2445,6 +2445,52 @@ async fn tier_token_allowance_acts_as_user_budget() {
 }
 
 #[tokio::test]
+async fn tier_cost_allowance_blocks_at_limit() {
+    let fake = FakeProvider::start(vec![Reply::ok(chat_reply()), Reply::ok(chat_reply())]).await;
+    let h = harness("corp-openai", "openai", &fake.url, json!({})).await;
+    h.storage
+        .insert_one("ai_pricing", gpt_x_price())
+        .await
+        .unwrap();
+    // One request costs 9 x $2/M + 2 x $8/M = $0.000034; the cap is $0.00003.
+    h.storage
+        .insert_one(
+            "tiers",
+            json!({"tier_id": "t-usd", "name": "pro", "display_name": "Pro", "is_default": true,
+                "enabled": true, "limits": {"ai_monthly_cost_allowance_nanos": 30_000}}),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let headers = [("authorization", auth.as_str())];
+    let call = || {
+        send(
+            &h.app,
+            Method::POST,
+            CHAT,
+            &headers,
+            Some(chat_body("gpt-x")),
+        )
+    };
+    assert_eq!(call().await.status(), StatusCode::OK);
+    for _ in 0..250 {
+        if budget_used(&h.storage, "tiercost-t-usd-alice").await > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        budget_used(&h.storage, "tiercost-t-usd-alice").await,
+        34_000
+    );
+    let response = call().await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_json(response).await;
+    assert_eq!(body["error_code"], "AI004");
+    assert_eq!(body["budget"], "Pro tier AI spend allowance");
+}
+
+#[tokio::test]
 async fn budget_charge_after_stream_end() {
     let fake = FakeProvider::start(vec![Reply::Sse(
         OPENAI_SSE
@@ -2695,7 +2741,9 @@ async fn tier_accepts_ai_monthly_token_allowance() {
     let (app, _storage) = platform_app().await;
     let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
     let tier = json!({"tier_id": "pro-ai", "name": "pro", "display_name": "Pro",
-        "limits": {"requests_per_minute": 100, "ai_monthly_token_allowance": 2_000_000}});
+        "limits": {"requests_per_minute": 100, "ai_monthly_token_allowance": 2_000_000,
+            "ai_monthly_cost_allowance_nanos": 25_000_000_000u64,
+            "ai_monthly_cost_allowance_action": "warn"}});
     let response = request(
         &app,
         Method::POST,
@@ -2720,6 +2768,14 @@ async fn tier_accepts_ai_monthly_token_allowance() {
         saved["limits"]["ai_monthly_token_allowance"], 2_000_000,
         "{saved}"
     );
+    assert_eq!(
+        saved["limits"]["ai_monthly_cost_allowance_nanos"], 25_000_000_000u64,
+        "{saved}"
+    );
+    assert_eq!(
+        saved["limits"]["ai_monthly_cost_allowance_action"], "warn",
+        "{saved}"
+    );
     let response = request(
         &app,
         Method::PUT,
@@ -2740,6 +2796,24 @@ async fn tier_accepts_ai_monthly_token_allowance() {
             "/platform/tiers/pro-ai",
             Some(&admin),
             Some(json!({"limits": {"ai_monthly_token_allowance": bad}})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        let response = request(
+            &app,
+            Method::PUT,
+            "/platform/tiers/pro-ai",
+            Some(&admin),
+            Some(json!({"limits": {"ai_monthly_cost_allowance_nanos": bad}})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        let response = request(
+            &app,
+            Method::PUT,
+            "/platform/tiers/pro-ai",
+            Some(&admin),
+            Some(json!({"limits": {"ai_monthly_cost_allowance_action": bad}})),
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");

@@ -6,6 +6,7 @@ import Link from 'next/link'
 import { useRouter, useParams } from 'next/navigation'
 import Layout from '@/components/Layout'
 import AiBudgetUsageCard from '@/components/AiBudgetUsageCard'
+import AiSpendLimitCard from '@/components/AiSpendLimitCard'
 import InfoTooltip from '@/components/InfoTooltip'
 import FormHelp from '@/components/FormHelp'
 import { fetchJson } from '@/utils/http'
@@ -530,6 +531,7 @@ const UserDetailPage = () => {
               </div>
             )}
             {/* Basic Information */}
+            <AiSpendLimitCard username={user.username} />
             <AiBudgetUsageCard scope="user" target={user.username} />
             <AiKeysPanel username={user.username} />
             <div className="card">

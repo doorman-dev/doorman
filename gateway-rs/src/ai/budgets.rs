@@ -45,6 +45,34 @@ pub struct BudgetSpec {
 }
 
 impl BudgetSpec {
+    /// A budget Doorman derives from other settings (tier limits, key limits,
+    /// the default allowance) rather than one stored in `ai_budgets`.
+    pub fn implicit(
+        budget_id: String,
+        name: String,
+        username: &str,
+        period: &str,
+        limit_type: &str,
+        limit_value: u64,
+    ) -> Self {
+        Self {
+            budget_id,
+            name,
+            scope: "user".to_owned(),
+            target: username.to_owned(),
+            period: period.to_owned(),
+            limit_type: limit_type.to_owned(),
+            limit_value,
+            action: "block".to_owned(),
+            downgrade_model: None,
+            warn_at_percent: 80,
+            enabled: true,
+            provider: None,
+            per_user: false,
+            member: None,
+        }
+    }
+
     pub fn from_value(value: &Value) -> Option<Self> {
         let text = |field: &str| value.get(field).and_then(Value::as_str).map(str::to_owned);
         Some(Self {
@@ -190,27 +218,31 @@ pub fn applicable(
             spec
         })
         .collect();
-    if let Some((tier, allowance)) = crate::policy::tier::ai_monthly_token_allowance(
-        documents,
-        username,
-        now.unix_timestamp().max(0) as u64,
-    ) {
-        specs.push(BudgetSpec {
-            budget_id: format!("tier-{tier}-{username}"),
-            name: format!("Tier {tier} AI token allowance"),
-            scope: "user".to_owned(),
-            target: username.to_owned(),
-            period: "month".to_owned(),
-            limit_type: "tokens".to_owned(),
-            limit_value: allowance,
-            action: "block".to_owned(),
-            downgrade_model: None,
-            warn_at_percent: 80,
-            enabled: true,
-            provider: None,
-            per_user: false,
-            member: None,
-        });
+    let now_seconds = now.unix_timestamp().max(0) as u64;
+    for allowance in crate::policy::tier::ai_monthly_allowances(documents, username, now_seconds) {
+        let tier = &allowance.tier_id;
+        // Each unit has its own id prefix so two counters can never share a key
+        // (`tier-…` keeps its original form so existing token usage carries over).
+        let (budget_id, name) = match allowance.unit {
+            "cost" => (
+                format!("tiercost-{tier}-{username}"),
+                format!("{} tier AI spend allowance", allowance.tier_name),
+            ),
+            _ => (
+                format!("tier-{tier}-{username}"),
+                format!("{} tier AI token allowance", allowance.tier_name),
+            ),
+        };
+        let mut spec = BudgetSpec::implicit(
+            budget_id,
+            name,
+            username,
+            "month",
+            allowance.unit,
+            allowance.amount,
+        );
+        spec.action = allowance.action.to_owned();
+        specs.push(spec);
     }
     specs.sort_by(|a, b| a.budget_id.cmp(&b.budget_id));
     specs
@@ -408,6 +440,78 @@ mod tests {
             datetime!(2026-10-26 00:00 UTC)
         );
         assert_eq!(ttl_seconds("week"), 15 * 86_400);
+    }
+
+    #[test]
+    fn tier_token_and_cost_allowances_are_separate_budgets() {
+        let documents = PolicyDocuments {
+            tiers: vec![
+                json!({"tier_id": "t1", "name": "pro", "display_name": "Pro",
+                "is_default": true, "enabled": true,
+                "limits": {"ai_monthly_token_allowance": 500,
+                    "ai_monthly_cost_allowance_nanos": 7_000_000_000u64,
+                    "ai_monthly_cost_allowance_action": "warn"}}),
+            ],
+            ..Default::default()
+        };
+        let now = datetime!(2026-10-18 12:00 UTC);
+        let specs = applicable(&documents, "bob", &[], None, None, now);
+        let summary: Vec<(&str, &str, u64, &str, &str)> = specs
+            .iter()
+            .map(|s| {
+                (
+                    s.budget_id.as_str(),
+                    s.limit_type.as_str(),
+                    s.limit_value,
+                    s.action.as_str(),
+                    s.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "tier-t1-bob",
+                    "tokens",
+                    500,
+                    "block",
+                    "Pro tier AI token allowance"
+                ),
+                (
+                    "tiercost-t1-bob",
+                    "cost",
+                    7_000_000_000,
+                    "warn",
+                    "Pro tier AI spend allowance"
+                ),
+            ]
+        );
+        // A user named like another user's cost counter never shares it.
+        let other = applicable(&documents, "bob-cost", &[], None, None, now);
+        assert!(other.iter().all(|spec| {
+            specs
+                .iter()
+                .all(|mine| mine.counter_key(now) != spec.counter_key(now))
+        }));
+    }
+
+    #[test]
+    fn override_limits_replace_the_tier_allowance() {
+        let documents = PolicyDocuments {
+            tiers: vec![
+                json!({"tier_id": "t1", "name": "pro", "is_default": true, "enabled": true,
+                "limits": {"ai_monthly_cost_allowance_nanos": 7_000_000_000u64}}),
+            ],
+            tier_assignments: vec![json!({"user_id": "bob", "tier_id": "t1",
+                "override_limits": {"ai_monthly_cost_allowance_nanos": 1_000_000_000u64}})],
+            ..Default::default()
+        };
+        let now = datetime!(2026-10-18 12:00 UTC);
+        let specs = applicable(&documents, "bob", &[], None, None, now);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].limit_value, 1_000_000_000);
+        assert_eq!(specs[0].action, "block");
     }
 
     #[test]

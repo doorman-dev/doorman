@@ -1738,9 +1738,15 @@ fn normalize_tier_limits(value: &Value) -> Result<Value, ()> {
             None => false,
         }),
     );
-    // Rust extension for AI budgets; validated by `ai_allowance_error`.
-    if let Some(value) = input.get("ai_monthly_token_allowance") {
-        output.insert("ai_monthly_token_allowance".to_owned(), value.clone());
+    // Rust extensions for AI budgets; validated by `ai_allowance_error`.
+    for field in crate::policy::tier::AI_ALLOWANCE_FIELDS
+        .iter()
+        .map(|(field, _)| *field)
+        .chain([crate::policy::tier::AI_COST_ACTION_FIELD])
+    {
+        if let Some(value) = input.get(field) {
+            output.insert(field.to_owned(), value.clone());
+        }
     }
     Ok(Value::Object(output))
 }
@@ -1918,20 +1924,39 @@ fn normalize_tier_request(path: &str, method: &Method, payload: &mut Value) -> R
     Ok(())
 }
 
-/// `limits.ai_monthly_token_allowance` (Rust extension): null or a positive integer.
+/// `limits.ai_monthly_token_allowance` and `limits.ai_monthly_cost_allowance_nanos`
+/// (Rust extensions): null or a positive integer.
 fn ai_allowance_error(limits: &Value, request_id: &str) -> Option<Response> {
-    let value = limits.get("ai_monthly_token_allowance")?;
-    if value.is_null() || value.as_u64().is_some_and(|tokens| tokens > 0) {
-        return None;
-    }
-    Some(validation_errors(
-        vec![json!({
-            "loc": ["body", "limits", "ai_monthly_token_allowance"],
-            "msg": "must be a positive integer",
-            "type": "value_error.ai"
-        })],
-        request_id,
-    ))
+    let errors: Vec<Value> = crate::policy::tier::AI_ALLOWANCE_FIELDS
+        .iter()
+        .filter(|(field, _)| {
+            limits
+                .get(*field)
+                .is_some_and(|value| !value.is_null() && !value.as_u64().is_some_and(|n| n > 0))
+        })
+        .map(|(field, _)| {
+            json!({
+                "loc": ["body", "limits", field],
+                "msg": "must be a positive integer",
+                "type": "value_error.ai"
+            })
+        })
+        .chain(
+            limits
+                .get(crate::policy::tier::AI_COST_ACTION_FIELD)
+                .filter(|value| {
+                    !value.is_null() && !matches!(value.as_str(), Some("block" | "warn"))
+                })
+                .map(|_| {
+                    json!({
+                        "loc": ["body", "limits", crate::policy::tier::AI_COST_ACTION_FIELD],
+                        "msg": "must be \"block\" or \"warn\"",
+                        "type": "value_error.ai"
+                    })
+                }),
+        )
+        .collect();
+    (!errors.is_empty()).then(|| validation_errors(errors, request_id))
 }
 
 fn tier_limits_response(limits: &Value) -> Value {

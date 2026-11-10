@@ -266,6 +266,33 @@ export function formatUsd(nanos: number | string): string {
 }
 
 /** An allowance amount in its own unit: dollars, tokens or requests. */
+/** An AI API as the API list returns it (the fields the budget screens use). */
+export type AiApiSummary = { api_name: string; api_version: string; api_type: string; api_ai_provider?: AiProvider; api_ai_config?: AiApiConfig }
+
+/**
+ * Models these APIs allow that have no price ("OpenAI gpt-x"), optionally only
+ * for one API ("name/version") or one provider. A USD limit counts them as $0.
+ */
+export function findUnpricedModels(apis: AiApiSummary[], pricing: AiPricingRow[], filter: { api?: string; provider?: string | null } = {}): string[] {
+  return [...new Set(apis
+    .filter(api => api.api_type === 'AI' && (!filter.api || `${api.api_name}/${api.api_version}` === filter.api) && (!filter.provider || api.api_ai_provider === filter.provider))
+    .flatMap(api => (api.api_ai_config?.allowed_models || []).filter(model => !model.endsWith('*'))
+      .filter(model => !pricing.some(row => row.provider === api.api_ai_provider && (row.model_pattern.endsWith('*') ? model.startsWith(row.model_pattern.slice(0, -1)) : row.model_pattern === model)))
+      .map(model => `${providerLabel(api.api_ai_provider || '')} ${model}`)))].sort()
+}
+
+/** Dollars as typed (up to nine decimals) to nano-USD; null when not a valid positive amount. */
+export const USD_PATTERN = '\\d+(\\.\\d{1,9})?'
+export function usdToNanos(text: string): number | null {
+  if (!/^\d+(?:\.\d{1,9})?$/.test(text.trim())) return null
+  const [whole, fraction = ''] = text.trim().split('.')
+  const nanos = BigInt(whole) * BigInt(1e9) + BigInt(fraction.padEnd(9, '0'))
+  return nanos <= BigInt(0) || nanos > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(nanos)
+}
+
+/** Nano-USD to a plain dollar string for an input field ("12.5"). */
+export const nanosToUsd = (nanos: number) => `${Math.trunc(nanos / 1e9)}.${String(nanos % 1e9).padStart(9, '0')}`.replace(/\.?0+$/, '')
+
 export function formatBudgetAmount(limitType: string, value: number): string {
   if (limitType === 'cost') return formatUsd(value)
   return `${formatTokens(value)} ${limitType === 'requests' ? (value === 1 ? 'request' : 'requests') : 'tokens'}`

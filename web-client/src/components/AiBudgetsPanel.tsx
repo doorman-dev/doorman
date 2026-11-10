@@ -6,9 +6,9 @@ import ConfirmModal from '@/components/ConfirmModal'
 import { delJson, fetchAllPaginated, getJson, postJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
 import AiBudgetBar from '@/components/AiBudgetBar'
-import { aiValidationErrors, formatBudgetAmount, providerLabel, type AiApiConfig, type AiBudget, type AiBudgetListRow, type AiBudgetScope, type AiPricingRow, type AiProvider } from '@/utils/ai'
+import { aiValidationErrors, findUnpricedModels, formatBudgetAmount, nanosToUsd, usdToNanos, providerLabel, type AiApiSummary, type AiBudget, type AiBudgetListRow, type AiBudgetScope, type AiPricingRow, type AiProvider } from '@/utils/ai'
 
-type Api = { api_name: string; api_version: string; api_type: string; api_ai_provider?: AiProvider; api_ai_config?: AiApiConfig }
+type Api = AiApiSummary
 const SCOPES: [AiBudgetScope, string][] = [['global', 'Everyone'], ['group', 'Group'], ['tier', 'Tier'], ['user', 'One user'], ['api', 'One AI API']]
 const scopeLabel = (scope: string) => SCOPES.find(([id]) => id === scope)?.[1] || scope
 type Draft = Omit<AiBudget, 'limit_value'> & { limit: string }
@@ -17,7 +17,6 @@ const ACTION_LABELS: Record<string, string> = { warn: 'Warn', block: 'Block', do
 const shortWindow = (period: string) => period === 'minute' || period === 'hour'
 
 const fresh = (): Draft => ({ budget_id: '', name: '', scope: 'global', target: '', period: 'month', limit_type: 'cost', limit: '', action: 'warn', downgrade_model: null, warn_at_percent: 80, enabled: true, provider: null, per_user: false })
-const dollars = (nanos: number) => `${Math.trunc(nanos / 1e9)}.${String(nanos % 1e9).padStart(9, '0')}`.replace(/\.?0+$/, '')
 
 export default function AiBudgetsPanel() {
   const [rows, setRows] = useState<AiBudgetListRow[]>([])
@@ -67,11 +66,7 @@ export default function AiBudgetsPanel() {
     return result.map(row => row[kind === 'user' ? 'username' : 'group_name']).filter(Boolean)
   }
   // Models these APIs allow that have no price: a USD limit never counts their spend.
-  const unpricedModels = draft?.limit_type === 'cost' && pricing ? [...new Set(apis
-    .filter(api => (draft.scope !== 'api' || `${api.api_name}/${api.api_version}` === draft.target) && (!draft.provider || api.api_ai_provider === draft.provider))
-    .flatMap(api => (api.api_ai_config?.allowed_models || []).filter(model => !model.endsWith('*'))
-      .filter(model => !pricing.some(row => row.provider === api.api_ai_provider && (row.model_pattern.endsWith('*') ? model.startsWith(row.model_pattern.slice(0, -1)) : row.model_pattern === model)))
-      .map(model => `${providerLabel(api.api_ai_provider || '')} ${model}`)))].sort() : []
+  const unpricedModels = draft?.limit_type === 'cost' && pricing ? findUnpricedModels(apis, pricing, { api: draft.scope === 'api' ? draft.target : undefined, provider: draft.provider }) : []
   const models = [...new Set(apis.flatMap(api => [...(api.api_ai_config?.allowed_models || []).filter(model => !model.endsWith('*')), ...Object.values(api.api_ai_config?.model_aliases || {})]))].sort()
   const update = (value: Partial<Draft>) => setDraft(current => current ? { ...current, ...value } : current)
   const save = async (event: React.FormEvent) => {
@@ -80,9 +75,9 @@ export default function AiBudgetsPanel() {
     setFields({}); setError(null)
     let limit: bigint
     if (draft.limit_type === 'cost') {
-      if (!/^\d+(?:\.\d{1,9})?$/.test(draft.limit)) { setFields({ limit_value: 'Enter dollars with at most nine decimal places.' }); return }
-      const [whole, fraction = ''] = draft.limit.split('.')
-      limit = BigInt(whole) * BigInt(1e9) + BigInt(fraction.padEnd(9, '0'))
+      const nanos = usdToNanos(draft.limit)
+      if (nanos === null) { setFields({ limit_value: 'Enter a positive dollar amount with at most nine decimal places.' }); return }
+      limit = BigInt(nanos)
     } else {
       if (!/^\d+$/.test(draft.limit)) { setFields({ limit_value: `Enter a positive whole number of ${draft.limit_type}.` }); return }
       limit = BigInt(draft.limit)
@@ -109,7 +104,7 @@ export default function AiBudgetsPanel() {
   return <div className="card p-6 space-y-4">
     <div className="flex justify-between gap-3"><div><p className="text-sm text-gray-500">Checked before each request. Requests already running can go slightly over.</p></div><button type="button" className="btn btn-primary shrink-0 self-start" onClick={() => { setDraft(fresh()); setFields({}); setError(null) }}>Add allowance</button></div>
     {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
-    {loading ? <p className="text-sm text-gray-500">Loading allowances…</p> : <>{rows.length ? <div className="overflow-x-auto"><table className="table w-full text-sm"><thead><tr><th>Name</th><th>Applies to</th><th>Period</th><th>Limit</th><th>Action</th><th>Used</th><th /></tr></thead><tbody>{rows.map(row => <tr key={row.budget_id}><td>{row.name}{!row.enabled && <span className="block text-xs">Disabled</span>}</td><td>{scopeLabel(row.scope)}{row.target && <span className="block text-xs font-mono">{row.target}</span>}{row.per_user && row.scope !== 'user' && <span className="block text-xs text-gray-500">Each member</span>}{row.provider && <span className="block text-xs text-gray-500">{providerLabel(row.provider)} only</span>}</td><td>{PERIOD_LABELS[row.period] || row.period}</td><td>{formatBudgetAmount(row.limit_type, row.limit_value)}</td><td>{ACTION_LABELS[row.action] || row.action}{row.downgrade_model && <span className="block text-xs">{row.downgrade_model}</span>}</td><td>{row.percent == null ? <p className="text-sm">{formatBudgetAmount(row.limit_type, row.used)} total<span className="block text-xs text-gray-500">across members; limit is per member</span></p> : <><p>{row.percent}%</p><AiBudgetBar percent={row.percent} warnAt={row.warn_at_percent} label={`${row.name} usage`} className="max-w-[10rem]" /></>}<p className="text-xs text-gray-500">Resets {shortWindow(row.period) ? new Date(row.resets_at).toLocaleTimeString() : new Date(row.resets_at).toLocaleDateString()}</p></td><td><div className="flex gap-2"><button type="button" className="btn btn-ghost" onClick={() => { setDraft({ ...row, limit: row.limit_type === 'cost' ? dollars(row.limit_value) : String(row.limit_value) }); setFields({}); setError(null) }}>Edit</button><button type="button" className="btn btn-ghost" onClick={() => setRemoving(row)}>Delete</button></div></td></tr>)}</tbody></table></div> : <p className="text-sm text-gray-500">No allowances yet.</p>}</>}
+    {loading ? <p className="text-sm text-gray-500">Loading allowances…</p> : <>{rows.length ? <div className="overflow-x-auto"><table className="table w-full text-sm"><thead><tr><th>Name</th><th>Applies to</th><th>Period</th><th>Limit</th><th>Action</th><th>Used</th><th /></tr></thead><tbody>{rows.map(row => <tr key={row.budget_id}><td>{row.name}{!row.enabled && <span className="block text-xs">Disabled</span>}</td><td>{scopeLabel(row.scope)}{row.target && <span className="block text-xs font-mono">{row.target}</span>}{row.per_user && row.scope !== 'user' && <span className="block text-xs text-gray-500">Each member</span>}{row.provider && <span className="block text-xs text-gray-500">{providerLabel(row.provider)} only</span>}</td><td>{PERIOD_LABELS[row.period] || row.period}</td><td>{formatBudgetAmount(row.limit_type, row.limit_value)}</td><td>{ACTION_LABELS[row.action] || row.action}{row.downgrade_model && <span className="block text-xs">{row.downgrade_model}</span>}</td><td>{row.percent == null ? <p className="text-sm">{formatBudgetAmount(row.limit_type, row.used)} total<span className="block text-xs text-gray-500">across members; limit is per member</span></p> : <><p>{row.percent}%</p><AiBudgetBar percent={row.percent} warnAt={row.warn_at_percent} label={`${row.name} usage`} className="max-w-[10rem]" /></>}<p className="text-xs text-gray-500">Resets {shortWindow(row.period) ? new Date(row.resets_at).toLocaleTimeString() : new Date(row.resets_at).toLocaleDateString()}</p></td><td><div className="flex gap-2"><button type="button" className="btn btn-ghost" onClick={() => { setDraft({ ...row, limit: row.limit_type === 'cost' ? nanosToUsd(row.limit_value) : String(row.limit_value) }); setFields({}); setError(null) }}>Edit</button><button type="button" className="btn btn-ghost" onClick={() => setRemoving(row)}>Delete</button></div></td></tr>)}</tbody></table></div> : <p className="text-sm text-gray-500">No allowances yet.</p>}</>}
     {draft && <div className="fixed inset-0 bg-black/50 z-[60] flex justify-end"><form role="dialog" aria-modal="true" aria-label={draft.budget_id ? 'Edit allowance' : 'Add allowance'} onSubmit={save} className="bg-white dark:bg-gray-900 w-full max-w-xl h-full overflow-y-auto p-6 space-y-4"><h3 className="text-lg font-semibold">{draft.budget_id ? 'Edit allowance' : 'Add allowance'}</h3>
       <label className="block text-sm">Name<input className="input w-full mt-1" required value={draft.name} onChange={event => update({ name: event.target.value })} />{issue('name')}</label>
       <label className="block text-sm">Scope<select className="input w-full mt-1" value={draft.scope} onChange={event => update({ scope: event.target.value as AiBudgetScope, target: '', per_user: event.target.value === 'user' ? false : draft.per_user })}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{issue('scope')}</label>

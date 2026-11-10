@@ -6,6 +6,7 @@ import Layout from '@/components/Layout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { getJson, delJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
+import { formatUsd } from '@/utils/ai'
 
 interface TierLimits {
   requests_per_second?: number
@@ -19,6 +20,9 @@ interface TierLimits {
   monthly_request_quota?: number
   daily_request_quota?: number
   monthly_bandwidth_quota?: number
+  ai_monthly_token_allowance?: number | null
+  ai_monthly_cost_allowance_nanos?: number | null
+  ai_monthly_cost_allowance_action?: 'block' | 'warn' | null
   enable_throttling: boolean
   max_queue_time_ms: number
 }
@@ -292,6 +296,22 @@ export default function TiersPage() {
                           <span className="text-gray-600 dark:text-gray-400">Monthly Quota:</span>
                           <span className="font-semibold text-gray-900 dark:text-white">
                             {formatNumber(tier.limits.monthly_request_quota)}
+                          </span>
+                        </div>
+                      )}
+                      {!!tier.limits.ai_monthly_cost_allowance_nanos && (
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600 dark:text-gray-400">AI spend cap:</span>
+                          <span className="font-semibold text-gray-900 dark:text-white">
+                            {formatUsd(tier.limits.ai_monthly_cost_allowance_nanos)}/mo{tier.limits.ai_monthly_cost_allowance_action === 'warn' ? ' (warn)' : ''}
+                          </span>
+                        </div>
+                      )}
+                      {!!tier.limits.ai_monthly_token_allowance && (
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600 dark:text-gray-400">AI token cap:</span>
+                          <span className="font-semibold text-gray-900 dark:text-white">
+                            {formatNumber(tier.limits.ai_monthly_token_allowance)}/mo
                           </span>
                         </div>
                       )}

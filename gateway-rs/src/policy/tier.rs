@@ -125,33 +125,71 @@ pub async fn enforce(
     Ok(smallest)
 }
 
-/// The user's effective `limits.ai_monthly_token_allowance` (override limits,
-/// then the assigned tier, then the default tier) as `(tier_id, tokens)`.
-pub fn ai_monthly_token_allowance(
+/// Tier limits that act as monthly AI allowances: `(limit field, budget unit)`.
+pub const AI_ALLOWANCE_FIELDS: [(&str, &str); 2] = [
+    ("ai_monthly_token_allowance", "tokens"),
+    ("ai_monthly_cost_allowance_nanos", "cost"),
+];
+
+/// What a tier's dollar allowance does at the cap: `block` (default) or `warn`.
+pub const AI_COST_ACTION_FIELD: &str = "ai_monthly_cost_allowance_action";
+
+/// One monthly AI allowance a user gets from their tier (or override limits).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierAllowance {
+    pub tier_id: String,
+    /// The tier's display name, for messages people read.
+    pub tier_name: String,
+    /// Budget unit: `tokens` or `cost` (nano-USD).
+    pub unit: &'static str,
+    pub amount: u64,
+    pub action: &'static str,
+}
+
+/// The user's effective monthly AI allowances (override limits, then the
+/// assigned tier, then the default tier).
+pub fn ai_monthly_allowances(
     documents: &PolicyDocuments,
     username: &str,
     now_seconds: u64,
-) -> Option<(String, u64)> {
-    let limits = effective_limits(documents, username, now_seconds)?;
-    let allowance = limits
-        .get("ai_monthly_token_allowance")
-        .and_then(Value::as_u64)
-        .filter(|tokens| *tokens > 0)?;
-    let tier = documents
-        .tier_assignments
+) -> Vec<TierAllowance> {
+    let Some(limits) = effective_limits(documents, username, now_seconds) else {
+        return Vec::new();
+    };
+    let tier_id = user_tier_id(documents, username).unwrap_or_else(|| "override".to_owned());
+    let tier_name = documents
+        .tiers
         .iter()
-        .find(|value| string_field(value, "user_id") == Some(username))
-        .and_then(|value| string_field(value, "tier_id"))
-        .or_else(|| {
-            documents
-                .tiers
-                .iter()
-                .find(|value| bool_field_default(value, "is_default", false))
-                .and_then(|value| string_field(value, "tier_id"))
+        .find(|value| string_field(value, "tier_id") == Some(tier_id.as_str()))
+        .and_then(|value| {
+            string_field(value, "display_name").or_else(|| string_field(value, "name"))
         })
-        .unwrap_or("override")
+        .unwrap_or(tier_id.as_str())
         .to_owned();
-    Some((tier, allowance))
+    let cost_action = match limits.get(AI_COST_ACTION_FIELD).and_then(Value::as_str) {
+        Some("warn") => "warn",
+        _ => "block",
+    };
+    AI_ALLOWANCE_FIELDS
+        .iter()
+        .filter_map(|(field, unit)| {
+            let amount = limits
+                .get(*field)
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)?;
+            Some(TierAllowance {
+                tier_id: tier_id.clone(),
+                tier_name: tier_name.clone(),
+                unit,
+                amount,
+                action: if *unit == "cost" {
+                    cost_action
+                } else {
+                    "block"
+                },
+            })
+        })
+        .collect()
 }
 
 /// The user's assigned tier, or the default tier when they have none.

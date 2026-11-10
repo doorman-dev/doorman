@@ -6,6 +6,8 @@ import Layout from '@/components/Layout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { getJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
+import UnpricedModelsNotice from '@/components/UnpricedModelsNotice'
+import { nanosToUsd, USD_PATTERN, usdToNanos } from '@/utils/ai'
 
 export default function EditTierPage() {
   const router = useRouter()
@@ -32,6 +34,8 @@ export default function EditTierPage() {
     monthly_request_quota: '',
     daily_request_quota: '',
     ai_monthly_token_allowance: '',
+    ai_monthly_cost_allowance_usd: '',
+    ai_monthly_cost_allowance_action: 'block',
     // Throttling
     enable_throttling: false,
     max_queue_time_ms: '5000'
@@ -70,6 +74,8 @@ export default function EditTierPage() {
         monthly_request_quota: (hasRateLimits && tier.limits?.monthly_request_quota && tier.limits.monthly_request_quota < 999999) ? tier.limits.monthly_request_quota.toString() : '',
         daily_request_quota: (hasRateLimits && tier.limits?.daily_request_quota && tier.limits.daily_request_quota < 999999) ? tier.limits.daily_request_quota.toString() : '',
         ai_monthly_token_allowance: tier.limits?.ai_monthly_token_allowance?.toString() || '',
+        ai_monthly_cost_allowance_usd: tier.limits?.ai_monthly_cost_allowance_nanos ? nanosToUsd(tier.limits.ai_monthly_cost_allowance_nanos) : '',
+        ai_monthly_cost_allowance_action: tier.limits?.ai_monthly_cost_allowance_action === 'warn' ? 'warn' : 'block',
         enable_throttling: tier.limits?.enable_throttling || false,
         max_queue_time_ms: tier.limits?.max_queue_time_ms?.toString() || '5000'
       })
@@ -107,6 +113,8 @@ export default function EditTierPage() {
           monthly_request_quota: rateLimitingDisabled ? unlimitedValue : (formData.monthly_request_quota ? parseInt(formData.monthly_request_quota) : undefined),
           daily_request_quota: rateLimitingDisabled ? unlimitedValue : (formData.daily_request_quota ? parseInt(formData.daily_request_quota) : undefined),
           ai_monthly_token_allowance: formData.ai_monthly_token_allowance ? Number(formData.ai_monthly_token_allowance) : null,
+          ai_monthly_cost_allowance_nanos: formData.ai_monthly_cost_allowance_usd ? usdToNanos(formData.ai_monthly_cost_allowance_usd) : null,
+          ai_monthly_cost_allowance_action: formData.ai_monthly_cost_allowance_action,
           burst_per_second: 0,
           burst_per_minute: 0,
           burst_per_hour: 0,
@@ -220,6 +228,20 @@ export default function EditTierPage() {
                 <input type="number" min={1} step={1} name="ai_monthly_token_allowance" value={formData.ai_monthly_token_allowance} onChange={handleChange} className="input w-full mt-2" placeholder="No AI token cap" />
               </label>
               <p className="text-xs text-gray-500 mt-2">Applies as a per-user monthly token cap for users in this tier. Leave blank for no tier allowance.</p>
+            </div>
+
+            <div className="card p-6">
+              <label className="block text-sm font-medium" title="A per-user monthly spend cap in US dollars for users in this tier.">AI monthly spend cap (USD)
+                <input type="text" inputMode="decimal" pattern={USD_PATTERN} title="A dollar amount, e.g. 25 or 12.50" name="ai_monthly_cost_allowance_usd" value={formData.ai_monthly_cost_allowance_usd} onChange={handleChange} className="input w-full mt-2" placeholder="No AI spend cap" />
+              </label>
+              <label className="block text-sm font-medium mt-4">At the cap
+                <select name="ai_monthly_cost_allowance_action" value={formData.ai_monthly_cost_allowance_action} onChange={handleChange} className="input w-full mt-2">
+                  <option value="block">Block requests</option>
+                  <option value="warn">Warn only</option>
+                </select>
+              </label>
+              <p className="text-xs text-gray-500 mt-2">Each user in this tier can spend up to this much on AI per month and is warned at 80%. Leave blank for no cap.</p>
+              <div className="mt-3"><UnpricedModelsNotice /></div>
             </div>
 
             {/* Pricing */}
