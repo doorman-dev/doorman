@@ -8,7 +8,7 @@ services:
       args:
         NEXT_PUBLIC_PROTECTED_USERS: demo@doorman.dev
         NEXT_PUBLIC_GATEWAY_URL: ""
-    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.1.0}
+    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.2.0}
     container_name: doorman-demo
     ports:
       - "${PORT:-3001}:${PORT:-3001}"

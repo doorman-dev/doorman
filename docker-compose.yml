@@ -14,7 +14,7 @@ services:
       args:
         NEXT_PUBLIC_PROTECTED_USERS: ${NEXT_PUBLIC_PROTECTED_USERS:-}
         NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL:-}
-    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.1.0}
+    image: ${DOORMAN_IMAGE:-ghcr.io/doorman-dev/doorman:3.2.0}
     pull_policy: missing
     container_name: doorman
     ports:
