@@ -427,7 +427,7 @@ metadata:
 spec:
   containers:
   - name: backend
-    image: ghcr.io/doorman-dev/doorman:3.1.0
+    image: ghcr.io/doorman-dev/doorman:3.2.0
     livenessProbe:
       httpGet:
         path: /platform/monitor/liveness
@@ -994,7 +994,7 @@ curl -s http://127.0.0.1:3001/platform/monitor/readiness   # body must say "read
 
 # Roll back: same steps with the previous tag. If the new version changed stored
 # data in a way the old one cannot read, restore the backup from step 1 first.
-export DOORMAN_IMAGE=ghcr.io/doorman-dev/doorman:3.1.0
+export DOORMAN_IMAGE=ghcr.io/doorman-dev/doorman:3.2.0
 docker compose up -d doorman
 ```
 
