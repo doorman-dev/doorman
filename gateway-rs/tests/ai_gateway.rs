@@ -17,7 +17,8 @@ use uuid::Uuid;
 #[path = "common/ai.rs"]
 mod ai_common;
 use ai_common::{
-    FakeProvider, Reply, UPSTREAM_KEY, body_bytes, body_json, harness, harness_with, send,
+    BEDROCK_IAM_KEY, FakeProvider, Reply, UPSTREAM_KEY, body_bytes, body_json, harness,
+    harness_with, harness_with_key, send, vertex_service_account,
 };
 use std::time::Duration;
 
@@ -1122,7 +1123,9 @@ async fn ai_providers_catalog_lists_all_providers() {
             "anthropic",
             "gemini",
             "azure_openai",
-            "openai_compatible"
+            "openai_compatible",
+            "bedrock",
+            "vertex"
         ]
     );
     for provider in providers {
@@ -3557,9 +3560,11 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
         vec![
             "anthropic",
             "azure_openai",
+            "bedrock",
             "gemini",
             "openai",
-            "openai_compatible"
+            "openai_compatible",
+            "vertex"
         ]
     );
     for api in &apis {
@@ -3624,7 +3629,7 @@ async fn demo_seed_creates_keyless_ai_apis_and_usage() {
             .await
             .unwrap()
             .len(),
-        5
+        7
     );
     assert_eq!(
         storage
@@ -4295,4 +4300,531 @@ async fn budget_fails_open_and_uncharged_during_counter_store_outage() {
     .await;
     assert_eq!(after.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(fake.calls().len(), 1);
+}
+
+// ---- Step 4: Google Vertex AI (B4) ----
+
+const VERTEX_CLAUDE_STREAM: &str = "/api/ai/corp-vertex/v1/v1/projects/any-project/locations/anywhere/publishers/anthropic/models/claude-opus-5-5:streamRawPredict";
+
+async fn vertex_harness(fake: &FakeProvider, project: &str) -> ai_common::Harness {
+    harness_with_key(
+        "corp-vertex",
+        "vertex",
+        &fake.url,
+        json!({"api_ai_config": {
+            "credential_group": "prov-cred",
+            "allowed_models": ["claude-opus-5-5", "gemini-x"],
+            "region": "us-east5",
+        }}),
+        &vertex_service_account(fake, project),
+        |_| {},
+    )
+    .await
+}
+
+fn vertex_claude_body() -> Value {
+    json!({"anthropic_version": "vertex-2023-10-16", "max_tokens": 64, "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]})
+}
+
+#[tokio::test]
+async fn vertex_claude_stream_signs_in_once_and_fills_project_and_location() {
+    let fake = FakeProvider::start(vec![Reply::Sse(
+        ANTHROPIC_SSE
+            .iter()
+            .map(|chunk| (Duration::from_millis(5), *chunk))
+            .collect(),
+    )])
+    .await;
+    let h = vertex_harness(&fake, "acme-ai").await;
+    let auth = bearer(&h.key);
+    for _ in 0..2 {
+        let response = send(
+            &h.app,
+            Method::POST,
+            VERTEX_CLAUDE_STREAM,
+            &[("authorization", &auth)],
+            Some(vertex_claude_body()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(response).await,
+            ANTHROPIC_SSE.concat().as_bytes()
+        );
+    }
+    // One token exchange serves both requests.
+    assert_eq!(fake.token_calls(), 1);
+    let call = fake.last();
+    assert_eq!(
+        call.path_and_query,
+        "/v1/projects/acme-ai/locations/us-east5/publishers/anthropic/models/claude-opus-5-5:streamRawPredict"
+    );
+    assert_eq!(call.headers["authorization"], "Bearer ya29.fake-token-1");
+    assert!(call.json().get("model").is_none());
+    assert_eq!(
+        call.json()["metadata"]["user_id"],
+        doorman_gateway::ai::hashed_user_id("alice")
+    );
+    let row = wait_for_usage(&h.storage, 2).await;
+    assert_eq!(row["provider"], "vertex");
+    assert_eq!(row["model"], "claude-opus-5-5");
+    assert_eq!(row["input_tokens"], 24);
+    assert_eq!(row["output_tokens"], 10);
+}
+
+#[tokio::test]
+async fn vertex_gemini_generate_redacts_input_and_records_usage() {
+    let fake = FakeProvider::start(vec![Reply::ok(json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "Hello"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10}
+    }))])
+    .await;
+    let h = vertex_harness(&fake, "acme-ai").await;
+    h.storage
+        .insert_one(
+            "ai_guardrails",
+            guardrail(
+                "pii",
+                "input",
+                json!([{"type": "builtin", "id": "email"}]),
+                "redact",
+            ),
+        )
+        .await
+        .unwrap();
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        "/api/ai/corp-vertex/v1/v1/projects/p/locations/l/publishers/google/models/gemini-x:generateContent",
+        &[("authorization", &auth)],
+        Some(json!({"contents": [{"role": "user", "parts": [{"text": "mail jane@example.com"}]}]})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-doorman-ai-redactions"], "1");
+    let call = fake.last();
+    assert_eq!(
+        call.path_and_query,
+        "/v1/projects/acme-ai/locations/us-east5/publishers/google/models/gemini-x:generateContent"
+    );
+    assert!(!String::from_utf8_lossy(&call.body).contains("jane@example.com"));
+    let row = wait_for_usage(&h.storage, 1).await;
+    assert_eq!(row["provider"], "vertex");
+    assert_eq!(row["model"], "gemini-x");
+    assert_eq!(row["input_tokens"], 7);
+    assert_eq!(row["output_tokens"], 3);
+}
+
+#[tokio::test]
+async fn vertex_rejects_models_outside_the_allowlist() {
+    let fake = FakeProvider::start(vec![Reply::ok(json!({}))]).await;
+    let h = vertex_harness(&fake, "acme-ai").await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        "/api/ai/corp-vertex/v1/v1/projects/p/locations/l/publishers/google/models/gemini-other:generateContent",
+        &[("authorization", &auth)],
+        Some(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["error_code"], "AI002");
+    assert!(fake.calls().is_empty());
+    assert_eq!(
+        fake.token_calls(),
+        0,
+        "no sign-in before policy checks pass"
+    );
+}
+
+#[tokio::test]
+async fn vertex_sign_in_failure_is_ai011_not_cached_and_never_logged() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let fake = FakeProvider::start(vec![Reply::Sse(
+        ANTHROPIC_SSE
+            .iter()
+            .map(|chunk| (Duration::ZERO, *chunk))
+            .collect(),
+    )])
+    .await;
+    let h = vertex_harness(&fake, "acme-ai").await;
+    let auth = bearer(&h.key);
+    fake.set_token_status(500);
+    let response = send(
+        &h.app,
+        Method::POST,
+        VERTEX_CLAUDE_STREAM,
+        &[("authorization", &auth)],
+        Some(vertex_claude_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(body_json(response).await["error_code"], "AI011");
+    assert!(fake.calls().is_empty());
+
+    // The failure was not cached: the next request signs in again.
+    fake.set_token_status(200);
+    let response = send(
+        &h.app,
+        Method::POST,
+        VERTEX_CLAUDE_STREAM,
+        &[("authorization", &auth)],
+        Some(vertex_claude_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+    assert_eq!(fake.token_calls(), 2);
+    wait_for_usage(&h.storage, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("AI provider sign-in failed"), "{logs}");
+    let private_key = include_str!("fixtures/ai/vertex/private.pem");
+    let key_line = private_key.lines().nth(1).unwrap();
+    for (what, secret) in [
+        ("service-account key", key_line),
+        ("access token", "ya29.fake-token"),
+        ("personal AI key", h.key.as_str()),
+    ] {
+        assert!(!logs.contains(secret), "{what} leaked into logs");
+    }
+}
+
+// ---- Step 4: Amazon Bedrock (B5) ----
+
+const BEDROCK_MODEL: &str = "us.anthropic.claude-sonnet-5-5-v1:0";
+const BEDROCK_MODEL_PATH: &str = "us.anthropic.claude-sonnet-5-5-v1%3A0";
+
+async fn bedrock_harness(fake: &FakeProvider, key: &str, extra: Value) -> ai_common::Harness {
+    let mut config = json!({
+        "credential_group": "prov-cred",
+        "allowed_models": ["us.anthropic.*", "meta.llama4-demo-v1:0"],
+        "region": "us-west-2",
+    });
+    for (name, value) in extra.as_object().unwrap() {
+        config[name] = value.clone();
+    }
+    harness_with_key(
+        "corp-bedrock",
+        "bedrock",
+        &fake.url,
+        json!({"api_ai_config": config}),
+        key,
+        |_| {},
+    )
+    .await
+}
+
+fn bedrock_url(operation: &str) -> String {
+    format!("/api/ai/corp-bedrock/v1/model/{BEDROCK_MODEL_PATH}/{operation}")
+}
+
+fn converse_body() -> Value {
+    json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        "inferenceConfig": {"maxTokens": 64}})
+}
+
+fn converse_reply() -> Value {
+    json!({"output": {"message": {"role": "assistant", "content": [{"text": "Hello"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 9, "outputTokens": 4, "totalTokens": 13},
+        "metrics": {"latencyMs": 100}})
+}
+
+fn bedrock_event(event_type: &str, payload: Value) -> Vec<u8> {
+    doorman_gateway::ai::eventstream::encode(
+        &[
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+            (":message-type", "event"),
+        ],
+        payload.to_string().as_bytes(),
+    )
+}
+
+/// Splits a byte stream into awkward chunks so frames cross chunk boundaries.
+fn rechunk(bytes: &[u8], size: usize) -> Vec<Vec<u8>> {
+    bytes.chunks(size).map(<[u8]>::to_vec).collect()
+}
+
+/// Recomputes the SigV4 signature the fake received and compares it.
+fn assert_signed(call: &ai_common::Captured, server: &str, region: &str) {
+    use doorman_gateway::ai::sigv4;
+    let authorization = call.headers["authorization"].to_str().unwrap();
+    assert!(
+        authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+            && authorization.contains(&format!("/{region}/bedrock/aws4_request")),
+        "{authorization}"
+    );
+    let amz_date = call.headers["x-amz-date"].to_str().unwrap();
+    let now = time::PrimitiveDateTime::parse(
+        amz_date,
+        time::macros::format_description!("[year][month][day]T[hour][minute][second]Z"),
+    )
+    .unwrap()
+    .assume_utc();
+    let mut headers = http::HeaderMap::new();
+    if let Some(content_type) = call.headers.get(header::CONTENT_TYPE) {
+        headers.insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    let url = url::Url::parse(&format!("{server}{}", call.path_and_query)).unwrap();
+    let credentials = sigv4::Credentials {
+        access_key_id: "AKIDEXAMPLE".into(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+        session_token: None,
+    };
+    sigv4::sign(
+        &credentials,
+        region,
+        "bedrock",
+        &call.method,
+        &url,
+        &mut headers,
+        &call.body,
+        now,
+    );
+    assert_eq!(headers["authorization"].to_str().unwrap(), authorization);
+}
+
+#[tokio::test]
+async fn bedrock_converse_is_signed_and_secrets_never_logged() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let fake = FakeProvider::start(vec![Reply::ok(converse_reply())]).await;
+    let h = bedrock_harness(&fake, BEDROCK_IAM_KEY, json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("converse"),
+        &[
+            ("authorization", &auth),
+            ("x-amz-security-token", "client-token-must-not-pass"),
+        ],
+        Some(converse_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await, converse_reply());
+    let call = fake.last();
+    assert_eq!(
+        call.path_and_query,
+        format!("/model/{BEDROCK_MODEL_PATH}/converse")
+    );
+    assert!(call.headers.get("x-amz-security-token").is_none());
+    assert_signed(&call, &fake.url, "us-west-2");
+    let row = wait_for_usage(&h.storage, 1).await;
+    assert_eq!(row["provider"], "bedrock");
+    assert_eq!(row["model"], BEDROCK_MODEL);
+    assert_eq!(row["input_tokens"], 9);
+    assert_eq!(row["output_tokens"], 4);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    for (what, secret) in [
+        ("IAM secret", "wJalrXUtnFEMI"),
+        ("personal AI key", h.key.as_str()),
+    ] {
+        assert!(!logs.contains(secret), "{what} leaked into logs");
+    }
+}
+
+#[tokio::test]
+async fn bedrock_api_key_is_sent_as_bearer_without_sigv4() {
+    let fake = FakeProvider::start(vec![Reply::ok(converse_reply())]).await;
+    let h = bedrock_harness(&fake, "bedrock-api-key-fixture", json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("converse"),
+        &[("authorization", &auth)],
+        Some(converse_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let call = fake.last();
+    assert_eq!(
+        call.headers["authorization"],
+        "Bearer bedrock-api-key-fixture"
+    );
+    assert!(call.headers.get("x-amz-date").is_none());
+}
+
+#[tokio::test]
+async fn bedrock_converse_stream_passes_frames_and_records_usage() {
+    let mut stream = Vec::new();
+    stream.extend(bedrock_event("messageStart", json!({"role": "assistant"})));
+    stream.extend(bedrock_event(
+        "contentBlockDelta",
+        json!({"contentBlockIndex": 0, "delta": {"text": "Hello"}}),
+    ));
+    stream.extend(bedrock_event(
+        "messageStop",
+        json!({"stopReason": "end_turn"}),
+    ));
+    stream.extend(bedrock_event(
+        "metadata",
+        json!({"usage": {"inputTokens": 11, "outputTokens": 6, "totalTokens": 17},
+            "metrics": {"latencyMs": 90}}),
+    ));
+    let fake = FakeProvider::start(vec![Reply::Binary {
+        content_type: "application/vnd.amazon.eventstream",
+        chunks: rechunk(&stream, 7),
+    }])
+    .await;
+    let h = bedrock_harness(&fake, BEDROCK_IAM_KEY, json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("converse-stream"),
+        &[("authorization", &auth)],
+        Some(converse_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/vnd.amazon.eventstream"
+    );
+    assert_eq!(body_bytes(response).await, stream);
+    let row = wait_for_usage(&h.storage, 1).await;
+    assert_eq!(row["input_tokens"], 11);
+    assert_eq!(row["output_tokens"], 6);
+}
+
+#[tokio::test]
+async fn bedrock_invoke_stream_records_claude_usage() {
+    use base64::Engine;
+    let mut stream = Vec::new();
+    for chunk in ANTHROPIC_SSE {
+        let data = chunk.split("data: ").nth(1).unwrap().trim();
+        let bytes = base64::engine::general_purpose::STANDARD.encode(data);
+        stream.extend(bedrock_event("chunk", json!({"bytes": bytes})));
+    }
+    let fake = FakeProvider::start(vec![Reply::Binary {
+        content_type: "application/vnd.amazon.eventstream",
+        chunks: rechunk(&stream, 13),
+    }])
+    .await;
+    let h = bedrock_harness(&fake, BEDROCK_IAM_KEY, json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("invoke-with-response-stream"),
+        &[("authorization", &auth)],
+        Some(json!({"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await, stream);
+    let call = fake.last();
+    assert_eq!(call.json()["anthropic_version"], "bedrock-2023-05-31");
+    assert!(call.json().get("model").is_none());
+    assert_eq!(
+        call.json()["metadata"]["user_id"],
+        doorman_gateway::ai::hashed_user_id("alice")
+    );
+    let row = wait_for_usage(&h.storage, 1).await;
+    assert_eq!(row["input_tokens"], 12);
+    assert_eq!(row["output_tokens"], 5);
+}
+
+#[tokio::test]
+async fn bedrock_invoke_rejects_models_not_from_anthropic() {
+    let fake = FakeProvider::start(vec![Reply::ok(json!({}))]).await;
+    let h = bedrock_harness(&fake, BEDROCK_IAM_KEY, json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        "/api/ai/corp-bedrock/v1/model/meta.llama4-demo-v1%3A0/invoke",
+        &[("authorization", &auth)],
+        Some(json!({"prompt": "hi"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["error_code"], "AI001");
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn bedrock_exception_frame_mid_stream_reaches_the_client() {
+    let mut stream = bedrock_event(
+        "contentBlockDelta",
+        json!({"contentBlockIndex": 0, "delta": {"text": "Hel"}}),
+    );
+    stream.extend(doorman_gateway::ai::eventstream::encode(
+        &[
+            (":exception-type", "throttlingException"),
+            (":content-type", "application/json"),
+            (":message-type", "exception"),
+        ],
+        br#"{"message":"Too many tokens"}"#,
+    ));
+    let fake = FakeProvider::start(vec![Reply::Binary {
+        content_type: "application/vnd.amazon.eventstream",
+        chunks: vec![stream.clone()],
+    }])
+    .await;
+    let h = bedrock_harness(&fake, BEDROCK_IAM_KEY, json!({})).await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("converse-stream"),
+        &[("authorization", &auth)],
+        Some(converse_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await, stream);
+    wait_for_usage(&h.storage, 1).await;
+}
+
+#[tokio::test]
+async fn bedrock_failover_signs_each_target_for_its_own_host() {
+    let primary = FakeProvider::start(vec![Reply::status(
+        503,
+        json!({"message": "ServiceUnavailable"}),
+    )])
+    .await;
+    let backup = FakeProvider::start(vec![Reply::ok(converse_reply())]).await;
+    let h = bedrock_harness(
+        &primary,
+        BEDROCK_IAM_KEY,
+        json!({"fallback_targets": [{"server": backup.url}]}),
+    )
+    .await;
+    let auth = bearer(&h.key);
+    let response = send(
+        &h.app,
+        Method::POST,
+        &bedrock_url("converse"),
+        &[("authorization", &auth)],
+        Some(converse_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-doorman-ai-fallbacks"], "1");
+    assert_signed(&primary.last(), &primary.url, "us-west-2");
+    assert_signed(&backup.last(), &backup.url, "us-west-2");
 }

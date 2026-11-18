@@ -872,6 +872,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "bytes",
+ "crc32fast",
  "fernet",
  "flate2",
  "futures-util",

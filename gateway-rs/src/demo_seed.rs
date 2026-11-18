@@ -305,8 +305,9 @@ fn ai_example_pricing() -> Vec<Value> {
 /// seed real keys), so calls answer `AI006` until an admin adds one. The
 /// exception is `demo-local-llm`, a keyless OpenAI-compatible upstream at
 /// `DEMO_LOCAL_LLM_URL` (default `http://localhost:11434`, Ollama's port; the
-/// demo compose file points it at `docker/demo-llm.py`). Also an example
-/// pricing set, one budget, one guardrail and 30 days of usage.
+/// demo compose file points it at `docker/demo-llm.py`, which also answers
+/// Bedrock and Vertex routes for manual tests). Also an example pricing set,
+/// one budget, one guardrail and 30 days of usage.
 async fn seed_ai(
     storage: &SharedStorage,
     users: &[String],
@@ -355,6 +356,22 @@ async fn seed_ai(
             "authorization",
             vec!["llama-demo"],
         ),
+        (
+            "demo-bedrock",
+            "bedrock",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "bedrock-demo",
+            "authorization",
+            vec!["us.anthropic.claude-sonnet-5-5", "us.anthropic.*"],
+        ),
+        (
+            "demo-vertex",
+            "vertex",
+            "https://aiplatform.googleapis.com",
+            "vertex-demo",
+            "authorization",
+            vec!["claude-sonnet-5-5*", "gemini-3.8-flash"],
+        ),
     ];
     for (name, provider, server, credential_group, header, models) in &apis {
         if *credential_group != "none"
@@ -381,22 +398,24 @@ async fn seed_ai(
         {
             continue;
         }
+        let ai_config = json!({"credential_group": credential_group, "allowed_models": models,
+            "model_aliases": {}, "stream_allowed": true, "forward_user_id": true});
+        let description = if *credential_group == "none" {
+            "Demo local model (no provider key needed)".to_owned()
+        } else {
+            format!("Demo {provider} AI API (add a provider key to {credential_group} to use it)")
+        };
         storage
             .insert_one(
                 "apis",
                 json!({
                     "api_id": Uuid::new_v4().to_string(), "api_name": name, "api_version": "v1",
                     "api_path": format!("/{name}/v1"), "api_type": "AI", "api_ai_provider": provider,
-                    "api_description": if *credential_group == "none" {
-                        "Demo local model (no provider key needed)".to_owned()
-                    } else {
-                        format!("Demo {provider} AI API (add a provider key to {credential_group} to use it)")
-                    },
+                    "api_description": description,
                     "api_servers": [server], "api_allowed_groups": ["ALL"], "api_allowed_roles": [],
                     "api_public": false, "api_auth_required": true, "api_allowed_retry_count": 0,
                     "api_credits_enabled": false, "active": true,
-                    "api_ai_config": {"credential_group": credential_group, "allowed_models": models,
-                        "model_aliases": {}, "stream_allowed": true, "forward_user_id": true},
+                    "api_ai_config": ai_config,
                 }),
             )
             .await?;
@@ -454,12 +473,19 @@ async fn seed_ai(
 
     // 30 days of daily rollups for a sample of users, priced with the example table.
     let prices = crate::ai::pricing::PriceTable::from_docs(&pricing)
-        .unwrap_or_else(|_| crate::ai::pricing::PriceTable::empty());
+        .unwrap_or_else(|_| crate::ai::pricing::PriceTable::empty())
+        .with_builtin();
     let models = [
         ("demo-claude/v1", "anthropic", "claude-sonnet-5-5"),
         ("demo-claude/v1", "anthropic", "claude-haiku-5-5"),
         ("demo-claude/v1", "anthropic", "claude-opus-5-5"),
         ("demo-openai/v1", "openai", "gpt-demo-mini"),
+        (
+            "demo-bedrock/v1",
+            "bedrock",
+            "us.anthropic.claude-sonnet-5-5",
+        ),
+        ("demo-vertex/v1", "vertex", "gemini-3.8-flash"),
     ];
     let today = OffsetDateTime::now_utc().date();
     for username in users.iter().take(8) {

@@ -284,7 +284,16 @@ async fn recalculate_pricing(state: &AppState, payload: &Value, request_id: &str
             .and_then(Value::as_str)
             .unwrap_or_default();
         let model = row.get("model").and_then(Value::as_str).unwrap_or_default();
-        let cost = table.cost(provider, model, &usage, at);
+        let mut cost = table.cost(provider, model, &usage, at);
+        if cost.unpriced
+            && let Some(parsed) = crate::ai::adapter::AiProvider::parse(provider)
+        {
+            // Same fallback as live traffic: the base model of a Bedrock profile or ARN.
+            let base = crate::ai::providers::adapter_for(parsed).pricing_model(model);
+            if base != model {
+                cost = table.cost(provider, &base, &usage, at);
+            }
+        }
         if cost.unpriced {
             still_unpriced += 1;
             continue;
@@ -1194,7 +1203,7 @@ async fn validate_budget(state: &AppState, input: &Value) -> Result<Value, Strin
                 .and_then(|value| crate::ai::adapter::AiProvider::parse(value.trim()));
             if parsed.is_none() {
                 errors.push(
-                    "provider: must be openai, anthropic, gemini, azure_openai or openai_compatible"
+                    "provider: must be openai, anthropic, gemini, azure_openai, openai_compatible, bedrock or vertex"
                         .to_owned(),
                 );
             }

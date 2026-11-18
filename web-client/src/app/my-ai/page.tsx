@@ -27,8 +27,8 @@ function Connect({ apis }: { apis: AiMyApi[] }) {
   const [selected, setSelected] = useState(0)
   const api = apis[Math.min(selected, apis.length - 1)]
   const baseUrl = aiSdkBaseUrl(SERVER_URL, api.api_name, api.api_version, api.sdk_base_url_suffix)
-  const model = api.default_model || api.models[0] || 'YOUR_ALLOWED_MODEL'
-  const snippets = aiSnippets(api.provider, baseUrl, model)
+  const model = api.default_model || api.models.find(model => !model.endsWith('*')) || 'YOUR_ALLOWED_MODEL'
+  const snippets = aiSnippets(api.provider, baseUrl, model, undefined, api.models)
   const [tab, setTab] = useState(snippets[0].id)
   const active = snippets.find(snippet => snippet.id === tab) || snippets[0]
   return <section className="card p-6 space-y-4">
@@ -49,7 +49,8 @@ function Connect({ apis }: { apis: AiMyApi[] }) {
     <div>
       <div role="tablist" aria-label="Setup instructions" className="flex flex-wrap gap-1 border-b border-gray-200">{snippets.map(snippet => <button key={snippet.id} type="button" role="tab" aria-selected={snippet.id === active.id} onClick={() => setTab(snippet.id)} className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${snippet.id === active.id ? 'border-primary-600 text-primary-700 font-medium' : 'border-transparent text-gray-600 hover:text-gray-900'}`}>{snippet.label}</button>)}</div>
       <div className="relative mt-3"><pre className="bg-gray-50 border border-gray-200 text-gray-800 text-xs p-4 pr-20 rounded-lg overflow-x-auto"><code>{active.code}</code></pre><div className="absolute top-2 right-2"><SignalCopyButton text={active.code} label="Copy" /></div></div>
-      <p className="text-xs text-gray-500 mt-2">Replace <code>dk_your_key_here</code> with your access key.</p>
+      {(active.id === 'boto3' || active.id === 'aws-js') && <p className="text-xs text-gray-500 mt-2">The AWS SDKs need Doorman&apos;s HTTPS address. They refuse to send the key over plain HTTP.</p>}
+      <p className="text-xs text-gray-500 mt-2">Replace <code>dk_your_key_here</code> or set <code>DOORMAN_AI_KEY</code> to your access key. Enter a concrete allowed model where the example uses a model placeholder.</p>
     </div>
   </section>
 }

@@ -1,0 +1,80 @@
+{
+  "_comment": "Generated with botocore 1.44.5. Load this JSON as fixture and run the generator. The first three requests come from the AWS SigV4 test suite and include Doorman's additional signed payload-hash header. The space path is the URL wire representation.",
+  "aws_examples": "https://github.com/boto/botocore/tree/1.34.0/tests/unit/auth/aws4_testsuite",
+  "generator": [
+    "from botocore.auth import SigV4Auth",
+    "from botocore.awsrequest import AWSRequest",
+    "from botocore.credentials import Credentials",
+    "from hashlib import sha256",
+    "from unittest.mock import patch",
+    "from datetime import datetime",
+    "",
+    "for case in fixture[\"cases\"]:",
+    "    body = case[\"body\"].encode()",
+    "    headers = {\"X-Amz-Content-Sha256\": sha256(body).hexdigest()}",
+    "    if body:",
+    "        headers[\"Content-Type\"] = \"application/json\"",
+    "    request = AWSRequest(method=case[\"method\"], url=case[\"url\"], data=body, headers=headers)",
+    "    credentials = Credentials(\"AKIDEXAMPLE\", \"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY\", case[\"token\"])",
+    "    signer = SigV4Auth(credentials, case[\"service\"], \"us-east-1\")",
+    "    with patch(\"botocore.auth.get_current_datetime\", return_value=datetime(2015, 8, 30, 12, 36)):",
+    "        signer.add_auth(request)",
+    "    case[\"authorization\"] = request.headers[\"Authorization\"]"
+  ],
+  "cases": [
+    {
+      "name": "get-vanilla",
+      "method": "GET",
+      "url": "https://example.amazonaws.com/",
+      "service": "service",
+      "body": "",
+      "token": null,
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=726c5c4879a6b4ccbbd3b24edbd6b8826d34f87450fbbf4e85546fc7ba9c1642"
+    },
+    {
+      "name": "post-vanilla",
+      "method": "POST",
+      "url": "https://example.amazonaws.com/",
+      "service": "service",
+      "body": "",
+      "token": null,
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=3ad5e249949a59b862eedd9f1bf1ece4693c3042bf860ef5e3351b8925316f98"
+    },
+    {
+      "name": "get-space",
+      "method": "GET",
+      "url": "https://example.amazonaws.com/example%20space/",
+      "service": "service",
+      "body": "",
+      "token": null,
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a125bdae7835ac7741747b68349bc40dc0aa16ed4bec7ff2d6cbea57fa1e1854"
+    },
+    {
+      "name": "bedrock-converse",
+      "method": "POST",
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse",
+      "service": "bedrock",
+      "body": "{\"messages\":[]}",
+      "token": null,
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=83806d191c66617b8ba01d0ffdc08e972c8dde5965c95edad7b4a740e1bbad4f"
+    },
+    {
+      "name": "bedrock-arn",
+      "method": "POST",
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A%3Afoundation-model%2Fanthropic.claude-3-haiku-20240307-v1%3A0/converse",
+      "service": "bedrock",
+      "body": "{\"messages\":[]}",
+      "token": null,
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=fd991b9196a8a3920adc004db07b18a88f7c0a652398260b96ec2e24ef566602"
+    },
+    {
+      "name": "bedrock-session",
+      "method": "POST",
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse?z=2&a=1",
+      "service": "bedrock",
+      "body": "{\"messages\":[]}",
+      "token": "example-session-token",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=d48e2675c631e85c5dda66f1dd753ef8a78c9b739dd5e68ebcb240cc7cd4c91d"
+    }
+  ]
+}

@@ -74,6 +74,12 @@ pub struct AiApiConfig {
     /// different server. Never across keys on the same server (C3).
     #[serde(default)]
     pub load_balance: bool,
+    /// Bedrock region or Vertex location. None = parsed from the server host.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Vertex project ID. None = the service account's `project_id`.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 impl Default for AiApiConfig {
@@ -96,6 +102,8 @@ impl Default for AiApiConfig {
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
             fallback_targets: Vec::new(),
             load_balance: false,
+            region: None,
+            project_id: None,
         }
     }
 }

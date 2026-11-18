@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { fetchAllPaginated, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import type { AiApiConfig, AiTarget } from '@/utils/ai'
+import { BEDROCK_REGIONS, bedrockEndpoint, bedrockEndpointRegion, type AiApiConfig, type AiTarget } from '@/utils/ai'
 
 const blank = (): AiTarget => ({ credential_group: '', server: null, weight: 1 })
 
@@ -15,8 +15,8 @@ export function backupsSummary(config: Partial<AiApiConfig>): string {
 }
 
 /** Edits an AI API's failover backups (api_ai_config.fallback_targets). */
-export default function AiBackupsEditor({ apiName, apiVersion, config, onClose, onSaved }: {
-  apiName: string; apiVersion: string; config: Partial<AiApiConfig>; onClose: () => void; onSaved: (config: Partial<AiApiConfig>) => void
+export default function AiBackupsEditor({ apiName, apiVersion, provider, config, onClose, onSaved }: {
+  apiName: string; apiVersion: string; provider?: string; config: Partial<AiApiConfig>; onClose: () => void; onSaved: (config: Partial<AiApiConfig>) => void
 }) {
   const [rows, setRows] = useState<AiTarget[]>(() => (config.fallback_targets || []).map(target => ({ ...target })))
   const [balance, setBalance] = useState(!!config.load_balance)
@@ -59,9 +59,15 @@ export default function AiBackupsEditor({ apiName, apiVersion, config, onClose, 
             {[...new Set([...groups, ...(row.credential_group ? [row.credential_group] : [])])].map(group => <option key={group} value={group}>{group}</option>)}
           </select>
         </label>
+        {provider === 'bedrock' && <label className="block text-sm">AWS region
+          <select className="input w-full mt-1" value={bedrockEndpointRegion(row.server)} onChange={event => update(index, { server: event.target.value ? bedrockEndpoint(event.target.value) : null })}>
+            <option value="">{row.server && !bedrockEndpointRegion(row.server) ? 'Custom server' : 'Same region as primary'}</option>
+            {[...new Set([...BEDROCK_REGIONS, bedrockEndpointRegion(row.server)].filter(Boolean))].map(region => <option key={region}>{region}</option>)}
+          </select>
+        </label>}
         <label className="block text-sm" htmlFor={`backup-server-${index}`}>Server
           <input id={`backup-server-${index}`} className="input w-full mt-1" placeholder="Same server as the provider" value={row.server || ''} onChange={event => update(index, { server: event.target.value || null })} />
-          <span className="text-xs text-gray-500">For another region or Azure deployment, for example https://eastus2.example.openai.azure.com</span>
+          <span className="text-xs text-gray-500">{provider === 'bedrock' ? 'Choose a region above or enter a custom endpoint.' : 'For another region or Azure deployment, for example https://eastus2.example.openai.azure.com'}</span>
         </label>
         {balance && row.server && <label className="block text-sm" htmlFor={`backup-weight-${index}`}><span className="block">Share of traffic</span>
           <input id={`backup-weight-${index}`} className="input w-28 mt-1" type="number" min={1} max={1000} value={row.weight} onChange={event => update(index, { weight: Number(event.target.value) })} />

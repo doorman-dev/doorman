@@ -8,19 +8,47 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useAiProviders } from '@/hooks/useAiProviders'
 import { fetchAllPaginated, getJson, postJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import { providerLabel, type AiPricingRow, type AiProvider } from '@/utils/ai'
+import { AI_PROVIDERS, BEDROCK_REGIONS, VERTEX_LOCATIONS, bedrockEndpoint, vertexEndpoint, providerLabel, type AiPricingRow, type AiProvider } from '@/utils/ai'
 
 type Plan = 'pool' | 'each' | 'group' | 'tier' | 'none'
-type ProviderDraft = { enabled: boolean; key: string; name: string; models: string; server: string }
+type ProviderDraft = {
+  enabled: boolean; key: string; name: string; models: string; server: string; region: string
+  bedrockAuth: 'api_key' | 'iam'; accessKeyId: string; secretAccessKey: string; sessionToken: string
+}
+type ServiceAccountSummary = { project_id: string; client_email: string }
+
+function serviceAccountSummary(raw: string): ServiceAccountSummary | null {
+  try {
+    const account = JSON.parse(raw)
+    if (account?.type !== 'service_account' ||
+      typeof account.project_id !== 'string' || !account.project_id.trim() ||
+      typeof account.client_email !== 'string' || !/^\S+@\S+$/.test(account.client_email) ||
+      typeof account.private_key !== 'string' || !/^-----BEGIN (RSA )?PRIVATE KEY-----[\s\S]+-----END (RSA )?PRIVATE KEY-----\s*$/.test(account.private_key) ||
+      (account.token_uri != null && account.token_uri !== 'https://oauth2.googleapis.com/token')) return null
+    return { project_id: account.project_id, client_email: account.client_email }
+  } catch { return null }
+}
+
+function providerCredential(id: AiProvider, draft: ProviderDraft): string {
+  if (id !== 'bedrock' || draft.bedrockAuth !== 'iam') return draft.key.trim()
+  const session = draft.sessionToken.trim()
+  return JSON.stringify({
+    access_key_id: draft.accessKeyId.trim(),
+    secret_access_key: draft.secretAccessKey.trim(),
+    ...(session ? { session_token: session } : {}),
+  })
+}
 type Price = { input: string; output: string }
 
-const ORDER: AiProvider[] = ['openai', 'anthropic', 'gemini', 'azure_openai', 'openai_compatible']
+const ORDER = AI_PROVIDERS
 const DEFAULTS: Record<AiProvider, { name: string; models: string }> = {
   openai: { name: 'openai', models: 'gpt-*' },
   anthropic: { name: 'claude', models: 'claude-*' },
   gemini: { name: 'gemini', models: 'gemini-*' },
   azure_openai: { name: 'azure-openai', models: '' },
   openai_compatible: { name: 'local-llm', models: '' },
+  bedrock: { name: 'bedrock', models: 'anthropic.*, global.anthropic.*, us.anthropic.*' },
+  vertex: { name: 'vertex', models: 'gemini-*, claude-*' },
 }
 const PLANS: [Plan, string, string][] = [
   ['each', 'Same allowance for every employee', 'e.g. everyone gets $50/month of OpenAI and $30/month of Claude.'],
@@ -38,7 +66,7 @@ export default function AiSetupPage() {
   const [step, setStep] = useState(0)
   // Errors show only after the user tries to continue, not before they've typed anything.
   const [attempted, setAttempted] = useState(false)
-  const [drafts, setDrafts] = useState<Record<AiProvider, ProviderDraft>>(() => Object.fromEntries(ORDER.map(id => [id, { enabled: id === 'openai' || id === 'anthropic', key: '', name: DEFAULTS[id].name, models: DEFAULTS[id].models, server: '' }])) as Record<AiProvider, ProviderDraft>)
+  const [drafts, setDrafts] = useState<Record<AiProvider, ProviderDraft>>(() => Object.fromEntries(ORDER.map(id => [id, { enabled: id === 'openai' || id === 'anthropic', key: '', name: DEFAULTS[id].name, models: DEFAULTS[id].models, server: '', region: id === 'bedrock' ? 'us-east-1' : 'global', bedrockAuth: 'api_key', accessKeyId: '', secretAccessKey: '', sessionToken: '' }])) as Record<AiProvider, ProviderDraft>)
   const [everyone, setEveryone] = useState(true)
   const [groups, setGroups] = useState<string[]>([])
   const [allGroups, setAllGroups] = useState<string[]>([])
@@ -70,7 +98,10 @@ export default function AiSetupPage() {
 
   const chosen = ORDER.filter(id => drafts[id].enabled)
   const preset = (id: AiProvider) => presets.find(item => item.id === id)
-  const needsServer = (id: AiProvider) => !preset(id)?.default_server
+  const needsServer = (id: AiProvider) => id !== 'bedrock' && id !== 'vertex' && !preset(id)?.default_server
+  const endpoint = (id: AiProvider, draft: ProviderDraft) => id === 'bedrock' ? bedrockEndpoint(draft.region)
+    : id === 'vertex' ? vertexEndpoint(draft.region) : preset(id)?.default_server || draft.server.trim()
+  const vertexAccount = serviceAccountSummary(drafts.vertex.key)
   const unpriced = unit === 'cost' && plan !== 'none' ? chosen.filter(id => !pricing.some(row => row.provider === id)) : []
   const rows: string[] = plan === 'group' || plan === 'tier' ? targets : plan === 'none' ? [] : ['']
   const amountKey = (target: string, provider: AiProvider) => `${target}|${provider}`
@@ -80,7 +111,9 @@ export default function AiSetupPage() {
     const errors: Record<string, string> = {}
     for (const id of chosen) {
       const draft = drafts[id]
-      if (!draft.key.trim()) errors[id] = 'Paste the provider API key.'
+      if (id === 'vertex' && !vertexAccount) errors[id] = 'Paste or select a valid service-account JSON file with a project ID.'
+      else if (id === 'bedrock' && draft.bedrockAuth === 'iam' && (!draft.accessKeyId.trim() || !draft.secretAccessKey.trim())) errors[id] = 'Enter the IAM access key ID and secret.'
+      else if (id !== 'vertex' && !(id === 'bedrock' && draft.bedrockAuth === 'iam') && !draft.key.trim()) errors[id] = 'Paste the provider API key.'
       else if (!/^[a-z0-9][a-z0-9-]*$/.test(draft.name)) errors[id] = 'Name: lowercase letters, digits and dashes.'
       else if (existingApis.includes(`${draft.name}/v1`)) errors[id] = `An API named ${draft.name}/v1 already exists. Choose another name.`
       else if (existingCreds.includes(`${draft.name}-key`)) errors[id] = `A credential named ${draft.name}-key already exists. Choose another name.`
@@ -120,14 +153,16 @@ export default function AiSetupPage() {
       for (const id of chosen) {
         const draft = drafts[id]
         const credential = `${draft.name}-key`
-        await postJson(`${SERVER_URL}/platform/credit`, { api_credit_group: credential, api_key: draft.key.trim(), api_key_header: preset(id)?.credential_header || 'authorization', credit_tiers: [] })
+        await postJson(`${SERVER_URL}/platform/credit`, { api_credit_group: credential, api_key: providerCredential(id, draft), api_key_header: preset(id)?.credential_header || 'authorization', credit_tiers: [] })
         note(`Stored the ${providerLabel(id)} key (encrypted) as ${credential}`)
         await postJson(`${SERVER_URL}/platform/api`, {
           api_name: draft.name, api_version: 'v1', api_type: 'AI', api_ai_provider: id,
           api_description: `${providerLabel(id)} for employees (created by AI setup)`,
-          api_servers: [needsServer(id) ? draft.server.trim() : preset(id)?.default_server],
+          api_servers: [endpoint(id, draft)],
           api_allowed_groups: everyone ? ['ALL'] : groups, api_allowed_roles: [],
-          api_ai_config: { credential_group: credential, allowed_models: listOf(draft.models), require_subscription: false },
+          api_ai_config: { credential_group: credential, allowed_models: listOf(draft.models), require_subscription: false,
+            ...(id === 'bedrock' || id === 'vertex' ? { region: draft.region } : {}),
+            ...(id === 'vertex' ? { project_id: vertexAccount?.project_id } : {}), },
         })
         note(`Created AI API ${draft.name}/v1 for ${everyone ? 'everyone' : groups.join(', ')}`)
       }
@@ -167,13 +202,49 @@ export default function AiSetupPage() {
         <p className="text-xs text-gray-500">For one person's exception, add an allowance for that user in Allowances. To redact personal data, add a guardrail in Policies.</p>
       </section> : <>
         {step === 0 && <section className="card p-6 space-y-4">
-          <div><h3 className="card-title">Which AI providers will you offer?</h3><p className="text-sm text-gray-500">Paste each company API key once. It is encrypted and never shown to employees.</p></div>
+          <div><h3 className="card-title">Which AI providers will you offer?</h3><p className="text-sm text-gray-500">Add a company credential for each provider. Credentials are encrypted and hidden from employees.</p></div>
           {ORDER.map(id => { const draft = drafts[id]; return <div key={id} className="border-t border-gray-100 pt-4 space-y-3 first-of-type:border-t-0 first-of-type:pt-0">
             <label className="flex items-center gap-2 font-medium"><input type="checkbox" checked={draft.enabled} onChange={event => update(id, { enabled: event.target.checked })} />{providerLabel(id)}</label>
-            {draft.enabled && <div className="grid gap-3 md:grid-cols-2 text-sm">
-              <label className="block md:col-span-2">API key<input className="input w-full mt-1" type="password" autoComplete="off" value={draft.key} onChange={event => update(id, { key: event.target.value })} placeholder={id === 'anthropic' ? 'sk-ant-…' : id === 'openai' ? 'sk-…' : 'Provider key'} /></label>
+            {draft.enabled && <div className="grid grid-cols-1 gap-3 md:grid-cols-2 text-sm">
+              {(id === 'bedrock' || id === 'vertex') && <label className="block md:col-span-2">{id === 'bedrock' ? 'AWS region' : 'Vertex location'}
+                <select className="input w-full mt-1" value={draft.region} onChange={event => update(id, { region: event.target.value })}>
+                  {(id === 'bedrock' ? BEDROCK_REGIONS : VERTEX_LOCATIONS).map(region => <option key={region} value={region}>{region === 'global' ? 'Global' : region}</option>)}
+                </select>
+                <span className="block text-xs text-gray-500 mt-1 break-all">{endpoint(id, draft)}</span>
+              </label>}
+              {id === 'bedrock' && <label className="block md:col-span-2">Credential type
+                <select className="input w-full mt-1" value={draft.bedrockAuth} onChange={event => update(id, { bedrockAuth: event.target.value === 'iam' ? 'iam' : 'api_key' })}>
+                  <option value="api_key">Bedrock API key</option><option value="iam">IAM access key</option>
+                </select>
+              </label>}
+              {id === 'vertex' ? <div className="min-w-0 md:col-span-2 space-y-2">
+                <label className="block">Service-account JSON
+                  <textarea className="input w-full mt-1 min-h-16" value="" autoComplete="off"
+                    placeholder="Paste JSON here or drop the JSON file"
+                    onChange={event => update(id, { key: event.target.value })}
+                    onPaste={event => { event.preventDefault(); update(id, { key: event.clipboardData.getData('text') }) }}
+                    onDragOver={event => event.preventDefault()}
+                    onDrop={event => {
+                      event.preventDefault()
+                      const file = event.dataTransfer.files[0]
+                      if (file) void file.text().then(key => update(id, { key })).catch(() => update(id, { key: 'invalid' }))
+                      else update(id, { key: event.dataTransfer.getData('text') })
+                    }} />
+                </label>
+                <label className="block text-xs">Choose JSON file<input className="block mt-1 w-full min-w-0" type="file" accept=".json,application/json" onChange={event => {
+                  const file = event.target.files?.[0]
+                  if (file) void file.text().then(key => update(id, { key })).catch(() => update(id, { key: 'invalid' }))
+                  event.target.value = ''
+                }} /></label>
+                {vertexAccount ? <div className="text-xs text-gray-500 break-all" role="status">Project {vertexAccount.project_id} · {vertexAccount.client_email}</div>
+                  : draft.key && <p className="text-xs text-red-600" role="status">This JSON is not a valid Vertex service account.</p>}
+              </div> : id === 'bedrock' && draft.bedrockAuth === 'iam' ? <>
+                <label className="block">Access key ID<input className="input w-full mt-1" autoComplete="off" value={draft.accessKeyId} onChange={event => update(id, { accessKeyId: event.target.value })} /></label>
+                <label className="block">Secret access key<input className="input w-full mt-1" type="password" autoComplete="off" value={draft.secretAccessKey} onChange={event => update(id, { secretAccessKey: event.target.value })} /></label>
+                <label className="block md:col-span-2">Session token (optional)<input className="input w-full mt-1" type="password" autoComplete="off" value={draft.sessionToken} onChange={event => update(id, { sessionToken: event.target.value })} /></label>
+              </> : <label className="block md:col-span-2">{id === 'bedrock' ? 'Bedrock API key' : 'API key'}<input className="input w-full mt-1" type="password" autoComplete="off" value={draft.key} onChange={event => update(id, { key: event.target.value })} placeholder={id === 'anthropic' ? 'sk-ant-…' : id === 'openai' ? 'sk-…' : 'Provider key'} /></label>}
               {needsServer(id) && <label className="block md:col-span-2">Endpoint URL<input className="input w-full mt-1" value={draft.server} onChange={event => update(id, { server: event.target.value })} placeholder={id === 'azure_openai' ? 'https://YOUR-RESOURCE.openai.azure.com' : 'http://llm.internal:8000'} /></label>}
-              <label className="block">Allowed models<input className="input w-full mt-1 font-mono" value={draft.models} onChange={event => update(id, { models: event.target.value })} placeholder={id === 'azure_openai' ? 'your-deployment-name' : 'model-*'} /><span className="text-xs text-gray-500">Comma-separated; a trailing * allows a family.</span></label>
+              <label className="block">Allowed models<input className="input w-full mt-1 font-mono" value={draft.models} onChange={event => update(id, { models: event.target.value })} placeholder={id === 'azure_openai' ? 'your-deployment-name' : 'model-*'} /><span className="text-xs text-gray-500">Comma-separated; a trailing * allows a family.{id === 'bedrock' && ' Include the inference-profile prefix, such as us. or global., if your clients use one.'}</span></label>
               <label className="block">Name in URLs<input className="input w-full mt-1 font-mono" value={draft.name} onChange={event => update(id, { name: event.target.value.toLowerCase() })} /></label>
               {attempted && providerErrors[id] && <p className="text-xs text-red-600 md:col-span-2">{providerErrors[id]}</p>}
             </div>}

@@ -218,12 +218,15 @@ async fn write_prompt_log(storage: &SharedStorage, ctx: &FinalizeCtx, log: &Prom
 
 /// Cost of `usage` at the current price table (unpriced → 0 nanos).
 pub async fn cost_for(ctx: &FinalizeCtx, usage: &AiUsage) -> CostResult {
-    price_table(ctx.storage.as_deref()).await.cost(
-        ctx.provider.as_str(),
-        &ctx.model,
-        usage,
-        time::OffsetDateTime::now_utc(),
-    )
+    let table = price_table(ctx.storage.as_deref()).await;
+    let now = time::OffsetDateTime::now_utc();
+    let cost = table.cost(ctx.provider.as_str(), &ctx.model, usage, now);
+    // Unpriced as sent: try the base model (Bedrock inference profiles, ARNs).
+    let base = crate::ai::providers::adapter_for(ctx.provider).pricing_model(&ctx.model);
+    if cost.unpriced && base != ctx.model {
+        return table.cost(ctx.provider.as_str(), &base, usage, now);
+    }
+    cost
 }
 
 /// The `ai` block of an activity-log record (plan §5.9).
@@ -378,9 +381,77 @@ fn spawn_record(ctx: FinalizeCtx, usage: AiUsage) {
 /// Forwards upstream SSE bytes unchanged while feeding a copy to the provider's
 /// usage parser. Usage is recorded exactly once: at stream end, on idle
 /// timeout, on upstream error, or when the client disconnects (drop).
+/// Splits a streamed response into events for the usage parser. The client
+/// always receives the original bytes.
+enum Framer {
+    Sse(SseParser),
+    /// Bedrock. `failed` = a frame did not decode; usage falls back to the estimate.
+    AwsEventStream {
+        decoder: crate::ai::eventstream::Decoder,
+        failed: bool,
+    },
+}
+
+impl Framer {
+    fn new(framing: crate::ai::adapter::StreamFraming) -> Self {
+        match framing {
+            crate::ai::adapter::StreamFraming::Sse => {
+                Framer::Sse(SseParser::new(MAX_SSE_EVENT_BYTES))
+            }
+            crate::ai::adapter::StreamFraming::AwsEventStream => Framer::AwsEventStream {
+                decoder: crate::ai::eventstream::Decoder::new(MAX_SSE_EVENT_BYTES),
+                failed: false,
+            },
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8], parser: &mut Option<Box<dyn StreamUsageParser>>) {
+        match self {
+            Framer::Sse(sse) => {
+                if let Some(parser) = parser.as_mut() {
+                    for event in sse.push(chunk) {
+                        parser.on_event(&event);
+                    }
+                }
+            }
+            Framer::AwsEventStream { decoder, failed } => {
+                if *failed {
+                    return;
+                }
+                for frame in decoder.push(chunk) {
+                    match frame {
+                        Ok(frame) => {
+                            if let Some(parser) = parser.as_mut() {
+                                parser.on_event(&frame.to_sse_event());
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "AI event stream did not decode; estimating usage"
+                            );
+                            *failed = true;
+                            *parser = None;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when some of the stream was not seen by the usage parser.
+    fn incomplete(&self) -> bool {
+        match self {
+            Framer::Sse(sse) => sse.overflowed(),
+            Framer::AwsEventStream { failed, .. } => *failed,
+        }
+    }
+}
+
 pub struct UsageTap {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    sse: SseParser,
+    framer: Framer,
     parser: Option<Box<dyn StreamUsageParser>>,
     ctx: Option<FinalizeCtx>,
     idle: Duration,
@@ -395,9 +466,25 @@ impl UsageTap {
         ctx: FinalizeCtx,
         idle: Duration,
     ) -> Self {
+        Self::with_framing(
+            inner,
+            parser,
+            ctx,
+            idle,
+            crate::ai::adapter::StreamFraming::Sse,
+        )
+    }
+
+    pub fn with_framing(
+        inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+        parser: Box<dyn StreamUsageParser>,
+        ctx: FinalizeCtx,
+        idle: Duration,
+        framing: crate::ai::adapter::StreamFraming,
+    ) -> Self {
         Self {
             inner,
-            sse: SseParser::new(MAX_SSE_EVENT_BYTES),
+            framer: Framer::new(framing),
             parser: Some(parser),
             ctx: Some(ctx),
             idle,
@@ -416,7 +503,7 @@ impl UsageTap {
         let parsed = self.parser.take().and_then(|parser| parser.finish());
         let usage = match parsed {
             Some(mut usage) => {
-                usage.estimated |= !complete || self.sse.overflowed();
+                usage.estimated |= !complete || self.framer.incomplete();
                 usage
             }
             None => estimate_usage(ctx.request_bytes, ctx.response_bytes),
@@ -443,11 +530,7 @@ impl Stream for UsageTap {
                         ctx.ttft_ms = Some(ctx.started.elapsed().as_millis() as u64);
                     }
                 }
-                if let Some(parser) = this.parser.as_mut() {
-                    for event in this.sse.push(&chunk) {
-                        parser.on_event(&event);
-                    }
-                }
+                this.framer.push(&chunk, &mut this.parser);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {

@@ -8,15 +8,19 @@ pub enum AiProvider {
     Gemini,
     AzureOpenai,
     OpenaiCompatible,
+    Bedrock,
+    Vertex,
 }
 
 impl AiProvider {
-    pub const ALL: [AiProvider; 5] = [
+    pub const ALL: [AiProvider; 7] = [
         AiProvider::Openai,
         AiProvider::Anthropic,
         AiProvider::Gemini,
         AiProvider::AzureOpenai,
         AiProvider::OpenaiCompatible,
+        AiProvider::Bedrock,
+        AiProvider::Vertex,
     ];
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -32,13 +36,77 @@ impl AiProvider {
             AiProvider::Gemini => "gemini",
             AiProvider::AzureOpenai => "azure_openai",
             AiProvider::OpenaiCompatible => "openai_compatible",
+            AiProvider::Bedrock => "bedrock",
+            AiProvider::Vertex => "vertex",
         }
     }
+}
+
+/// The shape of a request or response body. One provider can accept several
+/// (Vertex: Gemini or Anthropic; Bedrock: Converse or Anthropic), so guardrails
+/// and prompt logging read bodies by dialect, never by provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Dialect {
+    OpenaiChat,
+    OpenaiResponses,
+    Anthropic,
+    Gemini,
+    BedrockConverse,
+    /// Not walked by guardrails (count_tokens, embeddings, models).
+    Opaque,
+}
+
+impl Dialect {
+    /// Dialect of a provider operation (§ step 4 operations table).
+    pub fn for_operation(operation: &str) -> Self {
+        match operation {
+            "chat" => Dialect::OpenaiChat,
+            "responses" => Dialect::OpenaiResponses,
+            "messages" | "invoke" => Dialect::Anthropic,
+            "generate" => Dialect::Gemini,
+            "converse" => Dialect::BedrockConverse,
+            _ => Dialect::Opaque,
+        }
+    }
+}
+
+/// The provider's native generation dialect. Kept for existing callers and tests.
+impl From<AiProvider> for Dialect {
+    fn from(provider: AiProvider) -> Self {
+        match provider {
+            AiProvider::Openai | AiProvider::AzureOpenai | AiProvider::OpenaiCompatible => {
+                Dialect::OpenaiChat
+            }
+            AiProvider::Anthropic => Dialect::Anthropic,
+            AiProvider::Gemini | AiProvider::Vertex => Dialect::Gemini,
+            AiProvider::Bedrock => Dialect::BedrockConverse,
+        }
+    }
+}
+
+/// How a streamed response is framed on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamFraming {
+    /// `text/event-stream`.
+    Sse,
+    /// `application/vnd.amazon.eventstream` (Bedrock).
+    AwsEventStream,
+}
+
+/// Values the handler resolves per upstream target (config, then server host,
+/// then credential) and hands to `upstream_path`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpstreamCtx<'a> {
+    /// Bedrock region or Vertex location.
+    pub region: Option<&'a str>,
+    /// Vertex project ID.
+    pub project_id: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AiRequestInfo {
     /// "chat" | "responses" | "messages" | "count_tokens" | "generate" | "embed" | "models"
+    /// | "converse" | "invoke"
     pub operation: &'static str,
     /// As requested, before alias resolution.
     pub model: Option<String>,
@@ -48,8 +116,10 @@ pub struct AiRequestInfo {
     pub metered: bool,
     /// Answered by the gateway (models list).
     pub local: bool,
-    /// True for chat/responses/messages/generate: user-id, clamp and guardrails apply.
+    /// True for chat/responses/messages/generate/converse/invoke: user-id, clamp and guardrails apply.
     pub generation: bool,
+    /// Body shape for guardrails and prompt logging.
+    pub dialect: Dialect,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -118,6 +188,26 @@ pub static PRESETS: &[ProviderPreset] = &[
         sdk_base_url_suffix: "/v1",
         supports_user_id: true,
         operations: &["chat", "responses", "embed", "models"],
+    },
+    ProviderPreset {
+        id: "bedrock",
+        label: "Amazon Bedrock",
+        default_server: None,
+        credential_header: "authorization",
+        credential_format: "bearer",
+        sdk_base_url_suffix: "",
+        supports_user_id: true,
+        operations: &["converse", "invoke", "count_tokens"],
+    },
+    ProviderPreset {
+        id: "vertex",
+        label: "Google Vertex AI",
+        default_server: None,
+        credential_header: "authorization",
+        credential_format: "bearer",
+        sdk_base_url_suffix: "",
+        supports_user_id: true,
+        operations: &["generate", "messages", "count_tokens"],
     },
 ];
 
@@ -196,6 +286,18 @@ pub trait ProviderAdapter: Send + Sync {
     fn response_text(&self, info: &AiRequestInfo, body: &serde_json::Value) -> Option<String>;
     /// Analytics only; never alters the response.
     fn is_refusal(&self, body: &serde_json::Value) -> bool;
+    /// Final upstream path for one target (Vertex rewrites project and location).
+    fn upstream_path(&self, _info: &AiRequestInfo, rest_path: &str, _ctx: &UpstreamCtx) -> String {
+        rest_path.to_owned()
+    }
+    /// Wire framing of a streamed response.
+    fn stream_framing(&self, _info: &AiRequestInfo) -> StreamFraming {
+        StreamFraming::Sse
+    }
+    /// Model ID used for price lookup (Bedrock strips inference-profile and ARN prefixes).
+    fn pricing_model(&self, model: &str) -> String {
+        model.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +311,9 @@ mod tests {
             assert_eq!(AiProvider::parse(provider.as_str()), Some(provider));
         }
         assert_eq!(PRESETS.len(), AiProvider::ALL.len());
-        assert_eq!(AiProvider::parse("vertex"), None);
+        assert_eq!(AiProvider::parse("vertex"), Some(AiProvider::Vertex));
+        assert_eq!(AiProvider::parse("aws"), None);
+        assert_eq!(Dialect::for_operation("converse"), Dialect::BedrockConverse);
+        assert_eq!(Dialect::for_operation("count_tokens"), Dialect::Opaque);
     }
 }
