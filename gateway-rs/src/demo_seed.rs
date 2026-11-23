@@ -469,6 +469,22 @@ async fn seed_ai(
             )
             .await?;
     }
+    // One-endpoint demo route (step 5): `fast` tries Claude Haiku, then the local model.
+    if storage
+        .find_one(
+            "settings",
+            &json!({"type": crate::storage::ai_settings::SETTINGS_TYPE}),
+        )
+        .await?
+        .is_none()
+    {
+        let mut settings = crate::storage::ai_settings::defaults();
+        settings["unified"] = json!({"enabled": true, "routes": [{"model": "fast", "targets": [
+            {"api": "demo-claude/v1", "model": "claude-haiku-5-5"},
+            {"api": "demo-local-llm/v1", "model": "llama-demo"}
+        ]}]});
+        storage.insert_one("settings", settings).await?;
+    }
     storage.bump_policy_revision().await?;
 
     // 30 days of daily rollups for a sample of users, priced with the example table.

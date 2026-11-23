@@ -1,0 +1,19 @@
+{
+  "id": "msg_001",
+  "type": "message",
+  "model": "claude-haiku-4-5",
+  "role": "assistant",
+  "content": [
+    {"type": "thinking", "thinking": "hidden"},
+    {"type": "text", "text": "Checking"},
+    {"type": "text", "text": " now."},
+    {"type": "tool_use", "id": "toolu_weather", "name": "weather", "input": {"city": "Paris"}}
+  ],
+  "stop_reason": "tool_use",
+  "usage": {
+    "input_tokens": 30,
+    "cache_read_input_tokens": 10,
+    "cache_creation_input_tokens": 20,
+    "output_tokens": 5
+  }
+}

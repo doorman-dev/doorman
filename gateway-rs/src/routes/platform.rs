@@ -7087,6 +7087,7 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/platform/ai/budgets/{budget_id}"),
     ("GET", "/platform/ai/settings"),
     ("PUT", "/platform/ai/settings"),
+    ("GET", "/platform/ai/unified/resolve"),
     ("GET", "/platform/ai/guardrails"),
     ("POST", "/platform/ai/guardrails"),
     ("POST", "/platform/ai/guardrails/test"),

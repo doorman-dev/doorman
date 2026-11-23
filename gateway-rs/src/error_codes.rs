@@ -176,6 +176,10 @@ impl ErrorCode {
     pub const AI_FIRST_BYTE_TIMEOUT: &str = "AI010";
     /// 502: token exchange failed, or the stored cloud credential is malformed.
     pub const AI_PROVIDER_SIGN_IN_FAILED: &str = "AI011";
+    /// 400: the unified endpoint can't express this request in the provider's format.
+    pub const AI_TRANSLATION_FAILED: &str = "AI012";
+    /// 404: no AI API the caller can use serves the requested model (unified endpoint).
+    pub const AI_NO_PROVIDER_FOR_MODEL: &str = "AI013";
 }
 
 pub type ErrorCodes = ErrorCode;

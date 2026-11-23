@@ -1,0 +1,25 @@
+{
+  "model": "fast",
+  "messages": [
+    {"role": "system", "content": "Be concise."},
+    {"role": "developer", "content": "Use Celsius."},
+    {"role": "user", "content": [{"type":"text","text":"What is the weather?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]},
+    {"role": "assistant", "content": null, "tool_calls": [{"id":"call_0","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"},"thought_signature":"YWJj"}]},
+    {"role": "tool", "tool_call_id": "call_0", "content": "{\"temperature\":18}"}
+  ],
+  "tools": [{"type":"function","function":{"name":"weather","description":"Get current weather","parameters":{
+    "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
+    "properties":{"city":{"type":["string","null"]},"additionalProperties":{"type":"boolean"}},
+    "required":["city"]
+  }}}],
+  "tool_choice": {"type":"function","function":{"name":"weather"}},
+  "max_completion_tokens": 4096,
+  "temperature": 0.3,
+  "top_p": 0.8,
+  "stop": ["END"],
+  "response_format": {"type":"json_schema","json_schema":{"name":"weather","schema":{
+    "type":"object","properties":{"temperature":{"type":"integer"}},"required":["temperature"]
+  }}},
+  "reasoning_effort": "low",
+  "stream": true
+}

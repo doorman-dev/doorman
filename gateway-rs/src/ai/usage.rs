@@ -148,6 +148,9 @@ pub struct FinalizeCtx {
     pub budget_charges: Vec<crate::ai::budgets::BudgetCharge>,
     /// Set when the effective log level is `full`.
     pub prompt_log: Option<PromptLog>,
+    /// The model name the client sent to the unified endpoint (`/api/ai/v1`);
+    /// None for native requests.
+    pub unified_model: Option<String>,
 }
 
 /// Content captured for `ai_prompt_logs` (log level `full`, C8). Text is
@@ -243,6 +246,8 @@ pub fn activity_block(ctx: &FinalizeCtx, usage: &AiUsage, cost: CostResult) -> V
         "stream": ctx.stream,
         "redactions": ctx.redactions,
         "fallbacks": ctx.fallbacks,
+        "entry": if ctx.unified_model.is_some() { "unified" } else { "native" },
+        "requested_model": ctx.unified_model,
     })
 }
 

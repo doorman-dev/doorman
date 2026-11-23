@@ -1,0 +1,11 @@
+[
+  {"event":"messageStart","data":{"role":"assistant"}},
+  {"event":"contentBlockDelta","data":{"contentBlockIndex":0,"delta":{"text":"Checking."}}},
+  {"event":"contentBlockStop","data":{"contentBlockIndex":0}},
+  {"event":"contentBlockStart","data":{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"tool_weather","name":"weather"}}}},
+  {"event":"contentBlockDelta","data":{"contentBlockIndex":2,"delta":{"toolUse":{"input":"{\"city\":"}}}},
+  {"event":"contentBlockDelta","data":{"contentBlockIndex":2,"delta":{"toolUse":{"input":"\"Paris\"}"}}}},
+  {"event":"contentBlockStop","data":{"contentBlockIndex":2}},
+  {"event":"messageStop","data":{"stopReason":"tool_use"}},
+  {"event":"metadata","data":{"usage":{"inputTokens":30,"cacheReadInputTokens":10,"cacheWriteInputTokens":5,"outputTokens":8}}}
+]

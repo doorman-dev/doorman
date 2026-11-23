@@ -148,7 +148,28 @@ pub fn resolve_inbound(
         headers.insert(header::AUTHORIZATION, bearer);
         return Ok(InboundAuth::Jwt);
     }
-    let hash = hash_key(&credential);
+    let (record, username) = valid_key_record(&credential, docs)?;
+    if let Some(scope) = record.get("api_scope").and_then(Value::as_array) {
+        if !scope.is_empty() && !scope.iter().any(|entry| entry.as_str() == Some(api)) {
+            return Err(invalid_key("AI access key is not valid for this API"));
+        }
+    }
+    let key_id = record
+        .get("key_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_key("Invalid AI access key"))?;
+    Ok(InboundAuth::Key(AiPrincipal {
+        username: username.to_owned(),
+        key_id: key_id.to_owned(),
+    }))
+}
+
+/// A `dk_` key that exists, is unrevoked and unexpired, and belongs to an active user.
+fn valid_key_record<'a>(
+    credential: &str,
+    docs: &'a PolicyDocuments,
+) -> Result<(&'a Value, &'a str), PolicyFailure> {
+    let hash = hash_key(credential);
     let record = docs
         .ai_access_keys
         .iter()
@@ -176,18 +197,44 @@ pub fn resolve_inbound(
     if !user_active {
         return Err(invalid_key("Invalid AI access key"));
     }
-    if let Some(scope) = record.get("api_scope").and_then(Value::as_array) {
-        if !scope.is_empty() && !scope.iter().any(|entry| entry.as_str() == Some(api)) {
-            return Err(invalid_key("AI access key is not valid for this API"));
-        }
+    Ok((record, username))
+}
+
+/// The owner and API scope of the caller's `dk_` key, without checking the scope
+/// against any API (the unified endpoint resolves the API afterwards and the
+/// normal pipeline re-checks it). `Ok(None)`: the credential is not a `dk_` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyOwner {
+    pub username: String,
+    pub api_scope: Vec<String>,
+}
+
+pub fn peek_key(
+    headers: &HeaderMap,
+    query: &[(String, String)],
+    docs: &PolicyDocuments,
+) -> Result<Option<KeyOwner>, PolicyFailure> {
+    let Some(credential) = inbound_credential(headers, query) else {
+        return Ok(None);
+    };
+    if !credential.starts_with(KEY_PREFIX) {
+        return Ok(None);
     }
-    let key_id = record
-        .get("key_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_key("Invalid AI access key"))?;
-    Ok(InboundAuth::Key(AiPrincipal {
+    let (record, username) = valid_key_record(&credential, docs)?;
+    let api_scope = record
+        .get("api_scope")
+        .and_then(Value::as_array)
+        .map(|scope| {
+            scope
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(KeyOwner {
         username: username.to_owned(),
-        key_id: key_id.to_owned(),
+        api_scope,
     }))
 }
 

@@ -1,0 +1,9 @@
+{
+  "output":{"message":{"role":"assistant","content":[
+    {"text":"Checking."},
+    {"reasoningContent":{"reasoningText":{"text":"internal"}}},
+    {"toolUse":{"toolUseId":"tool_weather","name":"weather","input":{"city":"Paris"}}}
+  ]}},
+  "stopReason":"tool_use",
+  "usage":{"inputTokens":30,"cacheReadInputTokens":10,"cacheWriteInputTokens":5,"outputTokens":8,"totalTokens":38}
+}

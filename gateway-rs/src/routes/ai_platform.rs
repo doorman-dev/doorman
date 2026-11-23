@@ -94,6 +94,20 @@ pub(crate) async fn dispatch(
         }
         (Method::GET, ["ai", "usage", "me"]) => usage_me(state, username, request_id).await,
         (Method::GET, ["ai", "settings"]) => get_settings(state, request_id).await,
+        (Method::GET, ["ai", "unified", "resolve"]) => {
+            if !has_permission(state, username, "manage_apis").await {
+                return forbidden(
+                    "You do not have permission to preview AI model routing",
+                    request_id,
+                );
+            }
+            let target = query
+                .get("username")
+                .map(String::as_str)
+                .filter(|target| !target.is_empty())
+                .unwrap_or(username);
+            unified_resolve(state, target, request_id).await
+        }
         (Method::PUT, ["ai", "settings"]) => {
             if !has_permission(state, username, "manage_ai").await {
                 return forbidden(
@@ -874,6 +888,7 @@ async fn export_csv(
 
 /// Signed-in user's month-to-date usage; budgets are filled in by C10.
 async fn usage_me(state: &AppState, username: &str, request_id: &str) -> Response {
+    let (apis, unified) = my_ai_apis(state, username).await;
     let today = now().date();
     let month = today.to_string()[..7].to_owned();
     let Some(storage) = &state.storage else {
@@ -905,7 +920,8 @@ async fn usage_me(state: &AppState, username: &str, request_id: &str) -> Respons
                 "cost_usd": format_usd(totals.cost_nanos),
             },
             "budgets": own_budget_statuses(state, username).await,
-            "apis": my_ai_apis(state, username).await,
+            "apis": apis,
+            "unified": unified,
         }),
         request_id,
     )
@@ -913,68 +929,82 @@ async fn usage_me(state: &AppState, username: &str, request_id: &str) -> Respons
 
 /// The active AI APIs `username` may call, with what an SDK needs to connect
 /// (same subscription and group checks as the data plane).
-async fn my_ai_apis(state: &AppState, username: &str) -> Vec<Value> {
+async fn my_ai_apis(state: &AppState, username: &str) -> (Vec<Value>, Value) {
     let Some(documents) = policy_documents(state).await else {
-        return Vec::new();
+        return (Vec::new(), json!({"enabled": false, "models": []}));
     };
-    let Some(user) = documents
-        .users
-        .iter()
-        .find(|user| user.get("username").and_then(Value::as_str) == Some(username))
-    else {
-        return Vec::new();
+    let Some(user) = crate::ai::access::find_user(&documents, username) else {
+        return (Vec::new(), json!({"enabled": false, "models": []}));
     };
-    let mut apis: Vec<Value> = documents
-        .apis
+    let usable = crate::ai::access::usable_ai_apis(&documents, user);
+    let apis = usable
         .iter()
-        .filter(|api| crate::platform_contract::is_ai_api(api))
-        .filter(|api| api.get("active").and_then(Value::as_bool) != Some(false))
-        .filter(|api| crate::policy::groups::enforce_group_access(api, user).is_ok())
-        .filter_map(|api| {
-            let name = api.get("api_name").and_then(Value::as_str)?;
-            let version = api.get("api_version").and_then(Value::as_str)?;
-            let provider = api
-                .get("api_ai_provider")
-                .and_then(Value::as_str)
-                .and_then(crate::ai::adapter::AiProvider::parse)?;
-            let config = api
-                .get("api_ai_config")
-                .and_then(|config| crate::ai::config::AiApiConfig::from_value(config).ok())?;
-            if config.require_subscription
-                && crate::policy::subscription::enforce_subscription(
-                    &format!("{name}/{version}"),
-                    user,
-                    &documents.roles,
-                    &documents.subscriptions,
-                    false,
-                )
-                .is_err()
-            {
-                return None;
-            }
-            let mut models: Vec<String> = config
-                .allowed_models
-                .iter()
-                .filter(|model| !model.ends_with('*'))
-                .cloned()
-                .collect();
-            models.extend(config.model_aliases.keys().cloned());
-            Some(json!({
-                "api_name": name,
-                "api_version": version,
-                "provider": provider.as_str(),
-                "sdk_base_url_suffix": crate::ai::adapter::preset(provider).sdk_base_url_suffix,
-                "default_model": config.default_model,
-                "models": models,
-                "model_patterns": config.allowed_models,
-            }))
+        .map(|api| {
+            json!({
+                "api_name": api.name,
+                "api_version": api.version,
+                "provider": api.provider.as_str(),
+                "sdk_base_url_suffix": crate::ai::adapter::preset(api.provider).sdk_base_url_suffix,
+                "default_model": api.config.default_model,
+                "models": api.model_names(),
+                "model_patterns": api.config.allowed_models,
+            })
         })
         .collect();
-    apis.sort_by(|a, b| {
-        (a["api_name"].as_str(), a["api_version"].as_str())
-            .cmp(&(b["api_name"].as_str(), b["api_version"].as_str()))
+    let settings = crate::storage::ai_settings::from_documents(&documents.settings);
+    let enabled = crate::ai::access::unified_enabled(&settings) && !usable.is_empty();
+    let unified = json!({
+        "enabled": enabled,
+        "base_url_suffix": "/api/ai/v1",
+        "models": if enabled { crate::ai::access::unified_models(&settings, &usable) } else { Vec::new() },
     });
-    apis
+    (apis, unified)
+}
+
+/// Admin preview: what each model name resolves to on the unified endpoint for
+/// `username` (key scope not applied).
+async fn unified_resolve(state: &AppState, username: &str, request_id: &str) -> Response {
+    let Some(documents) = policy_documents(state).await else {
+        return unexpected(request_id);
+    };
+    let settings = crate::storage::ai_settings::from_documents(&documents.settings);
+    let usable = crate::ai::access::find_user(&documents, username)
+        .map(|user| crate::ai::access::usable_ai_apis(&documents, user))
+        .unwrap_or_default();
+    let models: Vec<Value> = crate::ai::access::unified_models(&settings, &usable)
+        .iter()
+        .map(|model| {
+            let targets: Vec<Value> = crate::ai::access::resolve(&settings, &usable, model)
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "api": format!("{}/{}", c.api_name, c.api_version),
+                        "provider": c.provider.as_str(),
+                        "model": c.model,
+                    })
+                })
+                .collect();
+            let via = if settings["unified"]["routes"]
+                .as_array()
+                .is_some_and(|routes| routes.iter().any(|route| route["model"] == *model))
+            {
+                "route"
+            } else {
+                "auto"
+            };
+            json!({"model": model, "via": via, "targets": targets})
+        })
+        .collect();
+    success(
+        StatusCode::OK,
+        json!({
+            "username": username,
+            "enabled": crate::ai::access::unified_enabled(&settings),
+            "routes": settings["unified"]["routes"],
+            "models": models,
+        }),
+        request_id,
+    )
 }
 
 // ── Budgets ─────────────────────────────────────────────────────────────────
@@ -1644,6 +1674,7 @@ fn settings_body(settings: &Value) -> Value {
         "notice_text": settings["notice_text"],
         "egress_ips": egress_ips(),
         "user_id_salt_set": crate::ai::user_id_salt_set(),
+        "unified": settings["unified"],
     })
 }
 
@@ -1700,6 +1731,12 @@ async fn put_settings(
                 };
             }
             _ => errors.push("notice_text: must be a string of at most 2000 characters".to_owned()),
+        }
+    }
+    if let Some(unified) = payload.get("unified").filter(|value| !value.is_null()) {
+        match crate::ai::access::validate_unified(unified) {
+            Ok(unified) => settings["unified"] = unified,
+            Err(error) => errors.push(error),
         }
     }
     if payload.get("egress_ips").is_some() {

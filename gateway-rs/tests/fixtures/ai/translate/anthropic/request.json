@@ -1,0 +1,21 @@
+{
+  "model": "fast",
+  "messages": [
+    {"role": "system", "content": "Keep answers short."},
+    {"role": "developer", "content": [{"type": "text", "text": "Use metric units."}]},
+    {"role": "user", "content": "What is in the image?"},
+    {"role": "user", "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+tm6QAAAAASUVORK5CYII="}},
+      {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpeg"}}
+    ]},
+    {"role": "assistant", "content": "One pixel."},
+    {"role": "user", "content": "What color?"}
+  ],
+  "stop": "END",
+  "max_completion_tokens": 2048,
+  "max_tokens": 1024,
+  "temperature": 0.2,
+  "top_p": 0.8,
+  "user": "client-user",
+  "stream": true
+}
