@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -102,8 +102,8 @@ pub fn parse_token_response(body: &[u8]) -> Result<(String, Duration), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{decode, DecodingKey, Validation};
-    use serde_json::{json, Value};
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+    use serde_json::{Value, json};
     use time::macros::datetime;
 
     const PRIVATE_KEY: &str = include_str!("../../tests/fixtures/ai/vertex/private.pem");
@@ -152,9 +152,11 @@ mod tests {
         for field in ["type", "client_email", "private_key"] {
             let mut incomplete = complete.clone();
             incomplete.as_object_mut().unwrap().remove(field);
-            assert!(!parse(&incomplete.to_string())
-                .unwrap_err()
-                .contains("throwaway-test-key-marker"));
+            assert!(
+                !parse(&incomplete.to_string())
+                    .unwrap_err()
+                    .contains("throwaway-test-key-marker")
+            );
         }
         let sa = parse(&complete.to_string()).unwrap();
         let error = assertion(&sa, CLOUD_PLATFORM_SCOPE, OffsetDateTime::UNIX_EPOCH).unwrap_err();
