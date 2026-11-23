@@ -231,7 +231,7 @@ An unresolved model returns this response.
 ```json
 {
   "error": {
-    "message": "No AI provider you can use serves this model",
+    "message": "No AI provider you can use serves the model not-a-model",
     "type": "not_found_error",
     "code": "AI013",
     "param": null
