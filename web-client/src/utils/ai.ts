@@ -1,6 +1,17 @@
-export type AiProvider = 'openai' | 'anthropic' | 'gemini' | 'azure_openai' | 'openai_compatible'
+export const AI_PROVIDERS = ['openai', 'anthropic', 'gemini', 'azure_openai', 'openai_compatible', 'bedrock', 'vertex'] as const
+export type AiProvider = typeof AI_PROVIDERS[number]
+
+export const BEDROCK_REGIONS = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'ca-central-1', 'eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-north-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1', 'ap-southeast-1', 'ap-southeast-2', 'sa-east-1']
+export const VERTEX_LOCATIONS = ['global', 'us-central1', 'us-east1', 'us-east4', 'us-east5', 'us-west1', 'us-west4', 'northamerica-northeast1', 'europe-west1', 'europe-west2', 'europe-west3', 'europe-west4', 'asia-east1', 'asia-northeast1', 'asia-southeast1', 'australia-southeast1']
+export const bedrockEndpoint = (region: string) => `https://bedrock-runtime.${region}.amazonaws.com`
+export const vertexEndpoint = (location: string) => location === 'global' ? 'https://aiplatform.googleapis.com' : `https://${location}-aiplatform.googleapis.com`
+
+export function bedrockEndpointRegion(server?: string | null): string {
+  return server?.match(/^https:\/\/bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com\/?$/i)?.[1] || ''
+}
+
 export type AiLogLevel = 'none' | 'metadata' | 'full'
-export type AiOperation = 'chat' | 'responses' | 'messages' | 'count_tokens' | 'generate' | 'embed' | 'models'
+export type AiOperation = 'chat' | 'responses' | 'messages' | 'count_tokens' | 'generate' | 'embed' | 'models' | 'converse' | 'invoke'
 
 export interface AiProviderPreset {
   id: AiProvider
@@ -18,6 +29,8 @@ export interface AiApiConfig {
   credential_overrides: { group: string; credential_group: string }[]
   allowed_models: string[]
   default_model: string | null
+  region?: string | null
+  project_id?: string | null
   model_aliases: Record<string, string>
   allowed_operations: AiOperation[] | null
   max_output_tokens: number | null
@@ -249,6 +262,8 @@ const providerLabels: Record<AiProvider, string> = {
   gemini: 'Gemini API',
   azure_openai: 'Azure OpenAI',
   openai_compatible: 'OpenAI-compatible',
+  bedrock: 'Amazon Bedrock',
+  vertex: 'Google Vertex AI',
 }
 
 export function providerLabel(id: string): string {

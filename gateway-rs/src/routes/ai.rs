@@ -22,9 +22,13 @@ use serde_json::Value;
 
 use crate::{
     ai::{
-        adapter::{AiProvider, INBOUND_CREDENTIAL_HEADERS, INBOUND_CREDENTIAL_QUERY},
+        adapter::{
+            AiProvider, INBOUND_CREDENTIAL_HEADERS, INBOUND_CREDENTIAL_QUERY, StreamFraming,
+            UpstreamCtx,
+        },
         budgets,
         config::{AiApiConfig, model_allowed},
+        credentials::{self, OutboundRequest},
         failover,
         guardrails::{self, CompiledGuardrails, Direction},
         keys::{InboundAuth, record_last_used, resolve_inbound},
@@ -76,8 +80,11 @@ struct UpstreamTarget {
 }
 
 fn is_passthrough_response_header(name: &str) -> bool {
-    matches!(name, "retry-after" | "request-id" | "x-request-id")
-        || name.starts_with("x-ratelimit-")
+    matches!(
+        name,
+        "retry-after" | "request-id" | "x-request-id" | "x-amzn-requestid" | "x-amzn-errortype"
+    ) || name.starts_with("x-ratelimit-")
+        || name.starts_with("x-amzn-bedrock-")
         || name.starts_with("anthropic-ratelimit-")
 }
 
@@ -442,7 +449,8 @@ pub(crate) async fn execute_ai(
     if info.generation {
         let input_rails = rails.applicable(&api_label, &user_groups, Direction::Input);
         if !input_rails.is_empty() {
-            let outcome = guardrails::apply(provider, Direction::Input, &mut body, &input_rails);
+            let outcome =
+                guardrails::apply(info.dialect, Direction::Input, &mut body, &input_rails);
             log_guardrail_hits(&api_label, "input", &outcome);
             if let Some(guardrail) = outcome.blocked_by {
                 return Ok(guardrail_block_response(&guardrail));
@@ -500,7 +508,11 @@ pub(crate) async fn execute_ai(
     }
 
     let mut rest_path = route.rest_path.clone();
-    if info.model.as_deref() != Some(model.as_str()) {
+    // Bedrock and Vertex adapters also default `anthropic_version` (and Vertex's
+    // `stream`) in `set_model`, so it always runs for them.
+    if info.model.as_deref() != Some(model.as_str())
+        || matches!(provider, AiProvider::Bedrock | AiProvider::Vertex)
+    {
         rest_path = adapter.set_model(&info, &rest_path, &mut body, &model);
     }
     if info.generation {
@@ -676,18 +688,81 @@ pub(crate) async fn execute_ai(
     'targets: for (position, &slot) in order.iter().enumerate() {
         let target = &targets[slot];
         let has_next = position + 1 < order.len();
-        let mut target_headers = headers.clone();
-        if let Some((header_name, key)) = &target.credential {
-            let header_override =
-                (provider == AiProvider::OpenaiCompatible).then_some(header_name.as_str());
-            adapter.apply_credential(&mut target_headers, key, header_override);
-        }
+        // Sign-in happens only for targets actually tried (Vertex token exchange).
+        let prepared = match &target.credential {
+            Some((_, key)) => match credentials::prepare(provider, key, &client).await {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    tracing::error!(api = %api_label, target = target.index, %error, "AI provider sign-in failed");
+                    if has_next {
+                        failover::bench_target(&bench_keys[slot], failover::ERROR_COOL_DOWN);
+                        fallbacks += 1;
+                        continue 'targets;
+                    }
+                    return Ok(ai_error(
+                        StatusCode::BAD_GATEWAY,
+                        ErrorCode::AI_PROVIDER_SIGN_IN_FAILED,
+                        &error.0,
+                    ));
+                }
+            },
+            None => None,
+        };
+        // Each target has its own region (and so its own path and signature).
+        let region = credentials::region_for(provider, &target.server, config.region.as_deref());
+        let project_id = config
+            .project_id
+            .clone()
+            .filter(|project| !project.trim().is_empty())
+            .or_else(|| {
+                prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.project_id.clone())
+            });
+        let target_path = adapter.upstream_path(
+            &info,
+            &rest_path,
+            &UpstreamCtx {
+                region: region.as_deref(),
+                project_id: project_id.as_deref(),
+            },
+        );
         let url = format!(
             "{}/{}{}",
             target.server.trim_end_matches('/'),
-            rest_path.trim_start_matches('/'),
+            target_path.trim_start_matches('/'),
             query
         );
+        let mut target_headers = headers.clone();
+        if let (Some(prepared), Some((header_name, _))) = (&prepared, &target.credential) {
+            let header_override =
+                (provider == AiProvider::OpenaiCompatible).then_some(header_name.as_str());
+            let outbound = OutboundRequest {
+                method: &method,
+                url: &url,
+                body: &outbound_body,
+                region: region.as_deref(),
+            };
+            if let Err(error) = credentials::apply(
+                &prepared.credential,
+                adapter,
+                header_override,
+                &outbound,
+                &mut target_headers,
+            ) {
+                tracing::error!(api = %api_label, target = target.index, %error, "AI request signing failed");
+                if has_next {
+                    failover::bench_target(&bench_keys[slot], failover::ERROR_COOL_DOWN);
+                    fallbacks += 1;
+                    continue 'targets;
+                }
+                return Ok(ai_error(
+                    StatusCode::BAD_GATEWAY,
+                    ErrorCode::AI_PROVIDER_SIGN_IN_FAILED,
+                    &error.0,
+                ));
+            }
+        }
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
@@ -767,10 +842,13 @@ pub(crate) async fn execute_ai(
         record_success(&state.runtime.circuits, &circuit_key);
     }
     let upstream_headers = upstream.headers().clone();
-    let is_stream = upstream_headers
+    let upstream_content_type = upstream_headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let is_event_stream = upstream_content_type.starts_with("application/vnd.amazon.eventstream");
+    let is_stream = is_event_stream || upstream_content_type.starts_with("text/event-stream");
 
     let allowed = decision
         .allowed_headers
@@ -851,11 +929,17 @@ pub(crate) async fn execute_ai(
 
     if is_stream {
         let idle = std::time::Duration::from_millis(config.stream_idle_timeout_ms.max(1));
-        let tap = UsageTap::new(
+        let framing = if is_event_stream {
+            StreamFraming::AwsEventStream
+        } else {
+            StreamFraming::Sse
+        };
+        let tap = UsageTap::with_framing(
             upstream.bytes_stream().boxed(),
             adapter.stream_usage(&info),
             ctx,
             idle,
+            framing,
         );
         let mut response = Response::new(Body::from_stream(tap));
         *response.status_mut() = status;
@@ -863,7 +947,11 @@ pub(crate) async fn execute_ai(
         let headers = response.headers_mut();
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
+            HeaderValue::from_static(if is_event_stream {
+                "application/vnd.amazon.eventstream"
+            } else {
+                "text/event-stream"
+            }),
         );
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -914,7 +1002,7 @@ pub(crate) async fn execute_ai(
     {
         let output_rails = rails.applicable(&ctx.api, &user_groups, Direction::Output);
         if !output_rails.is_empty() {
-            let outcome = guardrails::apply(provider, Direction::Output, json, &output_rails);
+            let outcome = guardrails::apply(info.dialect, Direction::Output, json, &output_rails);
             log_guardrail_hits(&ctx.api, "output", &outcome);
             if let Some(guardrail) = outcome.blocked_by {
                 let usage = adapter

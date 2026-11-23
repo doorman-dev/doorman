@@ -1,6 +1,6 @@
 //! Scoped, compiled text detectors. Outcomes contain only detector IDs and counts.
 
-use crate::ai::adapter::AiProvider;
+use crate::ai::adapter::Dialect;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -93,11 +93,12 @@ impl CompiledGuardrails {
 }
 
 pub fn apply(
-    provider: AiProvider,
+    dialect: impl Into<Dialect>,
     direction: Direction,
     body: &mut Value,
     rails: &[&Guardrail],
 ) -> GuardrailOutcome {
+    let dialect = dialect.into();
     let mut outcome = GuardrailOutcome::default();
     let rails: Vec<_> = rails
         .iter()
@@ -115,7 +116,7 @@ pub fn apply(
         .iter()
         .filter(|rail| !rail.dry_run && rail.action == Action::Block)
     {
-        walk_body(provider, direction, body, &mut |text| {
+        walk_body(dialect, direction, body, &mut |text| {
             if outcome.blocked_by.is_none() && !find_hits(rail, text).is_empty() {
                 outcome.blocked_by = Some(rail.name.clone());
             }
@@ -124,7 +125,7 @@ pub fn apply(
             return outcome;
         }
     }
-    walk_body(provider, direction, body, &mut |text| {
+    walk_body(dialect, direction, body, &mut |text| {
         let mut redaction_hits = Vec::new();
         for rail in &rails {
             let hits = find_hits(rail, text);
@@ -432,25 +433,47 @@ fn walk_gemini_parts(content: &mut Value, visit: &mut impl FnMut(&mut String)) {
         }
     }
 }
+fn walk_converse_text(content: Option<&mut Value>, visit: &mut impl FnMut(&mut String)) {
+    if let Some(blocks) = content.and_then(Value::as_array_mut) {
+        for block in blocks {
+            if let Some(Value::String(text)) = block.get_mut("text") {
+                visit(text);
+            }
+        }
+    }
+}
+
 fn walk_body(
-    provider: AiProvider,
+    dialect: Dialect,
     direction: Direction,
     body: &mut Value,
     visit: &mut impl FnMut(&mut String),
 ) {
-    match (provider, direction) {
-        (AiProvider::Anthropic, Direction::Input) => {
+    match (dialect, direction) {
+        (Dialect::Opaque, _) => {}
+        (Dialect::BedrockConverse, Direction::Input) => {
+            walk_converse_text(body.get_mut("system"), visit);
+            if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+                for message in messages {
+                    walk_converse_text(message.get_mut("content"), visit);
+                }
+            }
+        }
+        (Dialect::BedrockConverse, Direction::Output) => {
+            walk_converse_text(body.pointer_mut("/output/message/content"), visit);
+        }
+        (Dialect::Anthropic, Direction::Input) => {
             if let Some(system) = body.get_mut("system") {
                 walk_content(system, visit);
             }
             walk_messages(body, visit);
         }
-        (AiProvider::Anthropic, Direction::Output) => {
+        (Dialect::Anthropic, Direction::Output) => {
             if let Some(content) = body.get_mut("content") {
                 walk_content(content, visit);
             }
         }
-        (AiProvider::Gemini, Direction::Input) => {
+        (Dialect::Gemini, Direction::Input) => {
             if let Some(system) = body.get_mut("systemInstruction") {
                 walk_gemini_parts(system, visit);
             }
@@ -460,10 +483,10 @@ fn walk_body(
                 }
             }
         }
-        (AiProvider::Gemini, Direction::Output) => {
+        (Dialect::Gemini, Direction::Output) => {
             if let Some(chunks) = body.as_array_mut() {
                 for chunk in chunks {
-                    walk_body(provider, direction, chunk, visit);
+                    walk_body(dialect, direction, chunk, visit);
                 }
             } else if let Some(candidates) =
                 body.get_mut("candidates").and_then(Value::as_array_mut)
@@ -475,7 +498,7 @@ fn walk_body(
                 }
             }
         }
-        (_, Direction::Input) => {
+        (Dialect::OpenaiChat | Dialect::OpenaiResponses, Direction::Input) => {
             walk_messages(body, visit);
             if let Some(instructions) = body.get_mut("instructions") {
                 walk_content(instructions, visit);
@@ -502,7 +525,7 @@ fn walk_body(
                 }
             }
         }
-        (_, Direction::Output) => {
+        (Dialect::OpenaiChat | Dialect::OpenaiResponses, Direction::Output) => {
             if let Some(choices) = body.get_mut("choices").and_then(Value::as_array_mut) {
                 for choice in choices {
                     if let Some(content) = choice
@@ -529,6 +552,7 @@ fn walk_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::adapter::AiProvider;
     fn doc(action: &str) -> Value {
         json!({"guardrail_id":"rail","name":"Protect email","enabled":true,"applies_to":{"apis":["*"],"groups":["*"]},"direction":"both","detectors":[{"type":"builtin","id":"email"}],"action":action,"mode":"enforce"})
     }
@@ -537,6 +561,47 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         rails
     }
+    #[test]
+    fn redacts_converse_text_in_both_directions() {
+        let rails = compiled(doc("redact"));
+        let email = "person@example.test";
+        let mut request = json!({
+            "system": [{"text": email}],
+            "messages": [{"role": "user", "content": [
+                {"text": email},
+                {"toolResult": {"content": [{"text": email}]}}
+            ]}]
+        });
+        let mut response = json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": email}]}}
+        });
+        for (direction, body, count) in [
+            (Direction::Input, &mut request, 2),
+            (Direction::Output, &mut response, 1),
+        ] {
+            let outcome = apply(
+                Dialect::BedrockConverse,
+                direction,
+                body,
+                &rails.applicable("api/v1", &[], direction),
+            );
+            assert_eq!(outcome.redactions, [("email".into(), count)]);
+        }
+        assert_eq!(request["system"][0]["text"], "[REDACTED:email]");
+        assert_eq!(
+            request["messages"][0]["content"][0]["text"],
+            "[REDACTED:email]"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][1]["toolResult"]["content"][0]["text"],
+            email
+        );
+        assert_eq!(
+            response["output"]["message"]["content"][0]["text"],
+            "[REDACTED:email]"
+        );
+    }
+
     #[test]
     fn redacts_email_in_openai_chat_parts() {
         let rails = compiled(doc("redact"));

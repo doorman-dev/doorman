@@ -445,6 +445,59 @@ pub fn validate_ai_api(api: &Value) -> Result<(), Vec<Value>> {
         if config.first_byte_timeout_ms == 0 || config.stream_idle_timeout_ms == 0 {
             fail("api_ai_config", "timeouts must be greater than 0");
         }
+        // Region and project are spliced into upstream URLs: keep them to [a-z0-9-].
+        let path_safe = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 63
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        };
+        if config
+            .region
+            .as_deref()
+            .is_some_and(|region| !path_safe(region.trim()))
+        {
+            fail(
+                "api_ai_config.region",
+                "region must use lowercase letters, digits and hyphens",
+            );
+        }
+        if config
+            .project_id
+            .as_deref()
+            .is_some_and(|project| !path_safe(project.trim()))
+        {
+            fail(
+                "api_ai_config.project_id",
+                "project ID must use lowercase letters, digits and hyphens",
+            );
+        }
+        if let Some(provider @ (AiProvider::Bedrock | AiProvider::Vertex)) = provider {
+            let backup_servers = config
+                .fallback_targets
+                .iter()
+                .filter_map(|target| target.server.as_deref());
+            let unknown = servers
+                .iter()
+                .copied()
+                .filter(|server| !server.trim().is_empty())
+                .chain(backup_servers)
+                .any(|server| {
+                    crate::ai::credentials::region_for(provider, server, config.region.as_deref())
+                        .is_none()
+                });
+            if unknown {
+                fail(
+                    "api_ai_config.region",
+                    if provider == AiProvider::Bedrock {
+                        "set a region, or use a bedrock-runtime.{region}.amazonaws.com server"
+                    } else {
+                        "set a location, or use a {location}-aiplatform.googleapis.com server"
+                    },
+                );
+            }
+        }
         if config.fallback_targets.len() > crate::ai::config::MAX_FALLBACK_TARGETS {
             fail(
                 "api_ai_config.fallback_targets",
@@ -791,7 +844,7 @@ mod tests {
             ai_error_fields(prepare_ai_api(&mut api)),
             vec!["api_ai_config"]
         );
-        let mut api = ai_api(json!({"api_ai_provider": "vertex"}));
+        let mut api = ai_api(json!({"api_ai_provider": "aws"}));
         assert_eq!(
             ai_error_fields(prepare_ai_api(&mut api)),
             vec!["api_ai_provider", "api_servers"]
@@ -812,6 +865,69 @@ mod tests {
         assert_eq!(
             ai_error_fields(prepare_ai_api(&mut api)),
             vec!["api_ai_config.credential_overrides"]
+        );
+    }
+
+    #[test]
+    fn bedrock_and_vertex_need_a_known_region() {
+        let cloud = |provider: &str, server: &str, extra: Value| {
+            let mut config = json!({"credential_group": "cloud", "allowed_models": ["m"]});
+            for (key, value) in extra.as_object().unwrap() {
+                config[key] = value.clone();
+            }
+            validate_ai_api(&ai_api(json!({
+                "api_ai_provider": provider,
+                "api_servers": [server],
+                "api_ai_config": config,
+            })))
+        };
+        assert!(
+            cloud(
+                "bedrock",
+                "https://bedrock-runtime.us-west-2.amazonaws.com",
+                json!({})
+            )
+            .is_ok()
+        );
+        assert!(cloud("vertex", "https://aiplatform.googleapis.com", json!({})).is_ok());
+        assert!(
+            cloud(
+                "vertex",
+                "https://europe-west1-aiplatform.googleapis.com",
+                json!({"project_id": "acme-ai"})
+            )
+            .is_ok()
+        );
+        // Custom hosts (tests, proxies) need an explicit region.
+        assert_eq!(
+            ai_error_fields(cloud("bedrock", "http://10.0.0.5:8080", json!({}))),
+            ["api_ai_config.region"]
+        );
+        assert!(
+            cloud(
+                "bedrock",
+                "http://10.0.0.5:8080",
+                json!({"region": "us-east-1"})
+            )
+            .is_ok()
+        );
+        // A backup on a custom host is checked too.
+        assert_eq!(
+            ai_error_fields(cloud(
+                "bedrock",
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                json!({"fallback_targets": [{"server": "http://10.0.0.6"}]})
+            )),
+            ["api_ai_config.region"]
+        );
+        // Region and project are spliced into URLs.
+        assert_eq!(
+            ai_error_fields(cloud(
+                "vertex",
+                "https://aiplatform.googleapis.com",
+                json!({"region": "us/../x", "project_id": "Acme Project"})
+            )),
+            ["api_ai_config.region", "api_ai_config.project_id"]
         );
     }
 

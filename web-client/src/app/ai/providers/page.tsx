@@ -9,7 +9,7 @@ import AiBackupsEditor, { backupsSummary } from '@/components/AiBackupsEditor'
 import { useAuth } from '@/contexts/AuthContext'
 import { fetchAllPaginated, getJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import { formatTokens, formatUsd, providerLabel, type AiApiConfig, type AiBreakdown, type AiUsageRow } from '@/utils/ai'
+import { bedrockEndpointRegion, formatTokens, formatUsd, providerLabel, type AiApiConfig, type AiBreakdown, type AiUsageRow } from '@/utils/ai'
 
 interface AiApi {
   api_id?: string
@@ -26,6 +26,7 @@ const TABS = [{ id: 'providers', label: 'Providers' }, { id: 'prices', label: 'M
 
 function ProviderCard({ api, usage, canEdit, onBackups }: { api: AiApi; usage?: AiUsageRow; canEdit: boolean; onBackups: () => void }) {
   const config = api.api_ai_config || {}
+  const location = config.region || (api.api_ai_provider === 'bedrock' ? bedrockEndpointRegion(api.api_servers?.[0]) : '')
   const hasKey = !!config.credential_group && config.credential_group !== 'none'
   const models = config.allowed_models?.length ? config.allowed_models : ['Any model']
   const aliases = Object.entries(config.model_aliases || {})
@@ -40,6 +41,8 @@ function ProviderCard({ api, usage, canEdit, onBackups }: { api: AiApi; usage?: 
       <span className={`ai-chip ${hasKey ? 'ai-chip--ok' : config.credential_group === 'none' ? 'ai-chip--off' : 'ai-chip--warn'}`}>{hasKey ? 'Key set' : config.credential_group === 'none' ? 'No key needed' : 'No key'}</span>
     </div>
     <dl className="grid grid-cols-[6.5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm">
+      {location && <><dt className="text-gray-500">{api.api_ai_provider === 'bedrock' ? 'Region' : 'Location'}</dt><dd>{location}</dd></>}
+      {api.api_ai_provider === 'vertex' && config.project_id && <><dt className="text-gray-500">Project</dt><dd className="break-words">{config.project_id}</dd></>}
       <dt className="text-gray-500">Models</dt><dd className="min-w-0 break-words">{models.join(', ')}</dd>
       {aliases.length > 0 && <><dt className="text-gray-500">Aliases</dt><dd className="min-w-0 break-words">{aliases.map(([alias, model]) => `${alias} → ${model}`).join(', ')}</dd></>}
       <dt className="text-gray-500">Who can use it</dt><dd>{who}</dd>
@@ -83,7 +86,7 @@ export default function AiProvidersPage() {
       {apis && apis.length > 0 && <p className="text-xs text-gray-500">Need full control? <Link href="/apis/add?type=AI" className="underline">Add a provider manually</Link>.</p>}
     </>}
     {tab === 'prices' && <AiPricingPanel canManage={canManage} />}
-    {editing && <AiBackupsEditor apiName={editing.api_name} apiVersion={editing.api_version} config={editing.api_ai_config || {}} onClose={() => setEditing(null)}
+    {editing && <AiBackupsEditor apiName={editing.api_name} apiVersion={editing.api_version} provider={editing.api_ai_provider} config={editing.api_ai_config || {}} onClose={() => setEditing(null)}
       onSaved={config => { setApis(current => current && current.map(api => api === editing ? { ...api, api_ai_config: config } : api)); setEditing(null) }} />}
   </AiPage>
 }

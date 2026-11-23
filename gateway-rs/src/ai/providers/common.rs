@@ -1,4 +1,6 @@
-use crate::ai::adapter::{AiRequestInfo, INBOUND_CREDENTIAL_HEADERS, INBOUND_CREDENTIAL_QUERY};
+use crate::ai::adapter::{
+    AiRequestInfo, Dialect, INBOUND_CREDENTIAL_HEADERS, INBOUND_CREDENTIAL_QUERY,
+};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
@@ -12,11 +14,19 @@ pub(super) fn request_info(
     AiRequestInfo {
         operation,
         model,
-        stream: stream && matches!(operation, "chat" | "responses" | "messages" | "generate"),
+        stream: stream && is_generation(operation),
         metered: !matches!(operation, "models" | "count_tokens"),
         local: operation == "models",
-        generation: matches!(operation, "chat" | "responses" | "messages" | "generate"),
+        generation: is_generation(operation),
+        dialect: Dialect::for_operation(operation),
     }
+}
+
+fn is_generation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "chat" | "responses" | "messages" | "generate" | "converse" | "invoke"
+    )
 }
 
 pub(super) fn body_model(body: &Value) -> Option<String> {
@@ -136,4 +146,30 @@ pub(super) fn feed_stream(parser: &mut dyn crate::ai::usage::StreamUsageParser, 
             parser.on_event(&event);
         }
     }
+}
+
+/// Decode a model path segment without interpreting a literal plus as a space.
+pub(super) fn decode_segment(segment: &str) -> Option<String> {
+    let escaped = segment
+        .replace('+', "%2B")
+        .replace('&', "%26")
+        .replace('=', "%3D");
+    url::form_urlencoded::parse(escaped.as_bytes())
+        .next()
+        .map(|(name, _)| name.into_owned())
+}
+
+/// Encode a single URL path segment, including delimiters inside model IDs.
+pub(super) fn encode_segment(segment: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~@".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to String");
+        }
+    }
+    encoded
 }

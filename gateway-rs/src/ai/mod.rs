@@ -3,11 +3,15 @@
 pub mod adapter;
 pub mod budgets;
 pub mod config;
+pub mod credentials;
+pub mod eventstream;
 pub mod failover;
+pub mod gcp_auth;
 pub mod guardrails;
 pub mod keys;
 pub mod pricing;
 pub mod providers;
+pub mod sigv4;
 pub mod sse;
 pub mod usage;
 

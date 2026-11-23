@@ -174,6 +174,8 @@ impl ErrorCode {
     pub const AI_STREAM_NOT_ALLOWED: &str = "AI008";
     pub const AI_INVALID_CONFIG: &str = "AI009";
     pub const AI_FIRST_BYTE_TIMEOUT: &str = "AI010";
+    /// 502: token exchange failed, or the stored cloud credential is malformed.
+    pub const AI_PROVIDER_SIGN_IN_FAILED: &str = "AI011";
 }
 
 pub type ErrorCodes = ErrorCode;

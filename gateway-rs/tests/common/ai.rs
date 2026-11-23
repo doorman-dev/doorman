@@ -5,7 +5,10 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -43,6 +46,11 @@ pub enum Reply {
     },
     /// SSE chunks, each sent after its delay.
     Sse(Vec<(Duration, &'static str)>),
+    /// Raw body chunks with a content type (Bedrock event streams).
+    Binary {
+        content_type: &'static str,
+        chunks: Vec<Vec<u8>>,
+    },
     /// Waits before answering.
     Delayed(Duration, Box<Reply>),
 }
@@ -68,8 +76,11 @@ impl Reply {
 #[derive(Clone)]
 pub struct FakeProvider {
     pub url: String,
+    /// Model calls only; `POST /token` (Google token exchange) is counted apart.
     pub captured: Arc<Mutex<Vec<Captured>>>,
     replies: Arc<Mutex<VecDeque<Reply>>>,
+    token_calls: Arc<AtomicUsize>,
+    token_status: Arc<AtomicU16>,
 }
 
 impl FakeProvider {
@@ -77,12 +88,29 @@ impl FakeProvider {
     pub async fn start(replies: Vec<Reply>) -> Self {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
-        let state = (captured.clone(), replies.clone());
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let token_status = Arc::new(AtomicU16::new(200));
+        let state = (
+            captured.clone(),
+            replies.clone(),
+            token_calls.clone(),
+            token_status.clone(),
+        );
         let app = Router::new().fallback(move |request: Request| {
-            let (captured, replies) = state.clone();
+            let (captured, replies, token_calls, token_status) = state.clone();
             async move {
                 let (parts, body) = request.into_parts();
                 let body = to_bytes(body, 64 * 1024 * 1024).await.unwrap();
+                if parts.uri.path() == "/token" {
+                    let call = token_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let status = token_status.load(Ordering::SeqCst);
+                    return render(Reply::status(
+                        status,
+                        json!({"access_token": format!("ya29.fake-token-{call}"),
+                            "expires_in": 3600, "token_type": "Bearer"}),
+                    ))
+                    .await;
+                }
                 captured.lock().unwrap().push(Captured {
                     method: parts.method,
                     path_and_query: parts
@@ -113,7 +141,17 @@ impl FakeProvider {
             url: format!("http://{addr}"),
             captured,
             replies,
+            token_calls,
+            token_status,
         }
+    }
+
+    pub fn token_calls(&self) -> usize {
+        self.token_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn set_token_status(&self, status: u16) {
+        self.token_status.store(status, Ordering::SeqCst);
     }
 
     pub fn calls(&self) -> Vec<Captured> {
@@ -161,6 +199,21 @@ fn render(reply: Reply) -> std::pin::Pin<Box<dyn std::future::Future<Output = Re
                     .body(Body::from_stream(stream))
                     .unwrap()
             }
+            Reply::Binary {
+                content_type,
+                chunks,
+            } => {
+                let stream = futures_util::stream::iter(
+                    chunks
+                        .into_iter()
+                        .map(|chunk| Ok::<_, Infallible>(Bytes::from(chunk))),
+                );
+                Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
             Reply::Delayed(delay, reply) => {
                 tokio::time::sleep(delay).await;
                 render(*reply).await
@@ -189,6 +242,27 @@ pub async fn harness_with(
     provider: &str,
     upstream: &str,
     api_overrides: Value,
+    configure: impl FnOnce(&mut Config),
+) -> Harness {
+    harness_with_key(
+        name,
+        provider,
+        upstream,
+        api_overrides,
+        UPSTREAM_KEY,
+        configure,
+    )
+    .await
+}
+
+/// Like `harness_with`, with `upstream_key` stored in `prov-cred` (a Vertex
+/// service-account JSON or Bedrock IAM JSON).
+pub async fn harness_with_key(
+    name: &str,
+    provider: &str,
+    upstream: &str,
+    api_overrides: Value,
+    upstream_key: &str,
     configure: impl FnOnce(&mut Config),
 ) -> Harness {
     let mut config = Config::for_test("removed-internal-backend".to_owned());
@@ -243,7 +317,7 @@ pub async fn harness_with(
     storage
         .insert_one(
             "credit_defs",
-            json!({"api_credit_group": "prov-cred", "api_key": UPSTREAM_KEY,
+            json!({"api_credit_group": "prov-cred", "api_key": upstream_key,
                 "api_key_header": header, "credit_tiers": []}),
         )
         .await
@@ -312,3 +386,22 @@ pub async fn body_json(response: Response) -> Value {
 pub fn status_of(response: &Response) -> StatusCode {
     response.status()
 }
+
+/// Throwaway service account whose `token_uri` is the fake provider's `/token`.
+/// Lets the gateway call a loopback token URI (test-only flag).
+pub fn vertex_service_account(fake: &FakeProvider, project: &str) -> String {
+    // SAFETY: every caller sets the same value; tests never unset it.
+    unsafe { std::env::set_var("AI_VERTEX_ALLOW_LOOPBACK_TOKEN_URI", "true") };
+    json!({
+        "type": "service_account",
+        "project_id": project,
+        "private_key_id": "test-key",
+        "private_key": include_str!("../fixtures/ai/vertex/private.pem"),
+        "client_email": "doorman-test@test-project.iam.gserviceaccount.com",
+        "token_uri": format!("{}/token", fake.url),
+    })
+    .to_string()
+}
+
+/// AWS's documented example IAM key pair, never a real credential.
+pub const BEDROCK_IAM_KEY: &str = r#"{"access_key_id":"AKIDEXAMPLE","secret_access_key":"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}"#;

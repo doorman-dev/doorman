@@ -51,7 +51,8 @@ cheaper model instead.
 ## Set up a provider
 
 1. In **Credits → Credit definitions**, create a provider credential using the
-   matching preset. Store your organization's provider-console API key. Provider
+   matching preset. Store your organization's provider credential. See the
+   [Bedrock](#amazon-bedrock) and [Vertex AI](#google-vertex-ai) setup below. Provider
    credentials can have an empty credit-tier list. Consumer subscriptions such
    as ChatGPT Plus, Claude Pro/Max and Gemini subscriptions are unsupported.
 2. In **APIs → Add API**, select **AI (LLM provider)** and the provider. Choose a
@@ -83,6 +84,8 @@ Plan to issue replacement access keys when rotating that material.
 | Gemini API | `https://generativelanguage.googleapis.com` | `https://gw.example.com/api/ai/corp-gemini/v1` |
 | Azure OpenAI | Your resource's `https://RESOURCE.openai.azure.com` | `https://gw.example.com/api/ai/corp-azure/v1` |
 | OpenAI-compatible | Your configured server, such as `http://ollama:11434` | `https://gw.example.com/api/ai/local-llm/v1/v1` |
+| Amazon Bedrock | `https://bedrock-runtime.{region}.amazonaws.com` | `https://gw.example.com/api/ai/corp-bedrock/v1` |
+| Google Vertex AI | `https://{location}-aiplatform.googleapis.com` or `https://aiplatform.googleapis.com` | `https://gw.example.com/api/ai/corp-vertex/v1` |
 
 Copy the base URL from the API's **Connect your SDK** box. In the OpenAI example,
 the first `v1` is the Doorman API version and the second is OpenAI's path prefix.
@@ -211,6 +214,207 @@ const reply = await client.models.generateContent({
   model: 'YOUR_ALLOWED_MODEL', contents: 'Hello',
 })
 ```
+
+### Amazon Bedrock
+
+In **AI → Providers → Add provider**, select **Amazon Bedrock** and choose an
+AWS region. The standard endpoint is
+`https://bedrock-runtime.{region}.amazonaws.com`. For a backup in another region,
+select it in **Backups**. Doorman uses the target endpoint's region for signing.
+
+- For a **Bedrock API key**, paste the key. Doorman sends it upstream as a bearer
+  token.
+- For an **IAM access key**, enter the access key ID, secret access key and any
+  session token. For manual setup, store a JSON credential with
+  `access_key_id`, `secret_access_key` and optional `session_token`. Doorman signs
+  upstream calls with SigV4. Grant `bedrock:InvokeModel` for inference and
+  `bedrock:InvokeModelWithResponseStream` for streaming on the resources you
+  allow. Add `bedrock:CountTokens` if clients use token counting. Keep the
+  gateway host clock synchronized with NTP. AWS signatures depend on the
+  gateway's UTC time. [AWS Bedrock permissions](https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock.html)
+
+| Operation | Path after the Doorman base URL |
+| --- | --- |
+| Converse | `/model/{id}/converse` |
+| ConverseStream | `/model/{id}/converse-stream` |
+| InvokeModel, Anthropic models | `/model/{id}/invoke` |
+| InvokeModelWithResponseStream, Anthropic models | `/model/{id}/invoke-with-response-stream` |
+| CountTokens | `/model/{id}/count-tokens` |
+
+For CountTokens, send `input.converse` with the conversation or
+`input.invokeModel.body` with the base64-encoded model request. The AWS SDKs
+encode the InvokeModel body when you pass it as bytes.
+[AWS CountTokens API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_CountTokens.html)
+
+Use a concrete model ID, inference-profile ID or URL-encoded ARN in the path.
+If your model uses a cross-region inference profile, include the full ID with
+its prefix, such as `us.`, `eu.`, `apac.` or `global.`, in the allowed models
+and the client request. Allow the profile and the model resources it invokes in
+IAM. Doorman relays AWS event-stream frames, including mid-stream errors.
+[AWS inference profiles](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles.html)
+
+Employees use a `dk_` key from **My AI** as `Authorization: Bearer`. Copy the
+Bedrock base URL from **My AI** and set `BEDROCK_BASE` to it. Use an allowed
+Claude model with Claude Code and the Anthropic SDKs.
+
+```sh
+export CLAUDE_CODE_USE_BEDROCK=1
+export ANTHROPIC_BEDROCK_BASE_URL="$BEDROCK_BASE"
+export AWS_REGION=us-east-1
+export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
+export ANTHROPIC_CUSTOM_HEADERS="Authorization: Bearer $DOORMAN_AI_KEY"
+export ANTHROPIC_MODEL=YOUR_ALLOWED_CLAUDE_MODEL
+claude
+```
+
+For the AWS SDKs, set `AWS_BEARER_TOKEN_BEDROCK` to the Doorman key in the
+client's environment. Use a current version of the SDK with bearer support.
+The AWS SDKs need Doorman's HTTPS address. They refuse to send the key over
+plain HTTP.
+
+```python
+import os
+import boto3
+
+os.environ["AWS_BEARER_TOKEN_BEDROCK"] = os.environ["DOORMAN_AI_KEY"]
+client = boto3.client(
+    "bedrock-runtime", region_name="us-east-1", endpoint_url=os.environ["BEDROCK_BASE"],
+)
+reply = client.converse(
+    modelId="YOUR_ALLOWED_MODEL",
+    messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+)
+```
+
+```typescript
+import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime'
+
+const client = new BedrockRuntimeClient({
+  region: 'us-east-1',
+  endpoint: process.env.BEDROCK_BASE,
+  token: async () => ({ token: process.env.DOORMAN_AI_KEY! }),
+  authSchemePreference: ['httpBearerAuth'],
+})
+```
+
+For Anthropic, construct one of the following clients and call
+`client.messages.create` with an allowed Claude model. Use boto3 or the
+AWS SDK for JS for Bedrock CountTokens.
+
+```python
+import os
+from anthropic import AnthropicBedrock
+
+client = AnthropicBedrock(
+    base_url=os.environ["BEDROCK_BASE"], aws_region="us-east-1",
+    api_key=os.environ["DOORMAN_AI_KEY"],
+)
+```
+
+```typescript
+import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'
+
+const client = new AnthropicBedrock({
+  baseURL: process.env.BEDROCK_BASE, awsRegion: 'us-east-1',
+  apiKey: process.env.DOORMAN_AI_KEY,
+})
+```
+
+[AWS bearer setup](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-use.html),
+[Claude Code protocol](https://code.claude.com/docs/en/llm-gateway-protocol)
+
+### Google Vertex AI
+
+Enable the Vertex AI API and grant the service account
+`roles/aiplatform.user` on the target project. In **AI → Providers → Add
+provider**, select **Google Vertex AI**, choose a location, and paste or drop the
+service-account JSON file. The browser shows its project and client email while
+keeping the private key hidden. The regional endpoint is
+`https://{location}-aiplatform.googleapis.com`. For `global`, use
+`https://aiplatform.googleapis.com`. Check that the publisher model is
+available in your location. Keep the gateway clock synchronized with NTP for
+the service-account JWT exchange. [Google Cloud access control](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/access-control),
+[model locations](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations)
+
+| Publisher | Supported operations |
+| --- | --- |
+| Google | `generateContent`, `streamGenerateContent`, `countTokens` |
+| Anthropic | `rawPredict`, `streamRawPredict`, `count-tokens:rawPredict` |
+
+Vertex paths start with
+`/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/`.
+Doorman fills in the configured project and location. The service-account
+project supplies the default project. For Anthropic count tokens, the route
+ends in `count-tokens:rawPredict` and the real Claude model goes in the body.
+Claude streaming uses `streamRawPredict` with `"stream": true`. Google
+streaming with `?alt=sse` uses SSE. Without it, Doorman buffers the JSON array.
+[Google Claude request formats](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude)
+
+Set `VERTEX_BASE` to the Doorman URL from **My AI**. Anthropic client base URLs
+include the extra `/v1` API prefix. The Google SDK appends its API version
+itself. The example project and location form the client path, and Doorman
+rewrites them for the target. Each client sends the employee's `dk_` key as a
+bearer token.
+
+```sh
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_BASE_URL="$VERTEX_BASE/v1"
+export CLOUD_ML_REGION=global
+export ANTHROPIC_VERTEX_PROJECT_ID=your-project
+export CLAUDE_CODE_SKIP_VERTEX_AUTH=1
+export ANTHROPIC_CUSTOM_HEADERS="Authorization: Bearer $DOORMAN_AI_KEY"
+export ANTHROPIC_MODEL=YOUR_ALLOWED_CLAUDE_MODEL
+claude
+```
+
+The Google Gen AI SDK in Vertex mode always loads Google credentials, so give
+it the Doorman key as a static access token. Passing only an `Authorization`
+header fails on machines without `gcloud` credentials.
+
+```python
+import os
+from google import genai
+from google.genai import types
+from google.oauth2.credentials import Credentials
+from google.genai import types
+from google.oauth2.credentials import Credentials
+
+client = genai.Client(
+    vertexai=True, project="your-project", location="global",
+    credentials=Credentials(token=os.environ["DOORMAN_AI_KEY"]),
+    http_options=types.HttpOptions(base_url=os.environ["VERTEX_BASE"], api_version="v1"),
+)
+reply = client.models.generate_content(model="YOUR_ALLOWED_GEMINI_MODEL", contents="Hello")
+```
+
+```python
+import os
+from anthropic import AnthropicVertex
+
+client = AnthropicVertex(
+    base_url=os.environ["VERTEX_BASE"] + "/v1",
+    project_id="your-project", region="global",
+    access_token=os.environ["DOORMAN_AI_KEY"],
+)
+```
+
+In TypeScript, configure an explicit auth client to pass the Doorman token
+through the Anthropic Vertex SDK's Google auth flow.
+
+```typescript
+import { AnthropicVertex } from '@anthropic-ai/vertex-sdk'
+import { OAuth2Client } from 'google-auth-library'
+
+const authClient = new OAuth2Client()
+authClient.setCredentials({ access_token: process.env.DOORMAN_AI_KEY })
+const client = new AnthropicVertex({
+  baseURL: process.env.VERTEX_BASE + '/v1',
+  projectId: 'your-project', region: 'global', authClient,
+})
+```
+
+[Google Gen AI SDK custom base URL](https://googleapis.github.io/python-genai/#custom-base-url),
+[Anthropic Vertex TypeScript client](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/packages/vertex-sdk/src/client.ts)
 
 ## Usage, pricing and budgets
 
@@ -379,6 +583,7 @@ native status/body so official SDK exception handling still works.
 | AI008 | 400 | Streaming is disabled for this API |
 | AI009 | 400 | Invalid AI API configuration |
 | AI010 | 504 | Provider first-byte timeout |
+| AI011 | 502 | Could not sign in to the AI provider |
 
 Inspect `X-Doorman-AI-Model`, `X-Doorman-AI-Model-Downgraded`,
 `X-Doorman-AI-Budget-Warning` and `X-Doorman-AI-Redactions` when diagnosing policy.
@@ -386,9 +591,12 @@ Provider rate-limit and request-ID headers are preserved.
 
 Supported operations are OpenAI chat, Responses and embeddings; Anthropic
 messages and token counting; Gemini generation, token counting and embeddings;
-and Azure deployment chat/embeddings. Model lists are governed local lists.
-Files, batches, fine-tuning, realtime/WebSockets, assistants, image generation,
-native Vertex AI and Bedrock are outside this release.
+Azure deployment chat and embeddings, and the operations listed for
+[Amazon Bedrock](#amazon-bedrock) and [Google Vertex AI](#google-vertex-ai).
+Where available, model lists are governed local lists. Bedrock and Vertex AI
+have no model-list endpoint through Doorman.
+Files, batches, fine-tuning, realtime/WebSockets, assistants and image
+generation are outside this release.
 
 Gemini `streamGenerateContent` without `alt=sse` returns its JSON array buffered
 until completion. SSE responses pass bytes through incrementally. AI uses a

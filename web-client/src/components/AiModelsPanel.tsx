@@ -5,6 +5,7 @@ import InfoTooltip from '@/components/InfoTooltip'
 import { SignalCopyButton } from '@/components/signal/Signal'
 import { useAiProviders } from '@/hooks/useAiProviders'
 import { getJson, putJson } from '@/utils/api'
+import { aiSnippets } from '@/utils/aiSnippets'
 import { SERVER_URL } from '@/utils/config'
 import { aiSdkBaseUrl, aiValidationErrors, defaultAiConfig, formatTokens, formatUsd, type AiApiConfig, type AiBreakdown, type AiLogLevel, type AiProvider, type AiUsageRow } from '@/utils/ai'
 
@@ -76,9 +77,11 @@ export default function AiModelsPanel({ apiName, apiVersion, provider, config, o
   }, [apiName, apiVersion])
   const suffix = providers.find(item => item.id === provider)?.sdk_base_url_suffix ?? (provider === 'openai' || provider === 'openai_compatible' ? '/v1' : '')
   const baseUrl = aiSdkBaseUrl(SERVER_URL, apiName, apiVersion, suffix)
-  const model = provider === 'anthropic' ? 'claude-opus-5-5' : draft.default_model || draft.allowed_models[0] || 'YOUR_ALLOWED_MODEL'
+  const model = provider === 'anthropic' ? 'claude-opus-5-5' : draft.default_model || draft.allowed_models.find(model => !model.endsWith('*')) || 'YOUR_ALLOWED_MODEL'
   const q = JSON.stringify
-  const snippets: Record<string, string> = provider === 'anthropic' ? {
+  const snippets: Record<string, string> = provider === 'bedrock' || provider === 'vertex'
+    ? Object.fromEntries(aiSnippets(provider, baseUrl, model, undefined, draft.allowed_models).map(snippet => [snippet.label, snippet.code]))
+    : provider === 'anthropic' ? {
     Python: `import os, anthropic\nclient = anthropic.Anthropic(base_url=${q(baseUrl)}, api_key=os.environ["DOORMAN_AI_KEY"])\nreply = client.messages.create(model=${q(model)}, max_tokens=1024, messages=[{"role":"user","content":"Hello"}])`,
     TypeScript: `import Anthropic from '@anthropic-ai/sdk'\nconst client = new Anthropic({ baseURL: ${q(baseUrl)}, apiKey: process.env.DOORMAN_AI_KEY })\nconst reply = await client.messages.create({ model: ${q(model)}, max_tokens: 1024, messages: [{ role: 'user', content: 'Hello' }] })`,
     curl: `curl ${q(`${baseUrl}/v1/messages`)} -H 'Content-Type: application/json' -H "x-api-key: $DOORMAN_AI_KEY" -H 'anthropic-version: 2023-06-01' -d '${JSON.stringify({ model, max_tokens: 1024, messages: [{ role: 'user', content: 'Hello' }] })}'`,
@@ -95,6 +98,7 @@ export default function AiModelsPanel({ apiName, apiVersion, provider, config, o
     TypeScript: `import OpenAI from 'openai'\nconst client = new OpenAI({ baseURL: ${q(baseUrl)}, apiKey: process.env.DOORMAN_AI_KEY })\nconst reply = await client.chat.completions.create({ model: ${q(model)}, messages: [{ role: 'user', content: 'Hello' }] })`,
     curl: `curl ${q(`${baseUrl}/chat/completions`)} -H "Authorization: Bearer $DOORMAN_AI_KEY" -H 'Content-Type: application/json' -d '${JSON.stringify({ model, messages: [{ role: 'user', content: 'Hello' }] })}'`,
   }
+  const activeLanguage = language in snippets ? language : Object.keys(snippets)[0]
   const save = async () => {
     setWorking(true); setError(null); setSuccess(null); setErrors({})
     try {
@@ -119,10 +123,12 @@ export default function AiModelsPanel({ apiName, apiVersion, provider, config, o
     <div className="p-6 space-y-5">
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
       {success && <p role="status" className="text-sm text-green-700">{success}</p>}
+      {provider === 'bedrock' && <p className="text-sm text-gray-600">Use the full model ID or ARN. For cross-region inference, enter the inference-profile ID including its prefix, for example <code>global.anthropic.*</code>.</p>}
+      {provider === 'vertex' && <p className="text-sm text-gray-600">Use <code>gemini-*</code> for Gemini or <code>claude-*</code> for Claude. Keep the <code>@version</code> suffix when the publisher model ID includes one.</p>}
       <AiModelFields value={draft} onChange={setDraft} disabled={working} errors={errors} />
       <div className="flex gap-2"><button type="button" className="btn btn-primary" disabled={working || !draft.allowed_models.length} onClick={save}>Save AI settings</button>{modelsAvailable && <button type="button" className="btn btn-secondary" disabled={working} onClick={fetchModels}>Fetch from provider</button>}</div>
       {stats && <p className="text-sm">Last 30 days: {formatTokens(stats.requests)} requests · {formatTokens(stats.input_tokens + stats.output_tokens + stats.cache_read_tokens + stats.cache_write_tokens)} tokens · {formatUsd(stats.cost_nanos)}</p>}
-      <div className="border rounded p-4 space-y-3"><h4 className="font-medium">Connect your SDK</h4><div className="flex items-center gap-2"><code className="text-xs break-all">{baseUrl}</code><SignalCopyButton text={baseUrl} label="Copy SDK base URL" /></div><div role="tablist" aria-label="SDK language" className="flex gap-2">{Object.keys(snippets).map(name => <button type="button" role="tab" aria-selected={name === language} key={name} onClick={() => setLanguage(name)} className={`btn ${name === language ? 'btn-primary' : 'btn-secondary'}`}>{name}</button>)}</div><pre className="overflow-x-auto text-xs p-3 bg-gray-50 dark:bg-black/20 rounded">{snippets[language]}</pre><SignalCopyButton text={snippets[language]} label="Copy SDK example" /></div>
+      <div className="border rounded p-4 space-y-3"><h4 className="font-medium">Connect your SDK</h4><div className="flex items-center gap-2"><code className="text-xs break-all">{baseUrl}</code><SignalCopyButton text={baseUrl} label="Copy SDK base URL" /></div><div role="tablist" aria-label="SDK language" className="flex flex-wrap gap-2">{Object.keys(snippets).map(name => <button type="button" role="tab" aria-selected={name === activeLanguage} key={name} onClick={() => setLanguage(name)} className={`btn ${name === activeLanguage ? 'btn-primary' : 'btn-secondary'}`}>{name}</button>)}</div><pre className="overflow-x-auto text-xs p-3 bg-gray-50 dark:bg-black/20 rounded">{snippets[activeLanguage]}</pre><SignalCopyButton text={snippets[activeLanguage]} label="Copy SDK example" /></div>
     </div>
   </div>
 }
