@@ -57,6 +57,7 @@ env/
 **/generated/
 **/*memory_dump*.bin
 **/*.bin
+!gateway-rs/tests/fixtures/**/*.bin
 .production.env
 doorman.code-workspace
 
