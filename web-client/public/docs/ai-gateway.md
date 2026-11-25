@@ -122,6 +122,123 @@ only use another key on the same server stay standby and are never load
 balanced. In `api_ai_config` these settings are `fallback_targets`
 (`credential_group`, `server`, `weight`) and `load_balance`.
 
+## One endpoint for every model
+
+Open **My AI → Any model** to copy the OpenAI-compatible base URL and see the
+models available to you. Use your personal `dk_` key from **Access keys** as
+the API key. This endpoint accepts `Authorization: Bearer` and the other AI-key
+headers Doorman already supports, such as `x-api-key`.
+
+| What you configure | Example |
+| --- | --- |
+| SDK base URL | `https://gw.example.com/api/ai/v1` |
+| Chat completions | `POST /api/ai/v1/chat/completions` |
+| Model discovery | `GET /api/ai/v1/models` |
+| Model field | An allowed model ID, an alias, or a named route such as `fast` |
+
+```bash
+curl 'https://gw.example.com/api/ai/v1/chat/completions' \
+  -H "Authorization: Bearer $DOORMAN_AI_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"fast","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Set `DOORMAN_AI_KEY` to your key before running the example. Replace `fast`
+with a name shown in **Any model**. For a streaming request, set `stream: true`
+and add `stream_options: {"include_usage": true}` if you want a final usage
+chunk. The provider-specific SDK connections are still available under
+[Connect an SDK](#connect-an-sdk).
+
+### Named routes and automatic resolution
+
+An administrator can open **AI Gateway → Providers → One endpoint** to turn
+the shared endpoint on or off, add routes, and preview model resolution by
+username. The endpoint is on by default. Editing settings requires
+`manage_ai`. Opening the page and previewing resolution require `manage_apis`.
+`v1` is reserved as an AI API name.
+
+Doorman first looks for a named route that matches the request's `model`.
+You can configure up to 50 routes. Each route can have up to five ordered
+targets, each with an AI API and a model.
+For example, `fast` can try a Claude model first and an OpenAI model second.
+Users only reach targets their account and key scope allow. The admin preview
+shows the account's access before any individual key's scope is applied.
+
+When there is no named route, Doorman resolves an allowed model ID or model alias
+by provider order. Doorman tries OpenAI first, followed by Azure OpenAI,
+Anthropic, Gemini API, Vertex AI, Bedrock, and OpenAI-compatible. Within a
+provider, Doorman sorts by API name and version.
+Model discovery lists named routes, concrete allowed model IDs, and aliases.
+Wildcard model rules allow concrete matching names on requests.
+
+Doorman tries another route target on an eligible upstream outage, such as a
+502–504 response, a first-byte timeout, an unreachable upstream, or all targets
+for an API being benched. It can move to another provider only before any
+response bytes reach the client. Budget blocks, guardrail blocks and other
+4xx responses end the request. Each attempt uses the selected API's own
+subscriptions, allowances, guardrails, and pricing.
+
+### Chat features and provider differences
+
+The common chat format supports text, image inputs, function tools, JSON output,
+streaming, and token usage. Send one choice per request (`n: 1`).
+Responses, embeddings, audio, and legacy text completions are outside this
+endpoint's scope. Use a provider-native connection for those operations where
+the provider and API configuration support them.
+
+| Target | Common format and provider requirements |
+| --- | --- |
+| OpenAI, Azure OpenAI and OpenAI-compatible | Doorman forwards the chat fields. Features such as `logprobs`, JSON formatting, image URLs and reasoning depend on the target model. Azure uses the selected deployment in the upstream path. |
+| Anthropic and Vertex Claude | Doorman translates to Messages. Inline base64 images and HTTPS image URLs work where the model accepts them. The token limit comes from `max_completion_tokens`, then `max_tokens`, then Doorman's default of 4096. JSON schema mode and thinking need model support. JSON object mode gives the model an instruction to return an object. |
+| Gemini API and Vertex Gemini | Doorman translates to GenerateContent. Gemini API uses inline base64 images. Vertex can also use public HTTPS image URLs with a supported filename extension, such as `.png` or `.jpeg`. JSON schema mode uses Gemini's schema subset, and thinking depends on the model generation. Tool calls can carry an optional `thought_signature` for subsequent requests. |
+| Amazon Bedrock | Doorman uses Converse or ConverseStream. Send images as inline base64 data URLs. JSON schema mode and forced tools require model support. JSON object mode gives the model an instruction to return an object. Reasoning effort is mapped for supported Claude and Nova 2 models. |
+
+Translated targets return `AI012` for `logprobs`. Gemini and Bedrock have no
+portable equivalent for `parallel_tool_calls: false`.
+
+### Set up an OpenAI-compatible client
+
+For all of these clients, use the base URL above, your `dk_` key and an allowed
+model name.
+
+| Client | Setup |
+| --- | --- |
+| OpenAI Python | Set `OpenAI(base_url=..., api_key=...)` or `OPENAI_BASE_URL` and `OPENAI_API_KEY`. Call `client.chat.completions.create(...)`. [Python SDK](https://github.com/openai/openai-python) |
+| OpenAI TypeScript | Set `new OpenAI({ baseURL, apiKey })`. Call `client.chat.completions.create(...)`. [TypeScript SDK](https://github.com/openai/openai-node/blob/main/docs/configuration.md) |
+| LangChain | Set `ChatOpenAI(base_url=..., api_key=..., model=..., use_responses_api=False)`. Set `stream_usage=True` for streaming token counts. [ChatOpenAI](https://docs.langchain.com/oss/python/integrations/chat/openai) |
+| Vercel AI SDK OpenAI | Call `createOpenAI({ baseURL, apiKey }).chat(model)` to select Chat Completions. [OpenAI provider](https://ai-sdk.dev/providers/ai-sdk-providers/openai) |
+| Vercel AI SDK OpenAI-compatible | Set `createOpenAICompatible({ name: 'doorman', baseURL, apiKey, includeUsage: true })`. Set `supportsStructuredOutputs: true` when you use a model with schema output. [Compatible provider](https://ai-sdk.dev/providers/openai-compatible-providers) |
+| Open WebUI | Add an OpenAI-compatible connection under **Admin Settings → Connections** and use Chat Completions. The connection can discover models from Doorman. [Connection setup](https://docs.openwebui.com/getting-started/quick-start/connect-a-provider/starting-with-openai-compatible/) |
+| LibreChat | Configure a custom endpoint with `baseURL` and `apiKey` in `librechat.yaml`. List IDs in `models.default` or enable discovery with `models.fetch: true`. [Custom endpoints](https://www.librechat.ai/docs/configuration/librechat_yaml/object_structure/custom_endpoint) |
+| Continue | In `config.yaml`, set `provider: openai`, `apiBase`, `apiKey` and `model`. Use a model that Continue calls via Chat Completions. [Continue setup](https://docs.continue.dev/customize/model-providers/top-level/openai) |
+| Cursor | Under **Settings → Models**, set the OpenAI key and **Override OpenAI Base URL**, then add the model ID. Compatibility depends on the model and the API path your Cursor version uses. [Cursor API keys](https://cursor.com/help/models-and-usage/api-keys), [base URL setting](https://forum.cursor.com/t/cursor-managed-models-are-routed-through-override-openai-base-url/169088) |
+| Aider / LiteLLM | In Aider, set `OPENAI_API_BASE` and `OPENAI_API_KEY`, then run `aider --model openai/<model-id>`. With the LiteLLM client, call `completion(model="openai/<model-id>", api_base=..., api_key=..., ...)`. [Aider](https://aider.chat/docs/llms/openai-compat.html), [LiteLLM](https://docs.litellm.ai/docs/providers/openai_compatible) |
+
+### Unified endpoint errors
+
+Doorman responds with an OpenAI-style `error` object containing `message`,
+`type`, `code` and `param`. Gateway errors keep their Doorman code in
+`error.code`.
+
+| HTTP status | Code | Meaning |
+| --- | --- | --- |
+| 400 | `AI012` | The request has a field or value the selected target cannot translate. Check `error.message` for the field or constraint. |
+| 404 | `AI013` | Your account and key have no eligible target for the requested model. Check the names in **My AI** and the key's scope. |
+| 401 | | The request needs a personal Doorman AI key. Use a `dk_` key from **My AI**. |
+
+An unresolved model returns this response.
+
+```json
+{
+  "error": {
+    "message": "No AI provider you can use serves the model not-a-model",
+    "type": "not_found_error",
+    "code": "AI013",
+    "param": null
+  }
+}
+```
+
 ## Connect an SDK
 
 Set `DOORMAN_AI_KEY` in your application's environment to its Doorman access key.

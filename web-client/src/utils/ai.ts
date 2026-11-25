@@ -211,6 +211,7 @@ export interface AiMyUsage {
   usage: AiUsageTotals
   budgets: BudgetStatus[]
   apis?: AiMyApi[]
+  unified?: { enabled: boolean; base_url_suffix: string; models: string[] }
 }
 
 /** An AI API the signed-in user can call (from /platform/ai/usage/me). */
@@ -229,6 +230,28 @@ export interface AiSettings {
   retention_days: number
   notice_text: string | null
   egress_ips: string[]
+  unified?: AiUnifiedSettings
+}
+
+export const AI_UNIFIED_BASE_URL_SUFFIX = '/api/ai/v1'
+export const AI_UNIFIED_ROUTE_LIMIT = 50
+export const AI_UNIFIED_TARGET_LIMIT = 5
+export const AI_UNIFIED_MODEL_LENGTH = 200
+
+export interface AiUnifiedTarget { api: string; model: string }
+export interface AiUnifiedRoute { model: string; targets: AiUnifiedTarget[] }
+export interface AiUnifiedSettings { enabled: boolean; routes: AiUnifiedRoute[] }
+export interface AiUnifiedResolution extends AiUnifiedSettings {
+  username: string
+  models: {
+    model: string
+    via: 'route' | 'auto'
+    targets: (AiUnifiedTarget & { provider: AiProvider })[]
+  }[]
+}
+
+export function aiUnifiedBaseUrl(gateway: string, suffix = AI_UNIFIED_BASE_URL_SUFFIX): string {
+  return `${gateway ? new URL(gateway).origin : ''}${suffix}`
 }
 
 export function defaultAiConfig(): AiApiConfig {

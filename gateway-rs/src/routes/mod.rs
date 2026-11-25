@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod ai_platform;
+pub mod ai_unified;
 pub mod discovery;
 pub mod graphql;
 pub mod grpc;

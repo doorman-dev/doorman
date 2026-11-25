@@ -61,3 +61,50 @@ export function aiSnippets(provider: AiProvider, baseUrl: string, model: string,
     { id: 'curl', label: 'curl', language: 'bash', code: `curl ${baseUrl}/chat/completions \\\n  -H "authorization: Bearer $DOORMAN_AI_KEY" \\\n  -H "content-type: application/json" \\\n  -d '{"model":"${model}","messages":[{"role":"user","content":"Hello"}]}'` },
   ]
 }
+
+export function aiUnifiedSnippets(baseUrl: string, model: string): AiSnippet[] {
+  const url = JSON.stringify(baseUrl)
+  const modelId = JSON.stringify(model)
+  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+  const payload = JSON.stringify({ model, messages: [{ role: 'user', content: 'Hello' }] })
+  return [
+    {
+      id: 'python', label: 'OpenAI Python', language: 'python',
+      code: `import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=${url},
+    api_key=os.environ["DOORMAN_AI_KEY"],
+)
+reply = client.chat.completions.create(
+    model=${modelId},
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(reply.choices[0].message.content)`,
+    },
+    {
+      id: 'node', label: 'OpenAI TypeScript', language: 'typescript',
+      code: `import OpenAI from 'openai'
+
+const client = new OpenAI({
+  baseURL: ${url},
+  apiKey: process.env.DOORMAN_AI_KEY,
+})
+const reply = await client.chat.completions.create({
+  model: ${modelId},
+  messages: [{ role: 'user', content: 'Hello' }],
+})
+console.log(reply.choices[0].message.content)`,
+    },
+    {
+      id: 'curl', label: 'curl', language: 'bash',
+      code: [
+        `curl ${shellQuote(`${baseUrl}/chat/completions`)}`,
+        '  -H "Authorization: Bearer $DOORMAN_AI_KEY"',
+        '  -H "Content-Type: application/json"',
+        `  -d ${shellQuote(payload)}`,
+      ].join(' \\\n'),
+    },
+  ]
+}

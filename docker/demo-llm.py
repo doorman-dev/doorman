@@ -110,6 +110,7 @@ def gemini_response(model: str, usage: dict, text: str = REPLY, final: bool = Tr
 
 
 BEDROCK_PATH = re.compile(r"^/model/(?P<model>[^/]+)/(?P<op>converse|converse-stream|invoke|invoke-with-response-stream|count-tokens)$")
+GEMINI_PATH = re.compile(r"^/v1(?:beta)?/models/(?P<model>[^/:]+):(?P<method>[A-Za-z]+)$")
 VERTEX_PATH = re.compile(r"^/v1(?:beta1)?/projects/[^/]+/locations/[^/]+/publishers/(?P<publisher>google|anthropic)/models/(?P<model>[^/:]+):(?P<method>[A-Za-z]+)$")
 
 
@@ -154,6 +155,19 @@ class Handler(BaseHTTPRequestHandler):
         if match := VERTEX_PATH.match(url.path):
             alt_sse = parse_qs(url.query).get("alt") == ["sse"]
             self.vertex(match["publisher"], match["model"], match["method"], body, alt_sse)
+            return
+        # Anthropic Messages and the Gemini API reuse the Vertex reply shapes
+        # (one-endpoint walkthrough, step 5).
+        if url.path.rstrip("/") == "/v1/messages/count_tokens":
+            self.send_json(200, {"input_tokens": prompt_tokens(body)})
+            return
+        if url.path.rstrip("/") == "/v1/messages":
+            method = "streamRawPredict" if body.get("stream") else "rawPredict"
+            self.vertex("anthropic", body.get("model") or "claude-demo", method, body, False)
+            return
+        if match := GEMINI_PATH.match(url.path):
+            alt_sse = parse_qs(url.query).get("alt") == ["sse"]
+            self.vertex("google", match["model"], match["method"], body, alt_sse)
             return
         if url.path.rstrip("/") != "/v1/chat/completions":
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})

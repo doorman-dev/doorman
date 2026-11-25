@@ -4828,3 +4828,47 @@ async fn bedrock_failover_signs_each_target_for_its_own_host() {
     assert_signed(&primary.last(), &primary.url, "us-west-2");
     assert_signed(&backup.last(), &backup.url, "us-west-2");
 }
+
+#[tokio::test]
+async fn unified_settings_validate_and_resolve_is_routed() {
+    let (app, _storage) = platform_app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    let bad = request(
+        &app,
+        Method::PUT,
+        "/platform/ai/settings",
+        Some(&admin),
+        Some(json!({"unified": {"routes": [{"model": "fast", "targets": []}]}})),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let routes = json!([{"model": "fast", "targets": [{"api": "gpt/v1", "model": "gpt-x-mini"}]}]);
+    let saved = json_body(
+        request(
+            &app,
+            Method::PUT,
+            "/platform/ai/settings",
+            Some(&admin),
+            Some(json!({"unified": {"enabled": false, "routes": routes}})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        saved["unified"],
+        json!({"enabled": false, "routes": routes})
+    );
+    let response = request(
+        &app,
+        Method::GET,
+        "/platform/ai/unified/resolve",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let resolved = json_body(response).await;
+    assert_eq!(resolved["enabled"], false);
+    assert_eq!(resolved["routes"], routes);
+    assert!(resolved["models"].is_array());
+}

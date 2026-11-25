@@ -11,7 +11,13 @@ pub const SETTINGS_TYPE: &str = "ai_settings";
 pub const LOG_LEVELS: [&str; 3] = ["none", "metadata", "full"];
 
 pub fn defaults() -> Value {
-    json!({"type": SETTINGS_TYPE, "log_level": "metadata", "retention_days": 30, "notice_text": null})
+    json!({
+        "type": SETTINGS_TYPE,
+        "log_level": "metadata",
+        "retention_days": 30,
+        "notice_text": null,
+        "unified": {"enabled": true, "routes": []},
+    })
 }
 
 /// The stored settings over the defaults (C8: default level is `metadata`).
@@ -20,7 +26,7 @@ pub fn merge(current: Option<&Value>) -> Value {
     if let (Some(fields), Some(current)) =
         (settings.as_object_mut(), current.and_then(Value::as_object))
     {
-        for key in ["log_level", "retention_days", "notice_text"] {
+        for key in ["log_level", "retention_days", "notice_text", "unified"] {
             if let Some(value) = current.get(key).filter(|value| !value.is_null()) {
                 fields.insert(key.to_owned(), value.clone());
             }

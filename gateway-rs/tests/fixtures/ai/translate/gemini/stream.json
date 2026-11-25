@@ -1,0 +1,5 @@
+[
+  {"candidates":[{"content":{"role":"model","parts":[{"text":"Hidden.","thought":true},{"text":"Checking."}]}}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":1}},
+  {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"weather","args":{"city":"Paris"}},"thoughtSignature":"YWJj"},{"functionCall":{"name":"clock","args":{}}}]},"finishReason":"STOP"}]},
+  {"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":5,"thoughtsTokenCount":3,"cachedContentTokenCount":4}}
+]

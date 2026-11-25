@@ -5,6 +5,7 @@ import Link from 'next/link'
 import AiPage from '@/components/AiPage'
 import AiTabs, { useHashTab } from '@/components/AiTabs'
 import AiPricingPanel from '@/components/AiPricingPanel'
+import AiUnifiedPanel from '@/components/AiUnifiedPanel'
 import AiBackupsEditor, { backupsSummary } from '@/components/AiBackupsEditor'
 import { useAuth } from '@/contexts/AuthContext'
 import { fetchAllPaginated, getJson } from '@/utils/api'
@@ -22,7 +23,7 @@ interface AiApi {
   api_servers?: string[]
 }
 
-const TABS = [{ id: 'providers', label: 'Providers' }, { id: 'prices', label: 'Model prices' }]
+const TABS = [{ id: 'providers', label: 'Providers' }, { id: 'endpoint', label: 'One endpoint' }, { id: 'prices', label: 'Model prices' }]
 
 function ProviderCard({ api, usage, canEdit, onBackups }: { api: AiApi; usage?: AiUsageRow; canEdit: boolean; onBackups: () => void }) {
   const config = api.api_ai_config || {}
@@ -75,7 +76,7 @@ export default function AiProvidersPage() {
   }, [])
 
   const canManage = !!permissions?.manage_ai
-  return <AiPage title="Providers" description="The AI providers your company offers, their models and who can use them." permission="manage_apis"
+  return <AiPage title="Providers" description="The AI providers your company offers, their models and who can use them." permission="manage_apis" className="pt-8 lg:pt-0"
     actions={tab === 'providers' && canManage ? <Link href="/ai/setup" className="btn btn-primary">Add provider</Link> : undefined}>
     <AiTabs tabs={TABS} value={tab} onChange={setTab} label="Providers sections" />
     {tab === 'providers' && <>
@@ -85,6 +86,7 @@ export default function AiProvidersPage() {
       {apis && apis.length > 0 && <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{apis.map(api => <ProviderCard key={`${api.api_name}/${api.api_version}`} api={api} usage={usage.get(`${api.api_name}/${api.api_version}`) || usage.get(api.api_name)} canEdit={!!permissions?.manage_apis} onBackups={() => setEditing(api)} />)}</div>}
       {apis && apis.length > 0 && <p className="text-xs text-gray-500">Need full control? <Link href="/apis/add?type=AI" className="underline">Add a provider manually</Link>.</p>}
     </>}
+    {tab === 'endpoint' && <AiUnifiedPanel apis={apis} providersError={error} canManage={canManage} canListUsers={!!permissions?.manage_users} />}
     {tab === 'prices' && <AiPricingPanel canManage={canManage} />}
     {editing && <AiBackupsEditor apiName={editing.api_name} apiVersion={editing.api_version} provider={editing.api_ai_provider} config={editing.api_ai_config || {}} onClose={() => setEditing(null)}
       onSaved={config => { setApis(current => current && current.map(api => api === editing ? { ...api, api_ai_config: config } : api)); setEditing(null) }} />}

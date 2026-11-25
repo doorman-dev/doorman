@@ -65,6 +65,14 @@ pub(crate) struct AiRoute {
 #[derive(Clone, Debug)]
 pub(crate) struct AiOperation(pub &'static str);
 
+/// Set by the unified endpoint (`/api/ai/v1`) on the native sub-request it
+/// sends through the pipeline; the reply is translated back by `ai_unified`.
+#[derive(Clone, Debug)]
+pub(crate) struct UnifiedCtx {
+    /// The `model` the client sent (a route name or a model ID); recorded in the activity log.
+    pub requested_model: String,
+}
+
 /// The `ai` block for a non-stream request's activity-log line.
 #[derive(Clone, Debug)]
 pub(crate) struct AiActivity(pub Value);
@@ -104,6 +112,10 @@ pub async fn ai_policy_then_proxy(
         .map(|uri| uri.0.path().to_owned())
         .unwrap_or_else(|| request.uri().path().to_owned());
     let tail = path.strip_prefix("/api/ai/").unwrap_or_default();
+    if let Some(rest) = tail.strip_prefix("v1/") {
+        let rest = rest.to_owned();
+        return crate::routes::ai_unified::handle(state, request, &rest).await;
+    }
     let mut segments = tail.splitn(3, '/');
     let name = segments.next().unwrap_or_default().to_owned();
     let version = segments.next().unwrap_or_default().to_owned();
@@ -319,6 +331,10 @@ pub(crate) async fn execute_ai(
     let method = request.method().clone();
     let query = parse_query(request.uri().query());
     let request_path = request.uri().path().to_owned();
+    let unified_model = request
+        .extensions()
+        .get::<UnifiedCtx>()
+        .map(|unified| unified.requested_model.clone());
     let (parts, body) = request.into_parts();
     let body_limit = BodyLimits::from_env().ai;
     let raw_body = match to_bytes(body, BodyLimits::for_path(&request_path, body_limit)).await {
@@ -916,6 +932,7 @@ pub(crate) async fn execute_ai(
         redactions: redaction_count,
         fallbacks,
         prompt_log,
+        unified_model: unified_model.clone(),
         groups: user_groups.clone(),
         role: user_role,
         tier: user_tier,

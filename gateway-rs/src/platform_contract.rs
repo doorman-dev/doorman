@@ -305,6 +305,9 @@ pub fn prepare_ai_api(api: &mut Value) -> Result<(), Vec<Value>> {
     validate_ai_api(api)
 }
 
+/// AI API name taken by the unified endpoint (`/api/ai/v1/...`, step 5).
+pub const RESERVED_AI_API_NAME: &str = "v1";
+
 /// Validates an AI API record (create payload or merged update). No-op for
 /// non-AI APIs. Errors use the Pydantic-style `{loc,msg,type}` items.
 pub fn validate_ai_api(api: &Value) -> Result<(), Vec<Value>> {
@@ -327,6 +330,12 @@ pub fn validate_ai_api(api: &Value) -> Result<(), Vec<Value>> {
             None
         }
     };
+    if api.get("api_name").and_then(Value::as_str) == Some(RESERVED_AI_API_NAME) {
+        fail(
+            "api_name",
+            "v1 is reserved for the one-endpoint AI address (/api/ai/v1)",
+        );
+    }
     if api.get("api_public").and_then(Value::as_bool) == Some(true) {
         fail("api_public", "AI APIs cannot be public");
     }
@@ -844,6 +853,8 @@ mod tests {
             ai_error_fields(prepare_ai_api(&mut api)),
             vec!["api_ai_config"]
         );
+        let mut api = ai_api(json!({"api_name": "v1"}));
+        assert_eq!(ai_error_fields(prepare_ai_api(&mut api)), vec!["api_name"]);
         let mut api = ai_api(json!({"api_ai_provider": "aws"}));
         assert_eq!(
             ai_error_fields(prepare_ai_api(&mut api)),

@@ -1,5 +1,6 @@
 //! Doorman AI gateway: provider adapters, metering, budgets and guardrails.
 
+pub mod access;
 pub mod adapter;
 pub mod budgets;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod pricing;
 pub mod providers;
 pub mod sigv4;
 pub mod sse;
+pub mod translate;
 pub mod usage;
 
 use hmac::{Hmac, Mac};
