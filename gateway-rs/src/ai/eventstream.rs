@@ -29,6 +29,11 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// True when a frame is half-received or decoding stopped on bad framing.
+    pub fn has_partial(&self) -> bool {
+        self.stopped || self.lengths.is_some() || !self.buffer.is_empty()
+    }
+
     pub fn new(max_frame: usize) -> Self {
         Self {
             max_frame,
@@ -198,6 +203,13 @@ fn encode_message(headers: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 impl Frame {
+    /// AWS exception or error frame, by its `:message-type` header.
+    pub fn is_error(&self) -> bool {
+        self.headers.iter().any(|(name, value)| {
+            name == ":message-type" && matches!(value.as_str(), "exception" | "error")
+        })
+    }
+
     pub fn to_sse_event(&self) -> SseEvent {
         let header = |name: &str| {
             self.headers
@@ -220,6 +232,23 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_frames_and_error_frames_are_reported() {
+        let frame = encode(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+            ],
+            b"{}",
+        );
+        let mut decoder = Decoder::new(1 << 20);
+        let frames = decoder.push(&frame);
+        assert!(frames[0].as_ref().unwrap().is_error());
+        assert!(!decoder.has_partial());
+        decoder.push(&frame[..5]);
+        assert!(decoder.has_partial());
+    }
 
     #[test]
     fn round_trip_and_one_byte_chunks() {

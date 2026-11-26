@@ -1906,15 +1906,17 @@ async fn ai_export_csv_escapes_and_requires_permission() {
     assert!(lines[0].starts_with("# "));
     assert_eq!(
         lines[1],
-        "month,group,username,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,estimated_requests,unpriced_requests,role,tier,provider"
+        "month,group,username,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,estimated_requests,unpriced_requests,role,tier,provider,cache_hits,saved_cost_usd"
     );
     assert!(
         // bob has no role/tier snapshot and no user record yet: "(none)".
-        lines.contains(&"2026-10,eng,bob,gpt-x,1,10,5,0,0,0.000250,0,0,(none),(none),openai"),
+        lines.contains(
+            &"2026-10,eng,bob,gpt-x,1,10,5,0,0,0.000250,0,0,(none),(none),openai,0,0.000000"
+        ),
         "{csv}"
     );
     assert!(
-        lines.contains(&"2026-10,\"sales, emea\",carol,\"'=cmd,\"\"x\"\"\",1,1,1,0,0,0.000000,0,0,(none),(none),openai"),
+        lines.contains(&"2026-10,\"sales, emea\",carol,\"'=cmd,\"\"x\"\"\",1,1,1,0,0,0.000000,0,0,(none),(none),openai,0,0.000000"),
         "{csv}"
     );
     // September rows are excluded; bob is listed under both of his groups.
@@ -2009,7 +2011,9 @@ async fn usage_me_only_returns_own_rows() {
     assert_eq!(me["period_key"], format!("m{}", &today[..7]));
     assert_eq!(
         me["usage"],
-        json!({"requests": 3, "input_tokens": 30, "output_tokens": 10, "cost_nanos": 7_000, "cost_usd": "0.000007"})
+        json!({"requests": 3, "input_tokens": 30, "output_tokens": 10, "cost_nanos": 7_000, "cost_usd": "0.000007",
+            "cache_hits": 0, "saved_input_tokens": 0, "saved_output_tokens": 0, "saved_cost_nanos": 0,
+            "saved_cost_usd": "0.000000"})
     );
     assert_eq!(me["budgets"], json!([]));
     let bob = create_platform_user(&app, &admin, "bob").await;
@@ -4871,4 +4875,48 @@ async fn unified_settings_validate_and_resolve_is_routed() {
     assert_eq!(resolved["enabled"], false);
     assert_eq!(resolved["routes"], routes);
     assert!(resolved["models"].is_array());
+}
+
+#[tokio::test]
+async fn ai_cache_status_and_clear_endpoints() {
+    let (app, storage) = platform_app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    let response = request(&app, Method::GET, "/platform/ai/cache", Some(&admin), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stats = json_body(response).await;
+    assert_eq!(stats["backend"], "memory");
+    assert_eq!(stats["entries"], 0);
+    assert_eq!(stats["encrypted"], true);
+    assert!(stats["max_bytes"].as_u64().is_some_and(|max| max > 0));
+    // Only a real AI API can be cleared (names are never used as patterns).
+    let response = request(
+        &app,
+        Method::DELETE,
+        "/platform/ai/cache/gpt/v1",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    storage
+        .insert_one(
+            "apis",
+            json!({"api_id": "gpt-id", "api_name": "gpt", "api_version": "v1", "api_type": "AI",
+                "api_ai_provider": "openai", "api_servers": ["http://127.0.0.1:9"],
+                "api_ai_config": {"credential_group": "c", "allowed_models": ["gpt-x"]}}),
+        )
+        .await
+        .unwrap();
+    let response = request(
+        &app,
+        Method::DELETE,
+        "/platform/ai/cache/gpt/v1",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cleared = json_body(response).await;
+    assert_eq!(cleared["api"], "gpt/v1");
+    assert_eq!(cleared["purged"], 0);
 }

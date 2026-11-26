@@ -454,6 +454,20 @@ pub fn validate_ai_api(api: &Value) -> Result<(), Vec<Value>> {
         if config.first_byte_timeout_ms == 0 || config.stream_idle_timeout_ms == 0 {
             fail("api_ai_config", "timeouts must be greater than 0");
         }
+        if !(crate::ai::config::CACHE_MIN_TTL_SECONDS..=crate::ai::config::CACHE_MAX_TTL_SECONDS)
+            .contains(&config.cache.ttl_seconds)
+        {
+            fail(
+                "api_ai_config.cache.ttl_seconds",
+                "cache lifetime must be from 60 seconds to 7 days",
+            );
+        }
+        if !matches!(config.cache.scope.as_str(), "user" | "shared") {
+            fail(
+                "api_ai_config.cache.scope",
+                "cache scope must be user or shared",
+            );
+        }
         // Region and project are spliced into upstream URLs: keep them to [a-z0-9-].
         let path_safe = |value: &str| {
             !value.is_empty()
@@ -855,6 +869,17 @@ mod tests {
         );
         let mut api = ai_api(json!({"api_name": "v1"}));
         assert_eq!(ai_error_fields(prepare_ai_api(&mut api)), vec!["api_name"]);
+        let mut api = ai_api(
+            json!({"api_ai_config": {"credential_group": "c", "allowed_models": ["m"],
+            "cache": {"enabled": true, "ttl_seconds": 10, "scope": "everyone"}}}),
+        );
+        assert_eq!(
+            ai_error_fields(prepare_ai_api(&mut api)),
+            vec![
+                "api_ai_config.cache.ttl_seconds",
+                "api_ai_config.cache.scope"
+            ]
+        );
         let mut api = ai_api(json!({"api_ai_provider": "aws"}));
         assert_eq!(
             ai_error_fields(prepare_ai_api(&mut api)),

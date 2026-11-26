@@ -94,6 +94,71 @@ pub(crate) async fn dispatch(
         }
         (Method::GET, ["ai", "usage", "me"]) => usage_me(state, username, request_id).await,
         (Method::GET, ["ai", "settings"]) => get_settings(state, request_id).await,
+        (Method::GET, ["ai", "cache"]) => {
+            if !has_permission(state, username, "manage_ai").await {
+                return forbidden(
+                    "You do not have permission to view the AI cache",
+                    request_id,
+                );
+            }
+            success(
+                StatusCode::OK,
+                crate::ai::cache::stats(state.storage.as_deref()),
+                request_id,
+            )
+        }
+        (Method::DELETE, ["ai", "cache", api_name, api_version]) => {
+            if !has_permission(state, username, "manage_ai").await {
+                return forbidden(
+                    "You do not have permission to clear the AI cache",
+                    request_id,
+                );
+            }
+            let api = format!("{api_name}/{api_version}");
+            // Resolve the real AI API: entries are namespaced by its api_id,
+            // never by the (reusable, free-text) name in the URL.
+            let api_id = policy_documents(state).await.and_then(|documents| {
+                documents
+                    .apis
+                    .iter()
+                    .find(|doc| {
+                        doc.get("api_name").and_then(Value::as_str) == Some(*api_name)
+                            && doc.get("api_version").and_then(Value::as_str) == Some(*api_version)
+                            && crate::platform_contract::is_ai_api(doc)
+                    })
+                    .and_then(|doc| doc.get("api_id").and_then(Value::as_str))
+                    .map(str::to_owned)
+            });
+            let Some(api_id) = api_id else {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    ErrorCode::AI_OPERATION_NOT_ALLOWED,
+                    "AI API does not exist",
+                    request_id,
+                );
+            };
+            let namespace = crate::ai::cache::api_namespace(&api_id);
+            match crate::ai::cache::purge(state.storage.as_deref(), &namespace).await {
+                Ok(purged) => {
+                    audit::management_mutation(username, "ai_cache.purge", &api, "success");
+                    success(
+                        StatusCode::OK,
+                        json!({"api": api, "purged": purged}),
+                        request_id,
+                    )
+                }
+                Err(message) => {
+                    tracing::error!(api = %api, error = %message, "AI cache purge failed");
+                    audit::management_mutation(username, "ai_cache.purge", &api, "failure");
+                    error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "GTW006",
+                        "Clearing the AI cache failed; try again",
+                        request_id,
+                    )
+                }
+            }
+        }
         (Method::GET, ["ai", "unified", "resolve"]) => {
             if !has_permission(state, username, "manage_apis").await {
                 return forbidden(
@@ -448,6 +513,10 @@ struct Totals {
     cost_nanos: u64,
     estimated_requests: u64,
     unpriced_requests: u64,
+    cache_hits: u64,
+    saved_input_tokens: u64,
+    saved_output_tokens: u64,
+    saved_cost_nanos: u64,
 }
 
 impl Totals {
@@ -462,6 +531,10 @@ impl Totals {
         self.cost_nanos += field("cost_nanos");
         self.estimated_requests += field("estimated_requests");
         self.unpriced_requests += field("unpriced_requests");
+        self.cache_hits += field("cache_hits");
+        self.saved_input_tokens += field("saved_input_tokens");
+        self.saved_output_tokens += field("saved_output_tokens");
+        self.saved_cost_nanos += field("saved_cost_nanos");
     }
 
     fn json(&self) -> serde_json::Map<String, Value> {
@@ -476,6 +549,11 @@ impl Totals {
             "cost_usd": format_usd(self.cost_nanos),
             "estimated_requests": self.estimated_requests,
             "unpriced_requests": self.unpriced_requests,
+            "cache_hits": self.cache_hits,
+            "saved_input_tokens": self.saved_input_tokens,
+            "saved_output_tokens": self.saved_output_tokens,
+            "saved_cost_nanos": self.saved_cost_nanos,
+            "saved_cost_usd": format_usd(self.saved_cost_nanos),
         });
         value.as_object().cloned().unwrap_or_default()
     }
@@ -845,7 +923,7 @@ async fn export_csv(
     }
     let mut csv = String::from(
         "# AI usage chargeback (metadata only). Group totals can double-count users who belong to several groups.\n\
-         month,group,username,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,estimated_requests,unpriced_requests,role,tier,provider\n",
+         month,group,username,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,estimated_requests,unpriced_requests,role,tier,provider,cache_hits,saved_cost_usd\n",
     );
     for ((group, username, model, role, tier, provider), totals) in cells {
         let line = [
@@ -864,6 +942,8 @@ async fn export_csv(
             csv_cell(&role),
             csv_cell(&tier),
             csv_cell(&provider),
+            totals.cache_hits.to_string(),
+            format_usd(totals.saved_cost_nanos),
         ]
         .join(",");
         csv.push_str(&line);
@@ -918,6 +998,11 @@ async fn usage_me(state: &AppState, username: &str, request_id: &str) -> Respons
                 "output_tokens": totals.output_tokens,
                 "cost_nanos": totals.cost_nanos,
                 "cost_usd": format_usd(totals.cost_nanos),
+                "cache_hits": totals.cache_hits,
+                "saved_input_tokens": totals.saved_input_tokens,
+                "saved_output_tokens": totals.saved_output_tokens,
+                "saved_cost_nanos": totals.saved_cost_nanos,
+                "saved_cost_usd": format_usd(totals.saved_cost_nanos),
             },
             "budgets": own_budget_statuses(state, username).await,
             "apis": apis,

@@ -107,6 +107,7 @@ Policy matching trims surrounding whitespace. IPv4 networks accept prefix length
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AI_USER_ID_SALT` | Derived from `TOKEN_ENCRYPTION_KEY` / `MEM_ENCRYPTION_KEY` | Optional HMAC salt for pseudonymous provider user IDs (`safety_identifier` / `metadata.user_id`). Changing it breaks per-user continuity at the provider. |
+| `AI_CACHE_MAX_BYTES` | `268435456` (256 MiB) | Most memory the AI response cache uses when Doorman runs without external storage. With external storage, answers go to Redis and this is ignored. |
 | `AI_BUILTIN_PRICES` | `true` | Set to `false` to stop using the built-in model price list. Only prices entered in AI Gateway → Providers → Model prices are then used. |
 | `DOORMAN_EGRESS_IPS` | unset | Comma-separated outbound IPs, displayed in AI settings for provider allowlisting. Does not configure network routing. |
 | `REVOCATION_PURGE_INTERVAL_SECONDS` | `300` | How often expired token revocations and expired AI prompt logs are purged |

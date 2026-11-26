@@ -625,6 +625,119 @@ Administrators manage budgets in **AI Gateway → Allowances**; Groups and Users
 shortcuts that prefill the budget target. Usage bars show each budget's current
 period, independently of the analytics date range.
 
+## Response caching
+
+When someone sends exactly the same request again, Doorman can replay the
+stored answer instead of calling the provider. A cached answer costs nothing,
+comes back right away, and Usage shows what caching saved.
+
+Caching is off by default. To turn it on, open **AI Gateway → Providers**,
+select **Caching** on a provider card and choose:
+
+| Setting | Options |
+| --- | --- |
+| Cache answers | On or off for this provider |
+| Keep answers for | 5 minutes, 1 hour (default), 1 day, 7 days, or a custom time in whole seconds from 60 (1 minute) to 604800 (7 days) |
+| Who gets a stored answer | **Only the same person** (default), or **Everyone who can use this provider** |
+
+Choose **Everyone who can use this provider** only when prompts don't contain
+personal information. Someone who sends the same prompt as a colleague then
+gets the colleague's answer.
+
+### What counts as the same request
+
+Two requests match only when everything that can change the answer is the
+same:
+
+- the body as it would be sent to the provider, after input guardrails, the
+  model alias and the output-token cap. Key order and whitespace don't matter,
+  and any other difference, such as a changed word, temperature or tool list,
+  makes it a different request;
+- the provider settings: the API itself (an API deleted and created again
+  under the same name starts empty), its servers, its AI settings, and the
+  provider account the person's group uses;
+- headers sent on to the provider, such as `anthropic-version`,
+  `anthropic-beta` or `openai-beta`. Tracing, `User-Agent` and SDK
+  `x-stainless-*` headers are ignored;
+- the query string, in the order sent;
+- the output guardrails that apply to the person. Changing a guardrail starts
+  a new set of answers;
+- with **Only the same person**, the account. A user deleted and created again
+  with the same username starts empty.
+
+A streamed and a non-streamed request are cached separately. Requests through the one-endpoint address
+(`/api/ai/v1/chat/completions`) use the same cache as the provider's own
+address.
+
+Doorman stores only complete, successful answers, up to 1 MiB each, after
+output guardrails. A stream is stored only when the provider's end marker
+arrives (for example `data: [DONE]` or `message_stop`) and every frame is
+whole. Errors, error bodies returned with status 200, refused answers, answers
+that a guardrail blocked, and streams that are cut off or carry an error event
+are never stored. If an allowance switched the request to a cheaper model, that
+answer isn't stored either. Answers from providers that report no token counts
+are stored too, and their savings are estimated from the answer's size.
+
+### How a request uses the cache
+
+1. Input guardrails run first. A blocked prompt stays blocked, even if an answer
+   for it was stored earlier.
+2. Doorman looks up the stored answer. On a hit, the current output guardrails
+   run on it again (non-stream answers), and it is replayed with the original
+   content type, including streams. The request is recorded as a free request.
+3. On a miss, allowances, failover and the provider call run as usual, and the
+   answer is stored for the chosen time.
+
+A cache hit doesn't use token or dollar allowances. It still counts as a
+request: request allowances (per minute, hour, day or month) and bandwidth
+limits apply to hits, and a hit is refused with `429` when a request allowance
+is used up. Doorman's own rate limits for the user and the API also apply.
+
+### Skip the cache for one request
+
+Send one of these headers:
+
+- `Cache-Control: no-store` or `Cache-Control: no-cache`
+- `x-doorman-cache: bypass`
+
+Every AI response includes `x-doorman-cache`, which shows what happened:
+
+| Value | Meaning |
+| --- | --- |
+| `hit` | Replayed from the cache, with no provider call and no cost |
+| `miss` | Sent to the provider. A successful answer is now stored |
+| `bypass` | The request asked to skip the cache |
+| `off` | Caching is off for this provider, or the request can't be cached |
+
+Responses that Doorman makes itself, such as a guardrail block or an allowance
+limit, carry the header too.
+
+### Savings, storage and clearing
+
+**AI Gateway → Usage** shows **Saved by caching** with the dollars and tokens
+that cache hits avoided, and a **From cache** column in the breakdown when there
+are hits. **My AI** shows each person's own savings. The usage CSV export
+includes `cache_hits` and `saved_cost_usd`.
+
+When Doorman runs with external storage, answers are stored in Redis,
+encrypted with the field-encryption key (`TOKEN_ENCRYPTION_KEY` or
+`MEM_ENCRYPTION_KEY`), and every gateway instance shares them. Without a key,
+nothing is cached in Redis, because answers are never stored unencrypted.
+**AI Gateway → Settings** warns about this. Otherwise they
+are kept in the gateway's memory, up to `AI_CACHE_MAX_BYTES` (256 MiB by
+default). The least recently used answers are removed first, and memory
+answers don't survive a restart. **AI Gateway → Settings** shows which backend is
+in use.
+
+To remove every stored answer for a provider, for example after you change a
+system prompt, open **Caching** on its card and select **Clear cache**. You can
+also call `DELETE /platform/ai/cache/{api_name}/{api_version}`, which requires
+`manage_ai` and returns `404` for an API that doesn't exist. Clearing takes
+effect at once on every gateway instance, including answers that were still
+being written. If the backend fails, the call returns `503` and nothing is
+reported as cleared. `GET /platform/ai/cache` returns the backend, whether
+answers are encrypted, and, for memory, the number of entries and bytes.
+
 ## Guardrails and prompt privacy
 
 In **AI Gateway → Policies → Guardrails**, configure built-in email, US SSN, credit-card,

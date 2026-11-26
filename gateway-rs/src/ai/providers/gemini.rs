@@ -207,8 +207,12 @@ struct GeminiStream {
     usage: Option<AiUsage>,
     text: String,
     refusal: bool,
+    done: bool,
 }
 impl StreamUsageParser for GeminiStream {
+    fn terminal_seen(&self) -> bool {
+        self.done
+    }
     fn on_event(&mut self, event: &SseEvent) {
         let Ok(body) = serde_json::from_str::<Value>(&event.data) else {
             return;
@@ -217,6 +221,11 @@ impl StreamUsageParser for GeminiStream {
             self.usage = Some(usage);
         }
         self.refusal |= refusal(&body);
+        self.done |= body["candidates"].as_array().is_some_and(|candidates| {
+            candidates
+                .iter()
+                .any(|candidate| candidate["finishReason"].as_str().is_some())
+        });
         response_text(&body, &mut self.text);
     }
     fn completion_text(&self) -> Option<&str> {

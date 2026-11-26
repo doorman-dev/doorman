@@ -516,6 +516,64 @@ impl SharedStorage {
         })
     }
 
+    /// True when Doorman runs with external storage (Redis available).
+    pub fn has_redis(&self) -> bool {
+        self.redis.is_some()
+    }
+
+    /// Redis GET (external storage only).
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let mut redis = self.redis()?;
+        Ok(redis.get(key).await?)
+    }
+
+    /// Redis SET with expiry (external storage only).
+    pub async fn kv_set_ex(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), StorageError> {
+        let mut redis = self.redis()?;
+        let _: () = redis.set_ex(key, value, ttl_seconds).await?;
+        Ok(())
+    }
+
+    /// Redis INCR (external storage only); returns the new value.
+    pub async fn kv_incr(&self, key: &str) -> Result<u64, StorageError> {
+        let mut redis = self.redis()?;
+        let value: u64 = redis.incr(key, 1_u64).await?;
+        Ok(value)
+    }
+
+    /// Deletes every Redis key starting with `prefix` (taken literally: glob
+    /// characters in it are escaped); returns how many.
+    pub async fn kv_delete_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let mut redis = self.redis()?;
+        let pattern = format!("{}*", escape_glob(prefix));
+        let mut cursor: u64 = 0;
+        let mut deleted = 0u64;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(500)
+                .query_async(&mut redis)
+                .await?;
+            if !keys.is_empty() {
+                let removed: u64 = redis.del(&keys).await?;
+                deleted += removed;
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(deleted)
+    }
+
     fn redis(&self) -> Result<ConnectionManager, StorageError> {
         self.redis.clone().ok_or_else(|| {
             StorageError::InvalidDocument("Redis unavailable in memory mode".to_owned())
@@ -1760,10 +1818,29 @@ fn merge_object(target: &mut Value, updates: &Value) {
     }
 }
 
+/// Escapes Redis glob metacharacters so a SCAN MATCH pattern matches `text`
+/// literally.
+pub fn escape_glob(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '\\' | '^' | '-') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out
+}
+
 #[cfg(test)]
 mod parity_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn escape_glob_makes_scan_patterns_literal() {
+        assert_eq!(escape_glob("ab12:"), "ab12:");
+        assert_eq!(escape_glob("a*b?[c]\\"), "a\\*b\\?\\[c\\]\\\\");
+    }
 
     #[tokio::test]
     async fn tls_mutation_lock_serializes_cloned_memory_storage() {

@@ -46,6 +46,65 @@ export interface AiApiConfig {
   fallback_targets?: AiTarget[]
   /** Spread traffic across the primary and backups on a different server. */
   load_balance?: boolean
+  /** Exact-match response caching. Off by default. */
+  cache?: AiCacheConfig
+}
+
+export type AiCacheScope = 'user' | 'shared'
+
+export interface AiCacheStats {
+  backend: 'memory' | 'redis'
+  entries: number | null
+  bytes: number | null
+  max_bytes: number | null
+  /** False when Redis is used without an encryption key: nothing is cached then. */
+  encrypted?: boolean
+}
+
+/** "512 B", "1.5 MB", "256 MB". */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`
+}
+
+export interface AiCacheConfig {
+  enabled: boolean
+  /** 60 seconds to 7 days. */
+  ttl_seconds: number
+  /** user: only the same person gets a stored answer. shared: anyone allowed on the API. */
+  scope: AiCacheScope
+}
+
+export const AI_CACHE_TTL_PRESETS: { label: string; seconds: number }[] = [
+  { label: '5 minutes', seconds: 300 },
+  { label: '1 hour', seconds: 3600 },
+  { label: '1 day', seconds: 86400 },
+  { label: '7 days', seconds: 604800 },
+]
+
+export function defaultCacheConfig(): AiCacheConfig {
+  return { enabled: false, ttl_seconds: 3600, scope: 'user' }
+}
+
+/** "5 minutes", "1 hour", "90 minutes", "2 days". */
+export function formatCacheTtl(seconds: number): string {
+  const preset = AI_CACHE_TTL_PRESETS.find(item => item.seconds === seconds)
+  if (preset) return preset.label
+  const unit = (value: number, name: string) => `${value} ${name}${value === 1 ? '' : 's'}`
+  if (seconds % 86400 === 0) return unit(seconds / 86400, 'day')
+  if (seconds % 3600 === 0) return unit(seconds / 3600, 'hour')
+  if (seconds % 60 === 0) return unit(seconds / 60, 'minute')
+  return unit(seconds, 'second')
+}
+
+/** Summary line for a provider card. */
+export function cacheSummary(cache?: Partial<AiCacheConfig>): string {
+  if (!cache?.enabled) return 'Off'
+  return `${formatCacheTtl(cache.ttl_seconds || 3600)}, ${cache.scope === 'shared' ? 'shared' : 'per person'}`
 }
 
 export interface AiTarget {
@@ -151,6 +210,12 @@ export interface AiUsageTotals {
   output_tokens: number
   cost_nanos: number
   cost_usd: string
+  /** Response-cache hits (step 6): free requests and what they would have cost. */
+  cache_hits?: number
+  saved_input_tokens?: number
+  saved_output_tokens?: number
+  saved_cost_nanos?: number
+  saved_cost_usd?: string
 }
 
 export interface AiTopModel extends AiUsageTotals {

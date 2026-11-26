@@ -12,6 +12,8 @@ pub struct SseParser {
     frame: Vec<u8>,
     dropping: bool,
     line_has_content: bool,
+    /// An OpenAI-style `data: [DONE]` frame arrived (not returned as an event).
+    done: bool,
 }
 
 impl SseParser {
@@ -22,6 +24,7 @@ impl SseParser {
             frame: Vec::new(),
             dropping: false,
             line_has_content: false,
+            done: false,
         }
     }
 
@@ -39,8 +42,10 @@ impl SseParser {
             if byte == b'\n' {
                 if !self.line_has_content {
                     if !self.dropping {
-                        if let Some(event) = parse_frame(&self.frame) {
-                            events.push(event);
+                        match parse_frame_raw(&self.frame) {
+                            Some(event) if event.data.trim() == "[DONE]" => self.done = true,
+                            Some(event) => events.push(event),
+                            None => {}
                         }
                     }
                     self.frame.clear();
@@ -54,12 +59,23 @@ impl SseParser {
         events
     }
 
+    /// True once a `data: [DONE]` frame has been seen.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
     pub fn overflowed(&self) -> bool {
         self.overflowed
     }
+
+    /// True when bytes of an unfinished event are still buffered (the stream
+    /// was cut off mid-event).
+    pub fn has_partial(&self) -> bool {
+        self.dropping || self.frame.iter().any(|byte| !byte.is_ascii_whitespace())
+    }
 }
 
-fn parse_frame(frame: &[u8]) -> Option<SseEvent> {
+fn parse_frame_raw(frame: &[u8]) -> Option<SseEvent> {
     let text = std::str::from_utf8(frame).ok()?;
     let mut event = None;
     let mut data = Vec::new();
@@ -78,13 +94,24 @@ fn parse_frame(frame: &[u8]) -> Option<SseEvent> {
     if data.is_empty() {
         return None;
     }
-    let data = data.join("\n");
-    (data.trim() != "[DONE]").then_some(SseEvent { event, data })
+    Some(SseEvent {
+        event,
+        data: data.join("\n"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_parser_reports_a_cut_off_event() {
+        let mut parser = SseParser::new(1024);
+        parser.push(b"data: {\"a\":1}\n\n");
+        assert!(!parser.has_partial());
+        parser.push(b"data: {\"b\":");
+        assert!(parser.has_partial());
+    }
 
     #[test]
     fn sse_parser_handles_split_frames_and_crlf() {
