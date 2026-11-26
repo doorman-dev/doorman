@@ -184,8 +184,11 @@ async fn ai_requests_export_genai_spans_and_metrics() {
     assert!(!metrics.is_empty(), "no metrics exported");
     for bytes in traces.iter().chain(&metrics) {
         let raw = String::from_utf8_lossy(bytes);
-        for secret in [SECRET_PROMPT, SECRET_REPLY, "tenant=acme", &h.key, &hs.key] {
-            assert!(!raw.contains(secret), "exported {secret}");
+        for (index, secret) in [SECRET_PROMPT, SECRET_REPLY, "tenant=acme", &h.key, &hs.key]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(!raw.contains(secret), "secret #{index} was exported");
         }
         assert!(
             !raw.contains("enduser.id"),
