@@ -7,10 +7,11 @@ import AiTabs, { useHashTab } from '@/components/AiTabs'
 import AiPricingPanel from '@/components/AiPricingPanel'
 import AiUnifiedPanel from '@/components/AiUnifiedPanel'
 import AiBackupsEditor, { backupsSummary } from '@/components/AiBackupsEditor'
+import AiCacheEditor from '@/components/AiCacheEditor'
 import { useAuth } from '@/contexts/AuthContext'
 import { fetchAllPaginated, getJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import { bedrockEndpointRegion, formatTokens, formatUsd, providerLabel, type AiApiConfig, type AiBreakdown, type AiUsageRow } from '@/utils/ai'
+import { bedrockEndpointRegion, cacheSummary, formatTokens, formatUsd, providerLabel, type AiApiConfig, type AiBreakdown, type AiUsageRow } from '@/utils/ai'
 
 interface AiApi {
   api_id?: string
@@ -25,7 +26,7 @@ interface AiApi {
 
 const TABS = [{ id: 'providers', label: 'Providers' }, { id: 'endpoint', label: 'One endpoint' }, { id: 'prices', label: 'Model prices' }]
 
-function ProviderCard({ api, usage, canEdit, onBackups }: { api: AiApi; usage?: AiUsageRow; canEdit: boolean; onBackups: () => void }) {
+function ProviderCard({ api, usage, canEdit, onBackups, onCache }: { api: AiApi; usage?: AiUsageRow; canEdit: boolean; onBackups: () => void; onCache: () => void }) {
   const config = api.api_ai_config || {}
   const location = config.region || (api.api_ai_provider === 'bedrock' ? bedrockEndpointRegion(api.api_servers?.[0]) : '')
   const hasKey = !!config.credential_group && config.credential_group !== 'none'
@@ -48,9 +49,10 @@ function ProviderCard({ api, usage, canEdit, onBackups }: { api: AiApi; usage?: 
       {aliases.length > 0 && <><dt className="text-gray-500">Aliases</dt><dd className="min-w-0 break-words">{aliases.map(([alias, model]) => `${alias} → ${model}`).join(', ')}</dd></>}
       <dt className="text-gray-500">Who can use it</dt><dd>{who}</dd>
       <dt className="text-gray-500">Backups</dt><dd>{backupsSummary(config)}</dd>
+      <dt className="text-gray-500">Caching</dt><dd>{cacheSummary(config.cache)}</dd>
       <dt className="text-gray-500">Last 30 days</dt><dd className="tabular-nums">{usage ? `${formatTokens(usage.requests)} requests · ${formatUsd(usage.cost_nanos)}` : 'No traffic'}</dd>
     </dl>
-    {canEdit && api.api_id && <div className="mt-auto flex gap-2 border-t border-gray-100 pt-3"><Link href={`/apis/${encodeURIComponent(api.api_id)}`} className="btn btn-secondary">Edit</Link><button type="button" className="btn btn-secondary" onClick={onBackups}>Backups</button></div>}
+    {canEdit && api.api_id && <div className="mt-auto flex flex-wrap gap-2 border-t border-gray-100 pt-3"><Link href={`/apis/${encodeURIComponent(api.api_id)}`} className="btn btn-secondary">Edit</Link><button type="button" className="btn btn-secondary" onClick={onBackups}>Backups</button><button type="button" className="btn btn-secondary" onClick={onCache}>Caching</button></div>}
   </article>
 }
 
@@ -61,6 +63,7 @@ export default function AiProvidersPage() {
   const [usage, setUsage] = useState<Map<string, AiUsageRow>>(new Map())
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<AiApi | null>(null)
+  const [caching, setCaching] = useState<AiApi | null>(null)
 
   useEffect(() => {
     let active = true
@@ -83,12 +86,14 @@ export default function AiProvidersPage() {
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
       {!apis && !error && <p className="text-sm text-gray-500">Loading providers…</p>}
       {apis && !apis.length && <div className="card p-10 text-center space-y-3"><h2 className="text-lg font-semibold">No AI providers yet</h2><p className="text-sm text-gray-600">Add a provider key, pick who can use it and set allowances.</p>{canManage && <Link href="/ai/setup" className="btn btn-primary">Add provider</Link>}</div>}
-      {apis && apis.length > 0 && <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{apis.map(api => <ProviderCard key={`${api.api_name}/${api.api_version}`} api={api} usage={usage.get(`${api.api_name}/${api.api_version}`) || usage.get(api.api_name)} canEdit={!!permissions?.manage_apis} onBackups={() => setEditing(api)} />)}</div>}
+      {apis && apis.length > 0 && <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{apis.map(api => <ProviderCard key={`${api.api_name}/${api.api_version}`} api={api} usage={usage.get(`${api.api_name}/${api.api_version}`) || usage.get(api.api_name)} canEdit={!!permissions?.manage_apis} onBackups={() => setEditing(api)} onCache={() => setCaching(api)} />)}</div>}
       {apis && apis.length > 0 && <p className="text-xs text-gray-500">Need full control? <Link href="/apis/add?type=AI" className="underline">Add a provider manually</Link>.</p>}
     </>}
     {tab === 'endpoint' && <AiUnifiedPanel apis={apis} providersError={error} canManage={canManage} canListUsers={!!permissions?.manage_users} />}
     {tab === 'prices' && <AiPricingPanel canManage={canManage} />}
     {editing && <AiBackupsEditor apiName={editing.api_name} apiVersion={editing.api_version} provider={editing.api_ai_provider} config={editing.api_ai_config || {}} onClose={() => setEditing(null)}
       onSaved={config => { setApis(current => current && current.map(api => api === editing ? { ...api, api_ai_config: config } : api)); setEditing(null) }} />}
+    {caching && <AiCacheEditor apiName={caching.api_name} apiVersion={caching.api_version} config={caching.api_ai_config || {}} canClear={canManage} onClose={() => setCaching(null)}
+      onSaved={config => { setApis(current => current && current.map(api => api === caching ? { ...api, api_ai_config: config } : api)); setCaching(null) }} />}
   </AiPage>
 }

@@ -233,9 +233,13 @@ struct ConverseStream {
     usage: Option<AiUsage>,
     text: String,
     refusal: bool,
+    done: bool,
 }
 
 impl StreamUsageParser for ConverseStream {
+    fn terminal_seen(&self) -> bool {
+        self.done
+    }
     fn on_event(&mut self, event: &SseEvent) {
         let Ok(body) = serde_json::from_str::<Value>(&event.data) else {
             return;
@@ -246,7 +250,10 @@ impl StreamUsageParser for ConverseStream {
                     self.usage = Some(usage);
                 }
             }
-            Some("messageStop") => self.refusal |= converse_refusal(&body),
+            Some("messageStop") => {
+                self.done = true;
+                self.refusal |= converse_refusal(&body);
+            }
             Some("contentBlockDelta") => {
                 if let Some(text) = body["delta"]["text"].as_str() {
                     common::append_text(&mut self.text, text);
@@ -272,6 +279,9 @@ struct InvokeStream {
 }
 
 impl StreamUsageParser for InvokeStream {
+    fn terminal_seen(&self) -> bool {
+        self.parser.terminal_seen()
+    }
     fn on_event(&mut self, event: &SseEvent) {
         if event.event.as_deref() != Some("chunk") {
             return;

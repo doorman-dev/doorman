@@ -132,13 +132,18 @@ struct AnthropicStream {
     usage: Option<AiUsage>,
     text: String,
     refusal: bool,
+    done: bool,
 }
 impl StreamUsageParser for AnthropicStream {
+    fn terminal_seen(&self) -> bool {
+        self.done
+    }
     fn on_event(&mut self, event: &SseEvent) {
         let Ok(body) = serde_json::from_str::<Value>(&event.data) else {
             return;
         };
         match body["type"].as_str().or(event.event.as_deref()) {
+            Some("message_stop") => self.done = true,
             Some("message_start") => {
                 if body["message"]["usage"]["input_tokens"].as_u64().is_some() {
                     let mut usage = AiUsage::default();

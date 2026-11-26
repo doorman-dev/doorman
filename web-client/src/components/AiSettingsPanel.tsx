@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { getJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import type { AiLogLevel, AiSettings } from '@/utils/ai'
+import { formatBytes, type AiCacheStats, type AiLogLevel, type AiSettings } from '@/utils/ai'
 
 export default function AiSettingsPanel() {
   const [settings, setSettings] = useState<AiSettings | null>(null)
@@ -13,10 +13,12 @@ export default function AiSettingsPanel() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  const [cacheStats, setCacheStats] = useState<AiCacheStats | null>(null)
 
   const apply = (value: AiSettings) => { setSettings(value); setLogLevel(value.log_level); setRetention(String(value.retention_days)); setNotice(value.notice_text || '') }
   useEffect(() => {
     getJson<AiSettings>(`${SERVER_URL}/platform/ai/settings`).then(apply).catch(reason => setError(reason instanceof Error ? reason.message : 'Unable to load AI settings'))
+    getJson<AiCacheStats>(`${SERVER_URL}/platform/ai/cache`).then(setCacheStats).catch(() => {})
   }, [])
 
   const save = async (event: React.FormEvent) => {
@@ -39,6 +41,11 @@ export default function AiSettingsPanel() {
       <label className="block text-sm max-w-xl">Notice shown to employees{logLevel === 'full' && ' (required)'}<textarea className="input w-full mt-1" rows={3} maxLength={2000} required={logLevel === 'full'} value={notice} onChange={e => setNotice(e.target.value)} placeholder="AI prompts sent through Doorman are logged for security review." /></label>
       <label className="block text-sm">Keep logs for (days)<input className="input w-32 mt-1 block" type="number" min={1} max={3650} required value={retention} onChange={e => setRetention(e.target.value)} /></label>
       <div className="text-sm"><p>Outbound IP addresses</p>{settings.egress_ips.length ? <ul className="font-mono text-xs mt-1">{settings.egress_ips.map(ip => <li key={ip}>{ip}</li>)}</ul> : <p className="text-xs text-gray-500 mt-1">Not configured. Set <code>DOORMAN_EGRESS_IPS</code> to show the addresses providers should allowlist.</p>}</div>
+      {cacheStats && <div className="text-sm"><p>Response cache</p><p className="text-xs text-gray-500 mt-1">{cacheStats.backend === 'redis'
+        ? (cacheStats.encrypted === false
+          ? 'Caching is unavailable: Redis is in use but no TOKEN_ENCRYPTION_KEY or MEM_ENCRYPTION_KEY is set, and answers are never stored unencrypted.'
+          : 'Stored in Redis, encrypted, and shared by every gateway instance.')
+        : `Stored in this gateway's memory: ${cacheStats.entries ?? 0} answer${cacheStats.entries === 1 ? '' : 's'}, ${formatBytes(cacheStats.bytes ?? 0)} of ${formatBytes(cacheStats.max_bytes ?? 0)} (set AI_CACHE_MAX_BYTES to change). Turn caching on per provider under Providers.`}</p></div>}
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
       {saved && <p role="status" className="text-sm text-green-700">Saved.</p>}
       <button type="submit" className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>

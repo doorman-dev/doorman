@@ -110,7 +110,7 @@ export default function MyAiPage() {
     <section className="card p-6 space-y-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="card-title">This month</h2>
-        {data && <p className="text-sm text-gray-600 tabular-nums">{formatTokens(data.usage.requests)} requests · {formatUsd(data.usage.cost_nanos)}</p>}
+        {data && <p className="text-sm text-gray-600 tabular-nums">{formatTokens(data.usage.requests)} requests · {formatUsd(data.usage.cost_nanos)}{(data.usage.cache_hits || 0) > 0 && <> · {formatTokens(data.usage.cache_hits || 0)} answered from the cache, saving {formatUsd(data.usage.saved_cost_nanos || 0)}</>}</p>}
       </div>
       {!data ? <p className="text-sm text-gray-500">Loading…</p> : data.budgets.length ? <div className={data.budgets.length > 1 ? 'grid gap-5 md:grid-cols-2' : 'space-y-5'}>{data.budgets.map(budget => <Allowance key={budget.budget_id} budget={budget} />)}</div> : <p className="text-sm text-gray-500">No limits are set for you.</p>}
     </section>

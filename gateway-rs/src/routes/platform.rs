@@ -4699,6 +4699,7 @@ async fn user_routes(
             .await
         {
             Ok(true) => {
+                crate::ai::cache::forget_user(state.storage.as_deref(), target).await;
                 audit::management_mutation(active_user, "user.delete", target, "success");
                 message(StatusCode::OK, "User deleted successfully", request_id)
             }
@@ -5647,6 +5648,8 @@ async fn create_user(
     set_default(payload, "ui_access", json!(false));
     match storage.insert_one("users", payload.clone()).await {
         Ok(_) => {
+            // A reused username never inherits a deleted account's cached answers.
+            crate::ai::cache::forget_user(state.storage.as_deref(), &username).await;
             if let Some(actor) = actor {
                 audit::management_mutation(actor, "user.create", &username, "success");
             } else {
@@ -7088,6 +7091,8 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/platform/ai/settings"),
     ("PUT", "/platform/ai/settings"),
     ("GET", "/platform/ai/unified/resolve"),
+    ("GET", "/platform/ai/cache"),
+    ("DELETE", "/platform/ai/cache/{api_name}/{api_version}"),
     ("GET", "/platform/ai/guardrails"),
     ("POST", "/platform/ai/guardrails"),
     ("POST", "/platform/ai/guardrails/test"),

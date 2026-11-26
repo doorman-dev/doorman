@@ -3,6 +3,7 @@
 pub mod access;
 pub mod adapter;
 pub mod budgets;
+pub mod cache;
 pub mod config;
 pub mod credentials;
 pub mod eventstream;

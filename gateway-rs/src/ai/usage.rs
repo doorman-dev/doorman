@@ -19,6 +19,12 @@ pub trait StreamUsageParser: Send {
     fn completion_text(&self) -> Option<&str>;
     /// None → caller estimates (bytes/4) and sets estimated=true.
     fn finish(self: Box<Self>) -> Option<AiUsage>;
+    /// True once the provider's end-of-reply marker was seen (OpenAI `[DONE]`,
+    /// Anthropic `message_stop`, a Gemini `finishReason`, Bedrock
+    /// `messageStop`). Only such streams are stored in the response cache.
+    fn terminal_seen(&self) -> bool {
+        false
+    }
 }
 
 use std::{
@@ -151,6 +157,37 @@ pub struct FinalizeCtx {
     /// The model name the client sent to the unified endpoint (`/api/ai/v1`);
     /// None for native requests.
     pub unified_model: Option<String>,
+    /// Set on a response-cache hit: the provider usage the stored answer cost
+    /// when it was first made (recorded as savings; the hit itself is free).
+    pub cache_saved: Option<AiUsage>,
+}
+
+/// Records a streamed reply while it is forwarded and stores it in the
+/// response cache when the stream ends cleanly (step 6).
+pub struct StreamCache {
+    pub storage: Option<Arc<SharedStorage>>,
+    pub key: String,
+    pub ttl_seconds: u64,
+    /// Status, content type, headers and model; body and usage are filled in.
+    pub template: crate::ai::cache::CachedReply,
+}
+
+impl StreamCache {
+    /// Stores `body` with `usage` when the reply qualifies (decision 6).
+    pub fn store(self, body: Vec<u8>, usage: &AiUsage) {
+        let mut reply = self.template;
+        reply.body = body;
+        reply.set_usage(usage);
+        if !crate::ai::cache::storable(&reply, usage) {
+            return;
+        }
+        let (storage, key, ttl) = (self.storage, self.key, self.ttl_seconds);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                crate::ai::cache::put(storage.as_deref(), &key, reply, ttl).await;
+            });
+        }
+    }
 }
 
 /// Content captured for `ai_prompt_logs` (log level `full`, C8). Text is
@@ -210,6 +247,7 @@ async fn write_prompt_log(storage: &SharedStorage, ctx: &FinalizeCtx, log: &Prom
         "prompt_enc": encrypt_value(Some(&prompt)),
         "completion_enc": encrypt_value(completion.as_deref()),
         "redactions": redactions,
+        "cached": ctx.cache_saved.is_some(),
         "expires_at": (now.unix_timestamp().max(0) as u64)
             .saturating_add(log.retention_days.saturating_mul(86_400)),
     });
@@ -247,6 +285,7 @@ pub fn activity_block(ctx: &FinalizeCtx, usage: &AiUsage, cost: CostResult) -> V
         "redactions": ctx.redactions,
         "fallbacks": ctx.fallbacks,
         "entry": if ctx.unified_model.is_some() { "unified" } else { "native" },
+        "cached": ctx.cache_saved.is_some(),
         "requested_model": ctx.unified_model,
     })
 }
@@ -288,7 +327,27 @@ pub async fn record_usage(ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostRes
     let id = format!("{day}|{}|{}|{username}", ctx.api, ctx.model);
     let latency_ms = ctx.started.elapsed().as_millis() as i64;
     let as_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let saved = ctx.cache_saved.clone().unwrap_or_default();
+    let saved_cost = if ctx.cache_saved.is_some() {
+        cost_for(&ctx, &saved).await.cost_nanos
+    } else {
+        0
+    };
     let inc = [
+        ("cache_hits", i64::from(ctx.cache_saved.is_some())),
+        // Everything the provider would have read: uncached input plus its
+        // own prompt-cache reads and writes (adapters report them apart).
+        (
+            "saved_input_tokens",
+            as_i64(
+                saved
+                    .input_tokens
+                    .saturating_add(saved.cache_read_tokens)
+                    .saturating_add(saved.cache_write_tokens),
+            ),
+        ),
+        ("saved_output_tokens", as_i64(saved.output_tokens)),
+        ("saved_cost_nanos", as_i64(saved_cost)),
         ("requests", 1),
         ("errors", i64::from(!success)),
         ("input_tokens", as_i64(usage.input_tokens)),
@@ -388,6 +447,15 @@ fn spawn_record(ctx: FinalizeCtx, usage: AiUsage) {
 /// timeout, on upstream error, or when the client disconnects (drop).
 /// Splits a streamed response into events for the usage parser. The client
 /// always receives the original bytes.
+/// `event: error`, or data that is a JSON error envelope (a top-level
+/// `error` field or `"type": "error"`, in any field order): a stream carrying
+/// one of these is never cached. AWS frames are checked by message type.
+fn is_error_event(event: &crate::ai::sse::SseEvent) -> bool {
+    event.event.as_deref() == Some("error")
+        || serde_json::from_str::<Value>(&event.data)
+            .is_ok_and(|data| crate::ai::cache::is_error_envelope(&data))
+}
+
 enum Framer {
     Sse(SseParser),
     /// Bedrock. `failed` = a frame did not decode; usage falls back to the estimate.
@@ -410,24 +478,40 @@ impl Framer {
         }
     }
 
-    fn push(&mut self, chunk: &[u8], parser: &mut Option<Box<dyn StreamUsageParser>>) {
+    /// Returns true when an error event was seen in this chunk.
+    fn push(&mut self, chunk: &[u8], parser: &mut Option<Box<dyn StreamUsageParser>>) -> bool {
+        let mut saw_error = false;
         match self {
             Framer::Sse(sse) => {
-                if let Some(parser) = parser.as_mut() {
-                    for event in sse.push(chunk) {
+                let was_done = sse.done();
+                for event in sse.push(chunk) {
+                    saw_error |= is_error_event(&event);
+                    if let Some(parser) = parser.as_mut() {
                         parser.on_event(&event);
                     }
+                }
+                // `[DONE]` is not an event for usage, but it ends the reply.
+                if !was_done
+                    && sse.done()
+                    && let Some(parser) = parser.as_mut()
+                {
+                    parser.on_event(&crate::ai::sse::SseEvent {
+                        event: None,
+                        data: "[DONE]".to_owned(),
+                    });
                 }
             }
             Framer::AwsEventStream { decoder, failed } => {
                 if *failed {
-                    return;
+                    return saw_error;
                 }
                 for frame in decoder.push(chunk) {
                     match frame {
                         Ok(frame) => {
+                            let event = frame.to_sse_event();
+                            saw_error |= frame.is_error() || is_error_event(&event);
                             if let Some(parser) = parser.as_mut() {
-                                parser.on_event(&frame.to_sse_event());
+                                parser.on_event(&event);
                             }
                         }
                         Err(error) => {
@@ -437,12 +521,13 @@ impl Framer {
                             );
                             *failed = true;
                             *parser = None;
-                            return;
+                            return saw_error;
                         }
                     }
                 }
             }
         }
+        saw_error
     }
 
     /// True when some of the stream was not seen by the usage parser.
@@ -452,6 +537,29 @@ impl Framer {
             Framer::AwsEventStream { failed, .. } => *failed,
         }
     }
+
+    /// Every byte was decoded into whole events: nothing skipped, nothing
+    /// left half-received when the stream ended.
+    fn clean(&self) -> bool {
+        !self.incomplete()
+            && match self {
+                Framer::Sse(sse) => !sse.has_partial(),
+                Framer::AwsEventStream { decoder, .. } => !decoder.has_partial(),
+            }
+    }
+}
+
+/// The completion text of a recorded stream (a cache hit with `full` prompt
+/// logging), parsed the same way as a live stream.
+pub fn stream_completion_text(
+    body: &[u8],
+    framing: crate::ai::adapter::StreamFraming,
+    parser: Box<dyn StreamUsageParser>,
+) -> Option<String> {
+    let mut framer = Framer::new(framing);
+    let mut parser = Some(parser);
+    framer.push(body, &mut parser);
+    parser?.completion_text().map(str::to_owned)
 }
 
 pub struct UsageTap {
@@ -462,6 +570,11 @@ pub struct UsageTap {
     idle: Duration,
     deadline: Pin<Box<tokio::time::Sleep>>,
     done: bool,
+    /// Response cache recording: the writer, the bytes so far, and whether the
+    /// stream stopped qualifying (too large or an error event).
+    cache: Option<StreamCache>,
+    recorded: Vec<u8>,
+    uncacheable: bool,
 }
 
 impl UsageTap {
@@ -495,7 +608,16 @@ impl UsageTap {
             idle,
             deadline: Box::pin(tokio::time::sleep(idle)),
             done: false,
+            cache: None,
+            recorded: Vec::new(),
+            uncacheable: false,
         }
+    }
+
+    /// Records the stream for the response cache (step 6).
+    pub fn with_cache(mut self, cache: Option<StreamCache>) -> Self {
+        self.cache = cache;
+        self
     }
 
     fn finalize(&mut self, complete: bool) {
@@ -505,6 +627,10 @@ impl UsageTap {
         if let (Some(log), Some(parser)) = (ctx.prompt_log.as_mut(), self.parser.as_ref()) {
             log.completion = parser.completion_text().map(str::to_owned);
         }
+        let terminal = self
+            .parser
+            .as_ref()
+            .is_some_and(|parser| parser.terminal_seen());
         let parsed = self.parser.take().and_then(|parser| parser.finish());
         let usage = match parsed {
             Some(mut usage) => {
@@ -513,6 +639,16 @@ impl UsageTap {
             }
             None => estimate_usage(ctx.request_bytes, ctx.response_bytes),
         };
+        // Stored only when the provider said the reply is finished and every
+        // frame arrived whole; HTTP end-of-body alone is not enough.
+        if let Some(cache) = self.cache.take()
+            && complete
+            && terminal
+            && !self.uncacheable
+            && self.framer.clean()
+        {
+            cache.store(std::mem::take(&mut self.recorded), &usage);
+        }
         spawn_record(ctx, usage);
     }
 }
@@ -535,7 +671,17 @@ impl Stream for UsageTap {
                         ctx.ttft_ms = Some(ctx.started.elapsed().as_millis() as u64);
                     }
                 }
-                this.framer.push(&chunk, &mut this.parser);
+                let saw_error = this.framer.push(&chunk, &mut this.parser);
+                if this.cache.is_some() && !this.uncacheable {
+                    if saw_error
+                        || this.recorded.len() + chunk.len() > crate::ai::cache::MAX_ENTRY_BYTES
+                    {
+                        this.uncacheable = true;
+                        this.recorded = Vec::new();
+                    } else {
+                        this.recorded.extend_from_slice(&chunk);
+                    }
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {

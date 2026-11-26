@@ -28,6 +28,40 @@ pub struct AiTarget {
 
 pub const MAX_FALLBACK_TARGETS: usize = 10;
 
+pub const CACHE_MIN_TTL_SECONDS: u64 = 60;
+pub const CACHE_MAX_TTL_SECONDS: u64 = 7 * 24 * 3600;
+
+/// Exact-match response caching for one AI API (step 6). Off by default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_seconds: u64,
+    /// "user": only the same person gets a stored answer. "shared": anyone
+    /// allowed on the API does.
+    #[serde(default = "default_cache_scope")]
+    pub scope: String,
+}
+
+impl Default for AiCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_seconds: default_cache_ttl(),
+            scope: default_cache_scope(),
+        }
+    }
+}
+
+fn default_cache_ttl() -> u64 {
+    3600
+}
+
+fn default_cache_scope() -> String {
+    "user".to_owned()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiApiConfig {
     /// `credit_defs.api_credit_group` holding the provider key (C1). Required.
@@ -80,6 +114,9 @@ pub struct AiApiConfig {
     /// Vertex project ID. None = the service account's `project_id`.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Response caching (step 6).
+    #[serde(default)]
+    pub cache: AiCacheConfig,
 }
 
 impl Default for AiApiConfig {
@@ -104,6 +141,7 @@ impl Default for AiApiConfig {
             load_balance: false,
             region: None,
             project_id: None,
+            cache: AiCacheConfig::default(),
         }
     }
 }

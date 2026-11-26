@@ -220,6 +220,7 @@ pub(super) struct OpenaiStream {
     usage: Option<AiUsage>,
     text: String,
     refusal: bool,
+    done: bool,
 }
 impl OpenaiStream {
     pub(super) fn new(operation: &'static str) -> Self {
@@ -228,17 +229,26 @@ impl OpenaiStream {
             usage: None,
             text: String::new(),
             refusal: false,
+            done: false,
         }
     }
 }
 impl StreamUsageParser for OpenaiStream {
+    fn terminal_seen(&self) -> bool {
+        self.done
+    }
     fn on_event(&mut self, event: &SseEvent) {
+        if self.operation != "responses" && event.data.trim() == "[DONE]" {
+            self.done = true;
+            return;
+        }
         let Ok(body) = serde_json::from_str::<Value>(&event.data) else {
             return;
         };
         if self.operation == "responses" {
             match body["type"].as_str().or(event.event.as_deref()) {
                 Some("response.completed") => {
+                    self.done = true;
                     if let Some(usage) = extract_usage("responses", &body["response"]) {
                         self.usage = Some(usage);
                     }

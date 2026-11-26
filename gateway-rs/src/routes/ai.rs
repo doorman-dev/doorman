@@ -27,15 +27,17 @@ use crate::{
             UpstreamCtx,
         },
         budgets,
+        cache::{self, CacheMode, CachedReply},
         config::{AiApiConfig, model_allowed},
         credentials::{self, OutboundRequest},
         failover,
         guardrails::{self, CompiledGuardrails, Direction},
         keys::{InboundAuth, record_last_used, resolve_inbound},
+        pricing::CostResult,
         providers::adapter_for,
         usage::{
-            AiUsage, FinalizeCtx, PromptLog, UsageTap, activity_block, cost_for, estimate_usage,
-            record_usage,
+            AiUsage, FinalizeCtx, PromptLog, StreamCache, UsageTap, activity_block, cost_for,
+            estimate_usage, record_usage,
         },
     },
     error::GatewayError,
@@ -268,11 +270,179 @@ fn now_rfc3339() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
 }
 
+/// Replays a stored reply. Usage is recorded as a free request with what it
+/// saved. The current output guardrails run again on non-stream replies (as
+/// on a miss), and bandwidth and request allowances are charged as usual.
+async fn cache_hit_response(
+    hit: CachedReply,
+    mut ctx: FinalizeCtx,
+    info: &crate::ai::adapter::AiRequestInfo,
+    adapter: &'static dyn crate::ai::adapter::ProviderAdapter,
+    rails: &CompiledGuardrails,
+) -> Response {
+    let mut body = hit.body;
+    if !hit.stream {
+        let output_rails = rails.applicable(&ctx.api, &ctx.groups, Direction::Output);
+        if !output_rails.is_empty()
+            && let Ok(mut json) = serde_json::from_slice::<Value>(&body)
+        {
+            let outcome =
+                guardrails::apply(info.dialect, Direction::Output, &mut json, &output_rails);
+            log_guardrail_hits(&ctx.api, "output", &outcome);
+            if let Some(guardrail) = outcome.blocked_by {
+                ctx.prompt_log = None;
+                ctx.cache_saved = None;
+                ctx.status = StatusCode::BAD_REQUEST.as_u16();
+                tokio::spawn(record_usage(
+                    ctx,
+                    AiUsage::default(),
+                    Some(CostResult::default()),
+                ));
+                return guardrail_block_response(&guardrail);
+            }
+            if !outcome.redactions.is_empty() {
+                ctx.redactions += outcome
+                    .redactions
+                    .iter()
+                    .map(|(_, count)| *count)
+                    .sum::<u32>();
+                body = serde_json::to_vec(&json).unwrap_or(body);
+            }
+        }
+        ctx.response_bytes = body.len() as u64;
+        // Streams are charged in `record_usage`; non-stream replies here, as on a miss.
+        if let (Some(storage), Some((key, ttl))) = (ctx.storage.as_ref(), ctx.bandwidth.as_ref()) {
+            let accounted = ctx.request_bytes.saturating_add(ctx.response_bytes);
+            if let Err(error) = storage.add_bandwidth(key, accounted, *ttl).await {
+                tracing::error!(error = %error, "AI bandwidth accounting failed");
+            }
+        }
+    }
+    if let Some(log) = ctx.prompt_log.as_mut() {
+        log.completion = if hit.stream {
+            let framing = if hit
+                .content_type
+                .starts_with("application/vnd.amazon.eventstream")
+            {
+                StreamFraming::AwsEventStream
+            } else {
+                StreamFraming::Sse
+            };
+            crate::ai::usage::stream_completion_text(&body, framing, adapter.stream_usage(info))
+        } else {
+            serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|json| adapter.response_text(info, &json))
+        };
+    }
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in &hit.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    if let Ok(value) = HeaderValue::from_str(&hit.model) {
+        headers.insert(HeaderName::from_static("x-doorman-ai-model"), value);
+    }
+    headers.insert(
+        HeaderName::from_static("x-doorman-cache"),
+        HeaderValue::from_static("hit"),
+    );
+    if ctx.redactions > 0 {
+        headers.insert(
+            HeaderName::from_static("x-doorman-ai-redactions"),
+            HeaderValue::from(ctx.redactions),
+        );
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&hit.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+    );
+    if hit.stream {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    let status = StatusCode::from_u16(hit.status).unwrap_or(StatusCode::OK);
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+        .extensions_mut()
+        .insert(AiOperation(info.operation));
+    if hit.stream {
+        response.extensions_mut().insert(NoCompression);
+    } else {
+        response.extensions_mut().insert(AiActivity(activity_block(
+            &ctx,
+            &AiUsage::default(),
+            CostResult::default(),
+        )));
+    }
+    tokio::spawn(record_usage(
+        ctx,
+        AiUsage::default(),
+        Some(CostResult::default()),
+    ));
+    response
+}
+
+/// Every AI response carries `x-doorman-cache`, including responses Doorman
+/// makes itself (guardrail and allowance blocks, model lists, errors).
 pub(crate) async fn execute_ai(
     state: &AppState,
     request: Request,
     decision: PolicyDecision,
     documents: Option<&PolicyDocuments>,
+) -> Result<Response, GatewayError> {
+    let mut cache_mode = CacheMode::Off;
+    let mut response =
+        execute_ai_inner(state, request, decision, documents, &mut cache_mode).await?;
+    if !response.headers().contains_key("x-doorman-cache") {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-doorman-cache"),
+            HeaderValue::from_static(cache_mode.header(false)),
+        );
+    }
+    Ok(response)
+}
+
+/// Request headers forwarded upstream: the client's own, minus credentials,
+/// hop-by-hop and Doorman's headers.
+fn forwarded_request_headers(inbound: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in inbound {
+        let lower = name.as_str();
+        if is_hop_by_hop(name)
+            || INBOUND_CREDENTIAL_HEADERS.contains(&lower)
+            || matches!(
+                lower,
+                "host"
+                    | "content-length"
+                    | "accept-encoding"
+                    | "proxy-authorization"
+                    | "x-csrf-token"
+                    | "csrf-token"
+                    | "x-user-email"
+            )
+            || lower.starts_with("x-doorman-")
+        {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+    headers
+}
+
+async fn execute_ai_inner(
+    state: &AppState,
+    request: Request,
+    decision: PolicyDecision,
+    documents: Option<&PolicyDocuments>,
+    cache_slot: &mut CacheMode,
 ) -> Result<Response, GatewayError> {
     let started = Instant::now();
     let Some(route) = request.extensions().get::<AiRoute>().cloned() else {
@@ -381,6 +551,15 @@ pub(crate) async fn execute_ai(
         ));
     }
 
+    let mut cache_mode = if !config.cache.enabled || !info.generation || !info.metered {
+        CacheMode::Off
+    } else if cache::client_opted_out(&parts.headers) {
+        CacheMode::Bypass
+    } else {
+        CacheMode::Use
+    };
+    *cache_slot = cache_mode;
+
     if info.local {
         // Only concrete IDs are listed; `prefix*` patterns are not model names.
         let models: Vec<String> = config
@@ -488,6 +667,202 @@ pub(crate) async fn execute_ai(
         redactions: redactions.clone(),
     });
 
+    let bandwidth = decision
+        .bandwidth_key
+        .clone()
+        .zip(decision.bandwidth_ttl_seconds);
+    let user_role = username.as_deref().and_then(|username| {
+        documents
+            .users
+            .iter()
+            .find(|user| user.get("username").and_then(Value::as_str) == Some(username))
+            .and_then(|user| user.get("role"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let user_tier = username
+        .as_deref()
+        .and_then(|username| crate::policy::tier::user_tier_id(documents, username));
+
+    // Provider credential (C1): the tenant's own credit definition, never a default.
+    let credential_group = config
+        .credential_overrides
+        .iter()
+        .find(|entry| user_groups.iter().any(|group| group == &entry.group))
+        .map(|entry| entry.credential_group.clone())
+        .unwrap_or_else(|| config.credential_group.clone());
+
+    // Response cache (step 6): after input guardrails, before budgets, so a
+    // blocked prompt stays blocked and a stored answer costs nothing. The key
+    // covers everything that can change the answer (see `cache::KeyParts`).
+    let mut cache_key = None;
+    if cache_mode == CacheMode::Use {
+        let storage = state.storage.as_deref();
+        let api_id = api
+            .get("api_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_ns = cache::api_namespace(api_id);
+        let shared = config.cache.scope == "shared";
+        let owner_name = username.as_deref().unwrap_or("anonymous");
+        let generations = async {
+            let api_generation = cache::generation(storage, &format!("api:{api_ns}")).await?;
+            let owner = if shared {
+                "*".to_owned()
+            } else {
+                let user_generation =
+                    cache::generation(storage, &format!("user:{owner_name}")).await?;
+                format!("{owner_name}#{user_generation}")
+            };
+            Ok::<_, String>((api_generation, owner))
+        }
+        .await;
+        match generations {
+            Ok((generation, owner)) => {
+                let mut effective = body.clone();
+                let mut effective_path = route.rest_path.clone();
+                if info.model.as_deref() != Some(model.as_str())
+                    || matches!(provider, AiProvider::Bedrock | AiProvider::Vertex)
+                {
+                    effective_path =
+                        adapter.set_model(&info, &effective_path, &mut effective, &model);
+                }
+                if let Some(cap) = config.max_output_tokens {
+                    adapter.clamp_max_output(&info, &mut effective, cap);
+                }
+                if info.stream && config.inject_stream_usage {
+                    adapter.ensure_stream_usage(&info, &mut effective);
+                }
+                let upstream_query: Vec<(String, String)> = adapter
+                    .upstream_query(&info, query.clone())
+                    .into_iter()
+                    .filter(|(name, _)| !INBOUND_CREDENTIAL_QUERY.contains(&name.as_str()))
+                    .collect();
+                let mut ai_config = api.get("api_ai_config").cloned().unwrap_or(Value::Null);
+                if let Some(object) = ai_config.as_object_mut() {
+                    object.remove("cache");
+                }
+                let forwarded: Vec<(String, String)> = forwarded_request_headers(&parts.headers)
+                    .iter()
+                    .filter(|(name, _)| !cache::header_ignored_in_key(name.as_str()))
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                let output_policy: Vec<&str> = rails
+                    .applicable(&api_label, &user_groups, Direction::Output)
+                    .iter()
+                    .map(|rail| rail.id.as_str())
+                    .collect();
+                let context = serde_json::json!({
+                    "api_id": api_id,
+                    "provider": provider.as_str(),
+                    "config": ai_config,
+                    "servers": api.get("api_servers"),
+                    "tls_profile": decision.upstream_tls_profile_id,
+                    "credential_group": credential_group,
+                    "headers": forwarded,
+                    "output_policy": output_policy,
+                    "guardrails": cache::fingerprint(&documents.ai_guardrails),
+                });
+                cache_key = Some(cache::key(&cache::KeyParts {
+                    api_ns: &api_ns,
+                    generation,
+                    operation: info.operation,
+                    path: &effective_path,
+                    query: &upstream_query,
+                    model: &model,
+                    stream: info.stream,
+                    owner: &owner,
+                    body: &effective,
+                    context: &context,
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "AI cache unavailable; request not cached");
+                cache_mode = CacheMode::Bypass;
+                *cache_slot = cache_mode;
+            }
+        }
+    }
+    if let Some(key) = cache_key.as_deref()
+        && let Some(hit) = cache::get(state.storage.as_deref(), key).await
+    {
+        // Request-count allowances still count hits (decision 8, revised after
+        // review); token and dollar allowances are never charged for a hit.
+        let mut hit_charges = Vec::new();
+        let mut serve = true;
+        if let Some(storage) = &state.storage {
+            let now = time::OffsetDateTime::now_utc();
+            let specs: Vec<_> = budgets::applicable(
+                documents,
+                username.as_deref().unwrap_or_default(),
+                &user_groups,
+                Some(&api_label),
+                Some(provider.as_str()),
+                now,
+            )
+            .into_iter()
+            .filter(|spec| {
+                budgets::BudgetUnit::of(&spec.limit_type) == budgets::BudgetUnit::Requests
+            })
+            .collect();
+            if !specs.is_empty() {
+                match budgets::precheck(storage, &specs, &config.allowed_models, now).await {
+                    Err(block) => return Ok(budget_block_response(block)),
+                    // A downgrade means a different model answers: not this entry.
+                    Ok(outcome)
+                        if outcome
+                            .downgrade
+                            .as_ref()
+                            .is_some_and(|(_, to)| to != &model) =>
+                    {
+                        serve = false;
+                    }
+                    Ok(outcome) => hit_charges = outcome.charges,
+                }
+            }
+        }
+        if serve {
+            let redaction_count: u32 = redactions.iter().map(|(_, count)| *count).sum();
+            let ctx = FinalizeCtx {
+                storage: state.storage.clone(),
+                request_id,
+                provider,
+                api: api_label,
+                model: hit.model.clone(),
+                username,
+                operation: info.operation,
+                metered: true,
+                stream: hit.stream,
+                status: hit.status,
+                started,
+                ttft_ms: Some(started.elapsed().as_millis() as u64),
+                request_bytes: raw_body.len() as u64,
+                response_bytes: hit.body.len() as u64,
+                bandwidth,
+                redactions: redaction_count,
+                fallbacks: 0,
+                prompt_log,
+                unified_model: unified_model.clone(),
+                groups: user_groups.clone(),
+                role: user_role,
+                tier: user_tier,
+                budget_charges: hit_charges,
+                log_dir: state
+                    .config
+                    .logs_enabled
+                    .then(|| state.config.logs_dir.clone())
+                    .flatten(),
+                cache_saved: Some(hit.usage()),
+            };
+            return Ok(cache_hit_response(hit, ctx, &info, adapter, &rails).await);
+        }
+    }
+
     // Budgets (P3): block, downgrade or warn before anything is sent upstream.
     let mut budget_charges = Vec::new();
     let mut budget_warning = None;
@@ -545,13 +920,6 @@ pub(crate) async fn execute_ai(
         adapter.ensure_stream_usage(&info, &mut body);
     }
 
-    // Provider credential (C1): the tenant's own credit definition, never a default.
-    let credential_group = config
-        .credential_overrides
-        .iter()
-        .find(|entry| user_groups.iter().any(|group| group == &entry.group))
-        .map(|entry| entry.credential_group.clone())
-        .unwrap_or_else(|| config.credential_group.clone());
     // Some(None) = no key needed; None = configured key missing or undecryptable.
     let resolve_credential = |group: &str| -> Option<Option<(String, String)>> {
         if group == "none" && provider == AiProvider::OpenaiCompatible {
@@ -612,27 +980,7 @@ pub(crate) async fn execute_ai(
         ));
     }
 
-    let mut headers = HeaderMap::new();
-    for (name, value) in &parts.headers {
-        let lower = name.as_str();
-        if is_hop_by_hop(name)
-            || INBOUND_CREDENTIAL_HEADERS.contains(&lower)
-            || matches!(
-                lower,
-                "host"
-                    | "content-length"
-                    | "accept-encoding"
-                    | "proxy-authorization"
-                    | "x-csrf-token"
-                    | "csrf-token"
-                    | "x-user-email"
-            )
-            || lower.starts_with("x-doorman-")
-        {
-            continue;
-        }
-        headers.append(name.clone(), value.clone());
-    }
+    let mut headers = forwarded_request_headers(&parts.headers);
     adapter.default_headers(&mut headers);
     if method == Method::POST {
         headers.insert(
@@ -892,27 +1240,12 @@ pub(crate) async fn execute_ai(
         ("x-doorman-ai-budget-warning", budget_warning.as_deref()),
         ("x-doorman-ai-redactions", redaction_header.as_deref()),
         ("x-doorman-ai-fallbacks", fallback_header.as_deref()),
+        ("x-doorman-cache", Some(cache_mode.header(false))),
     ] {
         if let Some(value) = value.and_then(|value| HeaderValue::from_str(value).ok()) {
             response_headers.insert(HeaderName::from_static(name), value);
         }
     }
-    let bandwidth = decision
-        .bandwidth_key
-        .clone()
-        .zip(decision.bandwidth_ttl_seconds);
-    let user_role = username.as_deref().and_then(|username| {
-        documents
-            .users
-            .iter()
-            .find(|user| user.get("username").and_then(Value::as_str) == Some(username))
-            .and_then(|user| user.get("role"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
-    let user_tier = username
-        .as_deref()
-        .and_then(|username| crate::policy::tier::user_tier_id(documents, username));
     let mut ctx = FinalizeCtx {
         storage: state.storage.clone(),
         request_id,
@@ -942,7 +1275,41 @@ pub(crate) async fn execute_ai(
             .logs_enabled
             .then(|| state.config.logs_dir.clone())
             .flatten(),
+        cache_saved: None,
     };
+
+    // Stored replies keep the pass-through headers, never Doorman's own.
+    let cache_store = cache_key
+        .filter(|_| downgraded.is_none() && status.is_success())
+        .map(|key| {
+            let headers = response_headers
+                .iter()
+                .filter(|(name, _)| !name.as_str().starts_with("x-doorman-"))
+                .filter_map(|(name, value)| {
+                    Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+                })
+                .collect();
+            let template = CachedReply {
+                status: status.as_u16(),
+                content_type: upstream_content_type.clone(),
+                headers,
+                body: Vec::new(),
+                stream: is_stream,
+                model: ctx.model.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                estimated: false,
+            };
+            StreamCache {
+                storage: state.storage.clone(),
+                key,
+                ttl_seconds: config.cache.ttl_seconds,
+                template,
+            }
+        });
 
     if is_stream {
         let idle = std::time::Duration::from_millis(config.stream_idle_timeout_ms.max(1));
@@ -957,7 +1324,8 @@ pub(crate) async fn execute_ai(
             ctx,
             idle,
             framing,
-        );
+        )
+        .with_cache(cache_store);
         let mut response = Response::new(Body::from_stream(tap));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
@@ -1050,6 +1418,11 @@ pub(crate) async fn execute_ai(
     } else {
         AiUsage::default()
     };
+    if let Some(store) = cache_store
+        && !parsed.as_ref().is_some_and(|json| adapter.is_refusal(json))
+    {
+        store.store(buffered.clone(), &usage);
+    }
     let content_type = upstream_headers
         .get(header::CONTENT_TYPE)
         .cloned()
