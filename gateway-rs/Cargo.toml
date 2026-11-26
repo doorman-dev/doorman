@@ -56,8 +56,13 @@ fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"
 flate2 = "1.1"
 pbkdf2 = "0.12.2"
 protoc-bin-vendored = "3.2.0"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
 prost-types = "0.14"
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["test-util"] }

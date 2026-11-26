@@ -298,6 +298,17 @@ export interface AiSettings {
   unified?: AiUnifiedSettings
 }
 
+export interface AiTelemetryStatus {
+  enabled: boolean
+  protocol: 'http/protobuf' | 'grpc'
+  traces_endpoint: string | null
+  metrics_endpoint: string | null
+  service_name: string
+  include_user: boolean
+  sampler: string
+  last_error: string | null
+}
+
 export const AI_UNIFIED_BASE_URL_SUFFIX = '/api/ai/v1'
 export const AI_UNIFIED_ROUTE_LIMIT = 50
 export const AI_UNIFIED_TARGET_LIMIT = 5

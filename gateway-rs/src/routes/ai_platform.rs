@@ -94,6 +94,19 @@ pub(crate) async fn dispatch(
         }
         (Method::GET, ["ai", "usage", "me"]) => usage_me(state, username, request_id).await,
         (Method::GET, ["ai", "settings"]) => get_settings(state, request_id).await,
+        (Method::GET, ["ai", "telemetry"]) => {
+            if !has_permission(state, username, "manage_ai").await {
+                return forbidden(
+                    "You do not have permission to view AI telemetry settings",
+                    request_id,
+                );
+            }
+            success(
+                StatusCode::OK,
+                crate::observability::otel::status(),
+                request_id,
+            )
+        }
         (Method::GET, ["ai", "cache"]) => {
             if !has_permission(state, username, "manage_ai").await {
                 return forbidden(

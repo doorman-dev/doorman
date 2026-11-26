@@ -738,6 +738,111 @@ being written. If the backend fails, the call returns `503` and nothing is
 reported as cleared. `GET /platform/ai/cache` returns the backend, whether
 answers are encrypted, and, for memory, the number of entries and bytes.
 
+## OpenTelemetry
+
+Doorman exports traces and AI metrics over OTLP to your observability stack.
+Export is off until you configure an endpoint. Set the environment variables
+on the gateway and restart it. Check **AI Gateway → Policies → Prompt logging**
+for the read-only **Telemetry (OpenTelemetry)** status, the configured receivers,
+the protocol, the user identity setting, and the last exporter error. The status
+is also available at `GET /platform/ai/telemetry` with **Manage AI** permission.
+
+### Traces
+
+Doorman creates a SERVER span for gateway requests under `/api/*`. Its name is
+the HTTP method and normalized route, such as `POST /api/ai/corp-openai/v1`.
+When an incoming W3C trace context is valid, Doorman adds this span as a child
+of the caller's span. For a model call, Doorman creates a child CLIENT span
+for each upstream attempt, named by the operation
+and requested model, such as `chat gpt-4o`. Cache hits and policy blocks are
+visible on the server span. Model-list and token-count operations have no
+GenAI client span. Streaming spans include the time spent sending or receiving
+the stream.
+
+| Scope | Attributes |
+| --- | --- |
+| HTTP server span | `http.request.method`, `http.route`, `http.response.status_code`, `url.scheme`, `doorman.request_id` |
+| AI server span | `doorman.api`, `doorman.cache` (`hit`, `miss`, `bypass` or `off`), `doorman.fallbacks`, `doorman.cost_usd`, `doorman.guardrail.redactions`, `doorman.unified_model`, when available |
+| GenAI client span | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.stream`, `server.address`, `server.port` |
+| Upstream result | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.time_to_first_chunk` for streams with output, and `error.type` on failure, when available |
+| AI server span with user identity enabled | `enduser.id`, the authenticated Doorman username |
+
+The provider values are `openai`, `anthropic`, `gcp.gemini` (Gemini API),
+`gcp.vertex_ai`, `aws.bedrock`, `azure.ai.openai` and `openai_compatible`.
+Input token totals include provider prompt-cache tokens. The model attribute
+is the model Doorman requested from the provider.
+
+Doorman never exports prompts, completions, API keys, or request or response
+headers. W3C trace context is used to link the inbound span and is stripped
+before AI requests go upstream. Set `DOORMAN_OTEL_INCLUDE_USER=true` only if
+your trace destination is approved to receive employee usernames. Usernames,
+groups, and tiers are never metric labels.
+
+The default trace sampler is `parentbased_always_on`. It samples new traces and
+honors an incoming trace's sampling decision. For example, set
+`OTEL_TRACES_SAMPLER=parentbased_traceidratio` and
+`OTEL_TRACES_SAMPLER_ARG=0.1` to sample 10% of traces that start at Doorman.
+Trace sampling does not affect metric export.
+
+### Metrics
+
+Metrics cover AI traffic. The GenAI histograms use the OpenTelemetry GenAI
+v0.1.0 instrument names. Gateway counters include requests served from cache.
+The existing Prometheus `/metrics` endpoint stays separate.
+
+| Instrument | Type and unit | Measures |
+| --- | --- | --- |
+| `gen_ai.client.inference.duration` | Histogram, seconds | Time spent on a model inference operation |
+| `gen_ai.client.inference.operation.input_tokens` | Histogram, tokens | Input tokens per inference operation |
+| `gen_ai.client.inference.operation.output_tokens` | Histogram, tokens | Output tokens per inference operation |
+| `gen_ai.client.inference.time_to_first_chunk` | Histogram, seconds | Time until the first decoded stream event carrying output |
+| `gen_ai.client.embeddings.duration` | Histogram, seconds | Time spent on an embeddings operation |
+| `gen_ai.client.embeddings.operation.input_tokens` | Histogram, tokens | Input tokens per embeddings operation |
+| `doorman.ai.requests` | Counter, requests | AI requests, including cache hits and policy blocks |
+| `doorman.ai.cost` | Counter, USD | Recorded provider cost |
+| `doorman.ai.cache.hits` | Counter, hits | Responses served from Doorman's cache |
+| `doorman.ai.cache.saved_cost` | Counter, USD | Estimated provider cost avoided by cache hits |
+
+Metric dimensions include `gen_ai.provider.name`, `gen_ai.request.model`,
+`gen_ai.operation.name` and `doorman.api` when available. The request counter
+adds `doorman.status_class` and `doorman.cache`. Provider duration can include
+`error.type` when a request fails.
+
+### Try a local Collector and Jaeger
+
+From a Doorman checkout, start the demo:
+
+```sh
+docker compose -f docker/otel/compose.yaml up -d
+```
+
+In the environment where the native gateway starts, set these variables:
+
+```sh
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_SERVICE_NAME=doorman-gateway
+```
+
+Start the gateway and send an AI request. Open Jaeger at
+[localhost:16686](http://localhost:16686), select `doorman-gateway`, and find
+the trace. The demo sends traces to Jaeger and prints traces and metrics to the
+Collector log. The first metric export can take up to a minute.
+
+```sh
+docker compose -f docker/otel/compose.yaml logs -f collector
+```
+
+When you're done, stop the demo with `docker compose -f docker/otel/compose.yaml down`.
+
+For gRPC, set `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` and use
+`http://127.0.0.1:4317`. For HTTP/protobuf, Doorman appends `/v1/traces` and
+`/v1/metrics` to the shared base URL. To configure a single signal or override a
+destination, set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to the full receiver URL, including the
+path for HTTP. Supply receiver authentication in `OTEL_EXPORTER_OTLP_HEADERS`.
+Set `OTEL_SDK_DISABLED=true` to turn export off.
+
 ## Guardrails and prompt privacy
 
 In **AI Gateway → Policies → Guardrails**, configure built-in email, US SSN, credit-card,

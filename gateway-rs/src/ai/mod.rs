@@ -15,6 +15,7 @@ pub mod pricing;
 pub mod providers;
 pub mod sigv4;
 pub mod sse;
+pub mod telemetry;
 pub mod translate;
 pub mod usage;
 

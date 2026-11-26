@@ -113,6 +113,24 @@ Policy matching trims surrounding whitespace. IPv4 networks accept prefix length
 | `REVOCATION_PURGE_INTERVAL_SECONDS` | `300` | How often expired token revocations and expired AI prompt logs are purged |
 | `DOORMAN_AI_LIVE_TEST` | unset | Set to `1` to opt into live provider tests when separately configured credentials are available. Never required for fixture tests. |
 
+## OpenTelemetry
+
+Set these variables on the gateway process or container before startup. See the [AI Gateway OpenTelemetry guide](08-ai-gateway.md#opentelemetry) for a local Collector example and the exported fields.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Base endpoint for both signals. HTTP/protobuf appends `/v1/traces` and `/v1/metrics`. For gRPC, use the receiver's gRPC address. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | Overrides the base endpoint for traces. For HTTP/protobuf, supply the full trace URL, including its path. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | unset | Overrides the base endpoint for metrics. For HTTP/protobuf, supply the full metrics URL, including its path. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | OTLP transport. Set to `grpc` to use gRPC. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | Comma-separated `key=value` pairs for the exporter. Percent-encode reserved characters in values. |
+| `OTEL_SERVICE_NAME` | `doorman-gateway` | Service name shown in the observability backend. |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | Comma-separated resource attributes, for example `deployment.environment.name=production`. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | Trace sampling policy. The default samples new traces and respects upstream sampling decisions. |
+| `OTEL_TRACES_SAMPLER_ARG` | unset | Sampler argument, such as `0.1` for `parentbased_traceidratio`. |
+| `OTEL_SDK_DISABLED` | `false` | Set to `true` to disable both signals even when endpoints are configured. |
+| `DOORMAN_OTEL_INCLUDE_USER` | `false` | Set to `true` to include the Doorman username as `enduser.id` on AI server spans. Metrics never include it. |
+
 ## Logging
 
 | Variable | Default | Description |

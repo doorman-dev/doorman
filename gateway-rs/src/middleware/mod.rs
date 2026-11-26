@@ -4,6 +4,7 @@ pub mod chaos;
 pub mod cors;
 pub mod logging;
 pub mod metrics;
+pub mod otel;
 pub mod platform_cors;
 pub mod request_id;
 pub mod response_compat;

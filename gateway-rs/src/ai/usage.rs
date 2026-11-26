@@ -160,6 +160,12 @@ pub struct FinalizeCtx {
     /// Set on a response-cache hit: the provider usage the stored answer cost
     /// when it was first made (recorded as savings; the hit itself is free).
     pub cache_saved: Option<AiUsage>,
+    /// OpenTelemetry: the request's SERVER span and the answering upstream
+    /// attempt's CLIENT span (None when tracing is off).
+    pub server_span: Option<tracing::Span>,
+    pub client_span: Option<tracing::Span>,
+    /// Milliseconds to the first streamed event carrying output text.
+    pub first_chunk_ms: Option<u64>,
 }
 
 /// Records a streamed reply while it is forwarded and stores it in the
@@ -303,7 +309,7 @@ pub fn estimate_usage(request_bytes: u64, response_bytes: u64) -> AiUsage {
 /// Records one finished AI request: the durable daily rollup, the live
 /// counters and, for streams, a separate `ai_usage` activity line. Failures
 /// are logged and counted and never reach the client.
-pub async fn record_usage(ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostResult>) {
+pub async fn record_usage(mut ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostResult>) {
     if ctx.stream {
         if let (Some(storage), Some((key, ttl))) = (ctx.storage.as_ref(), ctx.bandwidth.as_ref()) {
             let bytes = ctx.request_bytes.saturating_add(ctx.response_bytes);
@@ -313,6 +319,7 @@ pub async fn record_usage(ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostRes
         }
     }
     if !ctx.metered {
+        crate::ai::telemetry::finish(&mut ctx, &usage, None, 0);
         return;
     }
     let success = (200..300).contains(&ctx.status);
@@ -333,6 +340,7 @@ pub async fn record_usage(ctx: FinalizeCtx, usage: AiUsage, cost: Option<CostRes
     } else {
         0
     };
+    crate::ai::telemetry::finish(&mut ctx, &usage, Some(cost.cost_nanos), saved_cost);
     let inc = [
         ("cache_hits", i64::from(ctx.cache_saved.is_some())),
         // Everything the provider would have read: uncached input plus its
@@ -672,6 +680,16 @@ impl Stream for UsageTap {
                     }
                 }
                 let saw_error = this.framer.push(&chunk, &mut this.parser);
+                if let Some(ctx) = this.ctx.as_mut()
+                    && ctx.first_chunk_ms.is_none()
+                    && this
+                        .parser
+                        .as_ref()
+                        .and_then(|parser| parser.completion_text())
+                        .is_some_and(|text| !text.is_empty())
+                {
+                    ctx.first_chunk_ms = Some(ctx.started.elapsed().as_millis() as u64);
+                }
                 if this.cache.is_some() && !this.uncacheable {
                     if saw_error
                         || this.recorded.len() + chunk.len() > crate::ai::cache::MAX_ENTRY_BYTES
