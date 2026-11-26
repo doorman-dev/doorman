@@ -4,6 +4,7 @@ pub mod audit;
 pub mod email;
 pub mod logging;
 pub mod metrics;
+pub mod otel;
 
 pub fn init() {
     logging::init();

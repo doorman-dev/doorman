@@ -147,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
     reload_task.abort();
+    // Flushing blocks; keep it off the async workers.
+    let _ = tokio::task::spawn_blocking(doorman_gateway::observability::otel::shutdown).await;
 
     // Axum has now drained active requests. Stop writers before the final dump
     // so an older autosave cannot replace the state committed during draining.

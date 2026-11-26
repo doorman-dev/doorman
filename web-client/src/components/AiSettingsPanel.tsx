@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { getJson, putJson } from '@/utils/api'
 import { SERVER_URL } from '@/utils/config'
-import { formatBytes, type AiCacheStats, type AiLogLevel, type AiSettings } from '@/utils/ai'
+import { formatBytes, type AiCacheStats, type AiLogLevel, type AiSettings, type AiTelemetryStatus } from '@/utils/ai'
 
 export default function AiSettingsPanel() {
   const [settings, setSettings] = useState<AiSettings | null>(null)
@@ -14,11 +14,13 @@ export default function AiSettingsPanel() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const [cacheStats, setCacheStats] = useState<AiCacheStats | null>(null)
+  const [telemetry, setTelemetry] = useState<AiTelemetryStatus | 'unavailable' | null>(null)
 
   const apply = (value: AiSettings) => { setSettings(value); setLogLevel(value.log_level); setRetention(String(value.retention_days)); setNotice(value.notice_text || '') }
   useEffect(() => {
     getJson<AiSettings>(`${SERVER_URL}/platform/ai/settings`).then(apply).catch(reason => setError(reason instanceof Error ? reason.message : 'Unable to load AI settings'))
     getJson<AiCacheStats>(`${SERVER_URL}/platform/ai/cache`).then(setCacheStats).catch(() => {})
+    getJson<AiTelemetryStatus>(`${SERVER_URL}/platform/ai/telemetry`).then(setTelemetry).catch(() => setTelemetry('unavailable'))
   }, [])
 
   const save = async (event: React.FormEvent) => {
@@ -46,6 +48,36 @@ export default function AiSettingsPanel() {
           ? 'Caching is unavailable: Redis is in use but no TOKEN_ENCRYPTION_KEY or MEM_ENCRYPTION_KEY is set, and answers are never stored unencrypted.'
           : 'Stored in Redis, encrypted, and shared by every gateway instance.')
         : `Stored in this gateway's memory: ${cacheStats.entries ?? 0} answer${cacheStats.entries === 1 ? '' : 's'}, ${formatBytes(cacheStats.bytes ?? 0)} of ${formatBytes(cacheStats.max_bytes ?? 0)} (set AI_CACHE_MAX_BYTES to change). Turn caching on per provider under Providers.`}</p></div>}
+      <section aria-labelledby="ai-telemetry-heading" className="space-y-2 text-sm">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h2 id="ai-telemetry-heading" className="font-medium">Telemetry (OpenTelemetry)</h2>
+          <p className="text-xs text-gray-500">
+            {telemetry === null ? 'Loading…' : telemetry === 'unavailable' ? 'Status unavailable' : telemetry.enabled ? 'On' : 'Off'}
+          </p>
+        </div>
+        {telemetry && telemetry !== 'unavailable' && (
+          <>
+            {telemetry.enabled && (
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-xs">
+                <dt className="text-gray-500">Protocol</dt><dd>{telemetry.protocol === 'grpc' ? 'gRPC' : 'HTTP/protobuf'}</dd>
+                <dt className="text-gray-500">Traces</dt><dd className="break-all font-mono">{telemetry.traces_endpoint ?? 'Off'}</dd>
+                <dt className="text-gray-500">Metrics</dt><dd className="break-all font-mono">{telemetry.metrics_endpoint ?? 'Off'}</dd>
+                <dt className="text-gray-500">User identity</dt>
+                <dd>{telemetry.traces_endpoint && telemetry.include_user ? 'Included on AI traces' : 'Excluded'}</dd>
+              </dl>
+            )}
+            {telemetry.last_error && (
+              <p role="alert" className="break-words rounded-lg border border-warning-200 bg-warning-50 p-2 text-xs text-warning-800">
+                <span className="font-medium">Last exporter error</span><br />{telemetry.last_error}
+              </p>
+            )}
+          </>
+        )}
+        <p className="text-xs text-gray-500">
+          Configure export through gateway environment variables.{' '}
+          <a href="/docs/ai-gateway.md" target="_blank" rel="noreferrer" className="text-primary-700 underline">OpenTelemetry setup guide</a>
+        </p>
+      </section>
       {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
       {saved && <p role="status" className="text-sm text-green-700">Saved.</p>}
       <button type="submit" className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>

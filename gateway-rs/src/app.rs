@@ -81,6 +81,9 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             security_headers,
         ))
+        .layer(axum_middleware::from_fn(
+            crate::middleware::otel::otel_server_span,
+        ))
         .layer(axum_middleware::from_fn(request_id))
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
             tracing::debug_span!("http_request", method = %request.method())

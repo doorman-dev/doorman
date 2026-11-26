@@ -7091,6 +7091,7 @@ const UNLISTED_PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/platform/ai/settings"),
     ("PUT", "/platform/ai/settings"),
     ("GET", "/platform/ai/unified/resolve"),
+    ("GET", "/platform/ai/telemetry"),
     ("GET", "/platform/ai/cache"),
     ("DELETE", "/platform/ai/cache/{api_name}/{api_version}"),
     ("GET", "/platform/ai/guardrails"),

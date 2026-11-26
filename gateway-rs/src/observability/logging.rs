@@ -9,7 +9,7 @@ use tracing::{
     field::{Field, Visit},
 };
 use tracing_subscriber::{
-    EnvFilter, Registry,
+    EnvFilter, Layer, Registry, filter,
     fmt::{
         FmtContext,
         format::{FormatEvent, FormatFields, Writer},
@@ -162,14 +162,29 @@ pub fn init() {
     if let Ok(mut slot) = RELOAD_HANDLE.lock() {
         *slot = Some(handle);
     }
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .event_format(RedactingJsonEvent)
-                .with_writer(std::io::stdout),
-        )
-        .try_init();
+    // The log-level filter applies to the JSON log only, so OTLP spans keep
+    // flowing whatever LOG_LEVEL is set to.
+    let otel = crate::observability::otel::start().map(|tracer| {
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(
+                filter::Targets::new()
+                    .with_target(crate::observability::otel::TARGET, tracing::Level::INFO),
+            )
+    });
+    let _ =
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(RedactingJsonEvent)
+                    .with_writer(std::io::stdout)
+                    .with_filter(filter),
+            )
+            .with(otel)
+            .with(crate::observability::otel::ErrorCapture.with_filter(
+                filter::Targets::new().with_target("opentelemetry", tracing::Level::WARN),
+            ))
+            .try_init();
 }
 
 /// Applies a new `LOG_LEVEL` (or full `EnvFilter` directive string) to the

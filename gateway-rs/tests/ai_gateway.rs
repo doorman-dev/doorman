@@ -4878,6 +4878,37 @@ async fn unified_settings_validate_and_resolve_is_routed() {
 }
 
 #[tokio::test]
+async fn ai_telemetry_status_endpoint() {
+    let (app, _storage) = platform_app().await;
+    let admin = login(&app, "admin@doorman.dev", fixture_password()).await;
+    let response = request(
+        &app,
+        Method::GET,
+        "/platform/ai/telemetry",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = json_body(response).await;
+    for field in [
+        "enabled",
+        "protocol",
+        "traces_endpoint",
+        "metrics_endpoint",
+        "service_name",
+        "include_user",
+        "sampler",
+        "last_error",
+    ] {
+        assert!(status.get(field).is_some(), "missing {field}: {status}");
+    }
+    assert!(status.get("headers").is_none());
+    let response = request(&app, Method::GET, "/platform/ai/telemetry", None, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn ai_cache_status_and_clear_endpoints() {
     let (app, storage) = platform_app().await;
     let admin = login(&app, "admin@doorman.dev", fixture_password()).await;

@@ -399,14 +399,50 @@ pub(crate) async fn execute_ai(
     documents: Option<&PolicyDocuments>,
 ) -> Result<Response, GatewayError> {
     let mut cache_mode = CacheMode::Off;
-    let mut response =
-        execute_ai_inner(state, request, decision, documents, &mut cache_mode).await?;
+    let mut meta = crate::ai::telemetry::RequestMeta::default();
+    let server_span = request
+        .extensions()
+        .get::<crate::middleware::otel::ServerSpan>()
+        .map(|span| span.0.clone());
+    let result = execute_ai_inner(
+        state,
+        request,
+        decision,
+        documents,
+        &mut cache_mode,
+        &mut meta,
+        server_span.clone(),
+    )
+    .await;
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            crate::ai::telemetry::request_done(
+                server_span.as_ref(),
+                &meta,
+                500,
+                cache_mode.header(false),
+            );
+            return Err(error);
+        }
+    };
     if !response.headers().contains_key("x-doorman-cache") {
         response.headers_mut().insert(
             HeaderName::from_static("x-doorman-cache"),
             HeaderValue::from_static(cache_mode.header(false)),
         );
     }
+    let cache = response
+        .headers()
+        .get("x-doorman-cache")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("off");
+    crate::ai::telemetry::request_done(
+        server_span.as_ref(),
+        &meta,
+        response.status().as_u16(),
+        cache,
+    );
     Ok(response)
 }
 
@@ -427,6 +463,11 @@ fn forwarded_request_headers(inbound: &HeaderMap) -> HeaderMap {
                     | "x-csrf-token"
                     | "csrf-token"
                     | "x-user-email"
+                    // Trace context stays inside the organisation: AI
+                    // providers are third parties.
+                    | "traceparent"
+                    | "tracestate"
+                    | "baggage"
             )
             || lower.starts_with("x-doorman-")
         {
@@ -443,6 +484,8 @@ async fn execute_ai_inner(
     decision: PolicyDecision,
     documents: Option<&PolicyDocuments>,
     cache_slot: &mut CacheMode,
+    meta: &mut crate::ai::telemetry::RequestMeta,
+    server_span: Option<tracing::Span>,
 ) -> Result<Response, GatewayError> {
     let started = Instant::now();
     let Some(route) = request.extensions().get::<AiRoute>().cloned() else {
@@ -487,6 +530,8 @@ async fn execute_ai_inner(
     };
     let adapter = adapter_for(provider);
     let api_label = format!("{}/{}", route.name, route.version);
+    meta.provider = Some(provider);
+    meta.api = Some(api_label.clone());
 
     if let Some(delay_ms) = decision.throttle_delay_ms.filter(|delay| *delay > 0) {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -505,6 +550,7 @@ async fn execute_ai_inner(
         .extensions()
         .get::<UnifiedCtx>()
         .map(|unified| unified.requested_model.clone());
+    meta.unified_model = unified_model.clone();
     let (parts, body) = request.into_parts();
     let body_limit = BodyLimits::from_env().ai;
     let raw_body = match to_bytes(body, BodyLimits::for_path(&request_path, body_limit)).await {
@@ -600,6 +646,8 @@ async fn execute_ai_inner(
         .get(&requested)
         .cloned()
         .unwrap_or_else(|| requested.clone());
+    meta.operation = Some(info.operation);
+    meta.model = Some(model.clone());
     if !model_allowed(&model, &config.allowed_models) {
         return Ok(ai_error(
             StatusCode::FORBIDDEN,
@@ -619,6 +667,7 @@ async fn execute_ai_inner(
         .username
         .clone()
         .or_else(|| decision.tier_username.clone());
+    meta.username = username.clone();
     let user_groups: Vec<String> = username
         .as_deref()
         .and_then(|username| {
@@ -858,6 +907,9 @@ async fn execute_ai_inner(
                     .then(|| state.config.logs_dir.clone())
                     .flatten(),
                 cache_saved: Some(hit.usage()),
+                server_span: server_span.clone(),
+                client_span: None,
+                first_chunk_ms: None,
             };
             return Ok(cache_hit_response(hit, ctx, &info, adapter, &rails).await);
         }
@@ -1045,6 +1097,7 @@ async fn execute_ai_inner(
     );
     let mut fallbacks = 0_u32;
     let mut chosen = None;
+    let mut chosen_span = None;
     // Per target, retries happen only before anything reaches the client, and
     // only for connection errors and 502/503/504; never 429 (C3) or 500 (costs
     // tokens). With backups configured, a timeout, a connection error or a
@@ -1130,6 +1183,13 @@ async fn execute_ai_inner(
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
+            let attempt_span = crate::ai::telemetry::client_span(
+                provider,
+                info.operation,
+                &model,
+                &url,
+                info.stream,
+            );
             let send = client
                 .request(method.clone(), url.clone())
                 .headers(target_headers.clone())
@@ -1139,7 +1199,22 @@ async fn execute_ai_inner(
                 failover::bench_target(&bench_keys[slot], cool_down);
                 tracing::warn!(api = %api_label, target = target.index, reason, "AI upstream failed; trying the next target");
             };
-            match tokio::time::timeout(first_byte_timeout, send).await {
+            let outcome = tokio::time::timeout(first_byte_timeout, send).await;
+            match &outcome {
+                Err(_) => crate::ai::telemetry::fail(&attempt_span, "timeout"),
+                Ok(Err(error)) if error.is_connect() => {
+                    crate::ai::telemetry::fail(&attempt_span, "connection_error")
+                }
+                Ok(Err(_)) => crate::ai::telemetry::fail(&attempt_span, "request_error"),
+                Ok(Ok(response))
+                    if response.status().is_server_error()
+                        || response.status().is_client_error() =>
+                {
+                    crate::ai::telemetry::fail(&attempt_span, response.status().as_str())
+                }
+                Ok(Ok(_)) => {}
+            }
+            match outcome {
                 Err(_) => {
                     record_failure(&state.runtime.circuits, &circuit_key);
                     state
@@ -1172,6 +1247,7 @@ async fn execute_ai_inner(
                 }
                 Ok(Ok(response)) => {
                     chosen = Some(response);
+                    chosen_span = attempt_span;
                     break 'targets;
                 }
                 Ok(Err(error)) if error.is_connect() && attempt < attempts => {
@@ -1276,6 +1352,9 @@ async fn execute_ai_inner(
             .then(|| state.config.logs_dir.clone())
             .flatten(),
         cache_saved: None,
+        server_span,
+        client_span: chosen_span,
+        first_chunk_ms: None,
     };
 
     // Stored replies keep the pass-through headers, never Doorman's own.
